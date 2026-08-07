@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -253,8 +254,168 @@ func execCommand(daemonOverride, sub string, rest []string) {
 			fmt.Printf("[cli] no output received within deadline. Is session %s running?\n", short(sid))
 		}
 
+	case "list", "ls", "sessions":
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			fmt.Printf("[cli] connect daemon %s: %v\n", addr, err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+		_, _ = protocol.NewMessage(protocol.MsgListSessions, "", "").WriteTo(conn)
+		br := protocol.NewMessageReader(conn)
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			_ = conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+			msg, err := br.Read()
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				break
+			}
+			if msg.Type == protocol.MsgError {
+				fmt.Printf("  !! error: %s\n", msg.Payload)
+				os.Exit(1)
+			}
+			if msg.Type == protocol.MsgListSessionsRsp {
+				var entries []struct {
+					SessionID  string   `json:"session_id"`
+					BotID      string   `json:"bot_id"`
+					CliType    string   `json:"cli_type"`
+					Status     string   `json:"status"`
+					Pid        int      `json:"pid"`
+					LastActive string   `json:"last_active"`
+					Outputs    []string `json:"outputs"`
+				}
+				if err := json.Unmarshal([]byte(msg.Payload), &entries); err != nil {
+					fmt.Printf("[cli] parse list response failed: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("%-24s %-18s %-10s %-12s %-8s %-22s %s\n",
+					"SESSION_ID", "BOT", "CLI", "STATUS", "PID", "LAST_ACTIVE", "LAST_OUTPUT")
+				for _, e := range entries {
+					pidStr := "-"
+					if e.Pid > 0 {
+						pidStr = fmt.Sprintf("%d", e.Pid)
+					}
+					lastOut := ""
+					if n := len(e.Outputs); n > 0 {
+						lastOut = e.Outputs[n-1]
+						if len(lastOut) > 50 {
+							lastOut = lastOut[:50] + "..."
+						}
+					}
+					sid := e.SessionID
+					if len(sid) > 22 {
+						sid = sid[:22] + ".."
+					}
+					fmt.Printf("%-24s %-18s %-10s %-12s %-8s %-22s %s\n",
+						sid, e.BotID, e.CliType, e.Status, pidStr, e.LastActive, lastOut)
+				}
+				fmt.Printf("\n[cli] %d session(s)\n", len(entries))
+				return
+			}
+		}
+		fmt.Printf("[cli] timeout waiting for list response\n")
+		os.Exit(1)
+
+	case "history", "hs":
+		if len(rest) < 1 {
+			fmt.Printf("usage: %s -cmd history <session_id>\n", os.Args[0])
+			os.Exit(1)
+		}
+		sid := rest[0]
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			fmt.Printf("[cli] connect daemon %s: %v\n", addr, err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+		_, _ = protocol.NewMessage(protocol.MsgHistory, sid, "").WriteTo(conn)
+		br := protocol.NewMessageReader(conn)
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			_ = conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+			msg, err := br.Read()
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				break
+			}
+			if msg.Type == protocol.MsgError && (msg.SessionID == sid || msg.SessionID == "") {
+				fmt.Printf("  !! error: %s\n", msg.Payload)
+				os.Exit(1)
+			}
+			if msg.Type == protocol.MsgHistoryRsp && msg.SessionID == sid {
+				var outs []string
+				if err := json.Unmarshal([]byte(msg.Payload), &outs); err != nil {
+					fmt.Printf("[cli] parse history response failed: %v\n", err)
+					os.Exit(1)
+				}
+				if len(outs) == 0 {
+					fmt.Printf("[cli] session %s has no output history\n", short(sid))
+					return
+				}
+				width := len(fmt.Sprintf("%d", len(outs)))
+				for i, line := range outs {
+					fmt.Printf("  [%*d] %s\n", width, i+1, line)
+				}
+				fmt.Printf("[cli] %d line(s)\n", len(outs))
+				return
+			}
+		}
+		fmt.Printf("[cli] timeout waiting for history response\n")
+		os.Exit(1)
+
+	case "close", "rm", "delete":
+		if len(rest) < 1 {
+			fmt.Printf("usage: %s -cmd close <session_id> [<reason>]\n", os.Args[0])
+			os.Exit(1)
+		}
+		sid := rest[0]
+		reason := ""
+		if len(rest) > 1 {
+			reason = strings.Join(rest[1:], " ")
+		}
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			fmt.Printf("[cli] connect daemon %s: %v\n", addr, err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+		_, _ = protocol.NewMessage(protocol.MsgCloseSession, sid, reason).WriteTo(conn)
+		br := protocol.NewMessageReader(conn)
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			_ = conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+			msg, err := br.Read()
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				break
+			}
+			if msg.Type == protocol.MsgError && (msg.SessionID == sid || msg.SessionID == "") {
+				fmt.Printf("  !! error: %s\n", msg.Payload)
+				os.Exit(1)
+			}
+			if msg.Type == protocol.MsgCloseSessionAck && msg.SessionID == sid {
+				fmt.Printf("[cli] session %s closed (reason=%q)\n", short(sid), reason)
+				return
+			}
+		}
+		fmt.Printf("[cli] timeout waiting for close ack\n")
+		os.Exit(1)
+
 	default:
-		fmt.Printf("unknown -cmd %q. Supported: new, send\n", sub)
+		fmt.Printf("unknown -cmd %q. Supported: new, send, list, history, close\n", sub)
+		fmt.Printf("\nUsage:\n")
+		fmt.Printf("  new <session_id> [<bot_id>]     Create a new session\n")
+		fmt.Printf("  send <session_id> <msg>         Send message to session\n")
+		fmt.Printf("  list                            List all sessions with status\n")
+		fmt.Printf("  history <session_id>            Show session output history\n")
+		fmt.Printf("  close <session_id> [<reason>]   Close a session (stop auto-recover)\n")
 		os.Exit(2)
 	}
 }

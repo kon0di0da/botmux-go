@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -325,7 +326,6 @@ func (d *Daemon) removeSession(id string) {
 	if hasMeta {
 		meta.Closed = true
 		meta.Status = StatusClosed
-		delete(d.sessions, id)
 	}
 	d.sessionsMu.Unlock()
 
@@ -348,12 +348,15 @@ func (d *Daemon) removeSession(id string) {
 }
 
 func (d *Daemon) CloseSession(id, reason string) {
-	d.sessionsMu.RLock()
-	_, ok := d.sessions[id]
-	d.sessionsMu.RUnlock()
+	d.sessionsMu.Lock()
+	meta, ok := d.sessions[id]
 	if !ok {
+		d.sessionsMu.Unlock()
 		return
 	}
+	meta.Closed = true
+	meta.Status = StatusClosed
+	d.sessionsMu.Unlock()
 
 	d.workersMu.RLock()
 	h := d.workers[id]
@@ -527,6 +530,18 @@ func (d *Daemon) handleClientConn(conn net.Conn, reader *protocol.MessageReader,
 	defer func() {
 		log.Printf("[daemon] client %s disconnected", cliID)
 	}()
+	switch first.Type {
+	case protocol.MsgListSessions:
+		d.handleListSessions(conn)
+		return
+	case protocol.MsgHistory:
+		d.handleHistory(conn, first.SessionID)
+		return
+	case protocol.MsgCloseSession:
+		d.handleCloseSession(conn, first.SessionID, first.Payload)
+		return
+	case protocol.MsgNewSession:
+	}
 	if first.Type == protocol.MsgNewSession {
 		sid := first.SessionID
 		if sid == "" {
@@ -581,6 +596,89 @@ func (d *Daemon) handleClientConn(conn net.Conn, reader *protocol.MessageReader,
 		}
 		d.forwardClientMessage(conn, msg)
 	}
+}
+
+type sessionListEntry struct {
+	SessionID  string   `json:"session_id"`
+	BotID      string   `json:"bot_id"`
+	CliType    string   `json:"cli_type"`
+	Status     string   `json:"status"`
+	Pid        int      `json:"pid"`
+	LastActive string   `json:"last_active"`
+	Outputs    []string `json:"outputs"`
+}
+
+func (d *Daemon) handleListSessions(conn net.Conn) {
+	d.sessionsMu.RLock()
+	metas := make([]*SessionMeta, 0, len(d.sessions))
+	for _, m := range d.sessions {
+		metas = append(metas, m)
+	}
+	d.sessionsMu.RUnlock()
+	entries := make([]sessionListEntry, 0, len(metas))
+	for _, m := range metas {
+		pid := 0
+		d.workersMu.RLock()
+		if h, ok := d.workers[m.SessionID]; ok {
+			pid = h.Pid
+		}
+		d.workersMu.RUnlock()
+		entries = append(entries, sessionListEntry{
+			SessionID:  m.SessionID,
+			BotID:      m.BotID,
+			CliType:    m.CliType,
+			Status:     string(m.Status),
+			Pid:        pid,
+			LastActive: m.LastActive().Format("2006-01-02 15:04:05"),
+			Outputs:    m.SnapshotOutput(),
+		})
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		_, _ = protocol.NewMessage(protocol.MsgError, "", "marshal sessions: "+err.Error()).WriteTo(conn)
+		return
+	}
+	_, _ = protocol.NewMessage(protocol.MsgListSessionsRsp, "", string(data)).WriteTo(conn)
+}
+
+func (d *Daemon) handleHistory(conn net.Conn, sessionID string) {
+	if sessionID == "" {
+		_, _ = protocol.NewMessage(protocol.MsgError, "", "missing session_id").WriteTo(conn)
+		return
+	}
+	d.sessionsMu.RLock()
+	m, ok := d.sessions[sessionID]
+	d.sessionsMu.RUnlock()
+	if !ok {
+		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "session not found").WriteTo(conn)
+		return
+	}
+	outs := m.SnapshotOutput()
+	data, err := json.Marshal(outs)
+	if err != nil {
+		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "marshal: "+err.Error()).WriteTo(conn)
+		return
+	}
+	_, _ = protocol.NewMessage(protocol.MsgHistoryRsp, sessionID, string(data)).WriteTo(conn)
+}
+
+func (d *Daemon) handleCloseSession(conn net.Conn, sessionID, reason string) {
+	if sessionID == "" {
+		_, _ = protocol.NewMessage(protocol.MsgError, "", "missing session_id").WriteTo(conn)
+		return
+	}
+	if reason == "" {
+		reason = "client request"
+	}
+	d.sessionsMu.RLock()
+	_, ok := d.sessions[sessionID]
+	d.sessionsMu.RUnlock()
+	if !ok {
+		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "session not found").WriteTo(conn)
+		return
+	}
+	_, _ = protocol.NewMessage(protocol.MsgCloseSessionAck, sessionID, "ok").WriteTo(conn)
+	go d.CloseSession(sessionID, reason)
 }
 
 func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message) {
@@ -672,7 +770,10 @@ func isClientFirstMessage(m *protocol.Message) bool {
 	case protocol.MsgNewSession,
 		protocol.MsgUserInput,
 		protocol.MsgClose,
-		protocol.MsgAck:
+		protocol.MsgAck,
+		protocol.MsgListSessions,
+		protocol.MsgHistory,
+		protocol.MsgCloseSession:
 		return true
 	}
 	return m.SessionID == ""

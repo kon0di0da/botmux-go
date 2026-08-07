@@ -18,6 +18,13 @@ const (
 	MsgError       MessageType = "error"
 	MsgHeartbeat   MessageType = "heartbeat"
 	MsgAck         MessageType = "ack"
+
+	MsgListSessions    MessageType = "list_sessions"
+	MsgListSessionsRsp MessageType = "list_sessions_rsp"
+	MsgHistory         MessageType = "history"
+	MsgHistoryRsp      MessageType = "history_rsp"
+	MsgCloseSession    MessageType = "close_session"
+	MsgCloseSessionAck MessageType = "close_session_ack"
 )
 
 type Message struct {
