@@ -38,6 +38,11 @@ type Daemon struct {
 	closeMu sync.Mutex
 
 	wg sync.WaitGroup
+
+	monitorMu    sync.Mutex
+	monitorStop  chan struct{}
+	spawnFailures map[string]*spawnFailure
+	spawnSem     chan struct{}
 }
 
 func New(cfg *config.DaemonConfig) (*Daemon, error) {
@@ -70,6 +75,7 @@ func (d *Daemon) Start() error {
 	log.Printf("[daemon] listening on %s (self=%s, sessions_dir=%s)", d.cfg.ListenAddr, d.selfExe, d.cfg.SessionsDir)
 
 	d.restoreSessions()
+	d.startSessionMonitor()
 
 	d.wg.Add(2)
 	go d.acceptLoop()
@@ -90,6 +96,7 @@ func (d *Daemon) Stop() error {
 	d.closed = true
 	d.closeMu.Unlock()
 	d.cancel()
+	d.stopSessionMonitor()
 	if d.listener != nil {
 		_ = d.listener.Close()
 	}
