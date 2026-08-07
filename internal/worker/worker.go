@@ -116,12 +116,12 @@ func (w *Worker) connectToDaemon() error {
 	w.setConnected(true)
 	w.conn = conn
 	w.msgReader = protocol.NewMessageReader(conn)
-	log.Printf("[worker:%s] connected to daemon %s", w.sessionID[:8], w.daemonAddr)
+	log.Printf("[worker:%s] connected to daemon %s", safeShortID(w.sessionID), w.daemonAddr)
 	return nil
 }
 
 func (w *Worker) reconnectToDaemon() {
-	log.Printf("[worker:%s] daemon disconnected, starting reconnection...", w.sessionID[:8])
+	log.Printf("[worker:%s] daemon disconnected, starting reconnection...", safeShortID(w.sessionID))
 	for attempt := 0; attempt < 100; attempt++ {
 		if w.isClosed() {
 			return
@@ -135,7 +135,7 @@ func (w *Worker) reconnectToDaemon() {
 				backoff = 30 * time.Second
 			}
 		}
-		log.Printf("[worker:%s] reconnect attempt %d (backoff=%v)...", w.sessionID[:8], attempt+1, backoff)
+		log.Printf("[worker:%s] reconnect attempt %d (backoff=%v)...", safeShortID(w.sessionID), attempt+1, backoff)
 		time.Sleep(backoff)
 
 		conn, err := net.Dial("tcp", w.daemonAddr)
@@ -153,10 +153,10 @@ func (w *Worker) reconnectToDaemon() {
 		}
 
 		_ = w.sendReady()
-		log.Printf("[worker:%s] reconnected to daemon (attempt %d)", w.sessionID[:8], attempt+1)
+		log.Printf("[worker:%s] reconnected to daemon (attempt %d)", safeShortID(w.sessionID), attempt+1)
 		return
 	}
-	log.Printf("[worker:%s] failed to reconnect after 100 attempts, giving up", w.sessionID[:8])
+	log.Printf("[worker:%s] failed to reconnect after 100 attempts, giving up", safeShortID(w.sessionID))
 }
 
 func (w *Worker) setConnected(v bool) {
@@ -178,7 +178,7 @@ func (w *Worker) startCli() error {
 	}
 	w.startResult = result
 	log.Printf("[worker:%s] cli adapter started (adapter=%s, dir=%s)",
-		w.sessionID[:8], w.cliAdapter.Name(), w.workingDir)
+		safeShortID(w.sessionID), w.cliAdapter.Name(), w.workingDir)
 	return nil
 }
 
@@ -234,7 +234,7 @@ func (w *Worker) readDaemonMessages() {
 		}
 		if f.err != nil {
 			if !errors.Is(f.err, io.EOF) && !errors.Is(f.err, net.ErrClosed) {
-				log.Printf("[worker:%s] read daemon error: %v", w.sessionID[:8], f.err)
+				log.Printf("[worker:%s] read daemon error: %v", safeShortID(w.sessionID), f.err)
 			}
 			w.setConnected(false)
 			go w.reconnectToDaemon()
@@ -250,15 +250,15 @@ func (w *Worker) readDaemonMessages() {
 				return
 			}
 			if err := w.cliAdapter.Send(w.ctx, msg.Payload); err != nil {
-				log.Printf("[worker:%s] send to cli: %v", w.sessionID[:8], err)
+				log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
 			}
 		case protocol.MsgClose:
-			log.Printf("[worker:%s] close requested by daemon", w.sessionID[:8])
+			log.Printf("[worker:%s] close requested by daemon", safeShortID(w.sessionID))
 			return
 		case protocol.MsgHeartbeat:
 		case protocol.MsgAck:
 		default:
-			log.Printf("[worker:%s] unknown msg type: %s", w.sessionID[:8], msg.Type)
+			log.Printf("[worker:%s] unknown msg type: %s", safeShortID(w.sessionID), msg.Type)
 		}
 	}
 }
@@ -279,7 +279,7 @@ func (w *Worker) readCliOutput() {
 			return
 		case err, ok := <-w.startResult.ErrCh:
 			if ok && err != nil {
-				log.Printf("[worker:%s] cli error: %v", w.sessionID[:8], err)
+				log.Printf("[worker:%s] cli error: %v", safeShortID(w.sessionID), err)
 			}
 			return
 		default:
@@ -297,14 +297,14 @@ func (w *Worker) readCliOutput() {
 			return
 		case err, ok := <-w.startResult.ErrCh:
 			if ok && err != nil {
-				log.Printf("[worker:%s] cli error: %v", w.sessionID[:8], err)
+				log.Printf("[worker:%s] cli error: %v", safeShortID(w.sessionID), err)
 			}
 			return
 		case f = <-ch:
 		}
 		if f.err != nil {
 			if !errors.Is(f.err, io.EOF) {
-				log.Printf("[worker:%s] cli readline: %v", w.sessionID[:8], f.err)
+				log.Printf("[worker:%s] cli readline: %v", safeShortID(w.sessionID), f.err)
 			}
 			return
 		}
@@ -318,7 +318,7 @@ func (w *Worker) readCliOutput() {
 			continue
 		}
 		if err := w.sendMessage(protocol.MsgOutput, text); err != nil {
-			log.Printf("[worker:%s] send output to daemon: %v", w.sessionID[:8], err)
+			log.Printf("[worker:%s] send output to daemon: %v", safeShortID(w.sessionID), err)
 			time.Sleep(1 * time.Second)
 			continue
 		}
@@ -387,7 +387,7 @@ func (w *Worker) cleanup() {
 		store := daemon.NewSessionStore(w.storeDir)
 		_ = store.MarkClosed(w.sessionID)
 	}
-	log.Printf("[worker:%s] worker exited", w.sessionID[:8])
+	log.Printf("[worker:%s] worker exited", safeShortID(w.sessionID))
 }
 
 func GetEnvOrDefault(key, def string) string {
@@ -395,4 +395,11 @@ func GetEnvOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func safeShortID(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
 }

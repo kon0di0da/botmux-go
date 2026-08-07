@@ -16,57 +16,20 @@ import (
 	"botmux-go/internal/protocol"
 )
 
-type WorkerSession struct {
-	SessionID  string
-	BotID      string
-	CliType    string
-	CliPath    string
-	WorkingDir string
-	Cmd        *exec.Cmd
-	Conn       net.Conn
-	Connected  chan struct{}
-	LastOutput []string
-	mu         sync.Mutex
-	closed     bool
-	lastActive time.Time
-	hbSeen     time.Time
-	onClose    []func()
-}
-
-func (ws *WorkerSession) touchActive() {
-	ws.mu.Lock()
-	ws.lastActive = time.Now()
-	ws.mu.Unlock()
-}
-
-func (ws *WorkerSession) AddOutput(line string) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	ws.LastOutput = append(ws.LastOutput, line)
-	if len(ws.LastOutput) > 50 {
-		ws.LastOutput = ws.LastOutput[len(ws.LastOutput)-50:]
-	}
-}
-
-func (ws *WorkerSession) SnapshotOutput() []string {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	out := make([]string, len(ws.LastOutput))
-	copy(out, ws.LastOutput)
-	return out
-}
-
 type Daemon struct {
-	cfg       *config.DaemonConfig
-	listener  net.Listener
-	selfExe   string
-	store     *SessionStore
+	cfg      *config.DaemonConfig
+	listener net.Listener
+	selfExe  string
+	store    *SessionStore
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	sessionsMu sync.RWMutex
-	sessions   map[string]*WorkerSession
+	sessions   map[string]*SessionMeta
+
+	workersMu sync.RWMutex
+	workers   map[string]*WorkerHandle
 
 	connMapMu  sync.Mutex
 	connToSess map[net.Conn]string
@@ -89,7 +52,8 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 		store:      NewSessionStore(cfg.SessionsDir),
 		ctx:        ctx,
 		cancel:     cancel,
-		sessions:   make(map[string]*WorkerSession),
+		sessions:   make(map[string]*SessionMeta),
+		workers:    make(map[string]*WorkerHandle),
 		connToSess: make(map[net.Conn]string),
 	}, nil
 }
@@ -129,12 +93,12 @@ func (d *Daemon) Stop() error {
 	if d.listener != nil {
 		_ = d.listener.Close()
 	}
-	d.sessionsMu.Lock()
+	d.sessionsMu.RLock()
 	ids := make([]string, 0, len(d.sessions))
 	for id := range d.sessions {
 		ids = append(ids, id)
 	}
-	d.sessionsMu.Unlock()
+	d.sessionsMu.RUnlock()
 	for _, id := range ids {
 		d.CloseSession(id, "daemon shutdown")
 	}
@@ -147,10 +111,10 @@ type NewSessionOpts struct {
 	CliType    string
 	CliPath    string
 	WorkingDir string
-	OnReady    func(ws *WorkerSession)
+	OnReady    func(meta *SessionMeta)
 }
 
-func (d *Daemon) NewSession(opts NewSessionOpts) (*WorkerSession, error) {
+func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 	if d.isClosed() {
 		return nil, errors.New("daemon closed")
 	}
@@ -173,82 +137,118 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*WorkerSession, error) {
 		workingDir = bot.WorkingDir
 	}
 
-	ws := &WorkerSession{
-		SessionID:  opts.SessionID,
-		BotID:      bot.BotID,
-		CliType:    cliType,
-		CliPath:    opts.CliPath,
-		WorkingDir: workingDir,
-		Connected:  make(chan struct{}),
-		lastActive: time.Now(),
-		hbSeen:     time.Now(),
-	}
-	d.sessionsMu.Lock()
-	if _, exists := d.sessions[opts.SessionID]; exists {
-		d.sessionsMu.Unlock()
-		return nil, fmt.Errorf("session %s already exists", opts.SessionID)
-	}
-	d.sessions[opts.SessionID] = ws
-	d.sessionsMu.Unlock()
-
-	ps := &PersistedSession{
+	now := time.Now()
+	meta := &SessionMeta{
 		SessionID:  opts.SessionID,
 		BotID:      bot.BotID,
 		CliType:    cliType,
 		CliPath:    opts.CliPath,
 		WorkingDir: workingDir,
 		LastOutput: []string{},
-		LastActive: time.Now(),
-		CreatedAt:  time.Now(),
+		CreatedAt:  now,
+		Status:     StatusCreated,
+		lastActive: now,
 	}
+
+	d.sessionsMu.Lock()
+	if _, exists := d.sessions[opts.SessionID]; exists {
+		d.sessionsMu.Unlock()
+		return nil, fmt.Errorf("session %s already exists", opts.SessionID)
+	}
+	d.sessions[opts.SessionID] = meta
+	d.sessionsMu.Unlock()
+
+	ps := meta.ToPersisted()
 	if err := d.store.save(ps); err != nil {
 		log.Printf("[daemon] warn: persist session %s failed: %v", safeShort(opts.SessionID), err)
 	}
 
-	cmd := exec.CommandContext(d.ctx, d.selfExe)
-	env := append(os.Environ(),
-		"BOTMUX_ROLE=worker",
-		"BOTMUX_SESSION_ID="+opts.SessionID,
-		"BOTMUX_DAEMON_ADDR="+d.cfg.ListenAddr,
-		"BOTMUX_CLI_TYPE="+cliType,
-		"BOTMUX_CLI_PATH="+opts.CliPath,
-		"BOTMUX_WORKING_DIR="+workingDir,
-		"BOTMUX_STORE_DIR="+d.cfg.SessionsDir,
-	)
-	cmd.Env = env
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	ws.Cmd = cmd
-
-	ws.mu.Lock()
-	ws.onClose = append(ws.onClose, func() {
-		if opts.OnReady != nil {
-		}
-	})
-	ws.mu.Unlock()
-
-	if err := cmd.Start(); err != nil {
-		d.removeSession(opts.SessionID)
-		return nil, fmt.Errorf("spawn worker: %w", err)
+	if err := d.spawnWorkerForSession(meta); err != nil {
+		return nil, err
 	}
-
-	d.store.UpdateWorkerPID(opts.SessionID, cmd.Process.Pid)
-	go d.waitWorkerExit(ws)
 
 	if opts.OnReady != nil {
-		go func() {
-			select {
-			case <-ws.Connected:
-				opts.OnReady(ws)
-			case <-time.After(10 * time.Second):
-				log.Printf("[daemon] session %s: worker ready timeout", opts.SessionID[:8])
-			case <-d.ctx.Done():
-			}
-		}()
+		d.workersMu.RLock()
+		h := d.workers[meta.SessionID]
+		d.workersMu.RUnlock()
+		if h != nil {
+			go func() {
+				select {
+				case <-h.Ready:
+					opts.OnReady(meta)
+				case <-time.After(10 * time.Second):
+					log.Printf("[daemon] session %s: worker ready timeout", safeShort(opts.SessionID))
+				case <-d.ctx.Done():
+				}
+			}()
+		}
 	}
+	return meta, nil
+}
 
-	log.Printf("[daemon] session %s spawned (cli=%s, pid=%d)", opts.SessionID[:8], cliType, cmd.Process.Pid)
-	return ws, nil
+func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
+	handle := NewWorkerHandle(meta.SessionID)
+
+	cmd := exec.CommandContext(d.ctx, d.selfExe)
+	cmd.Env = append(os.Environ(),
+		"BOTMUX_ROLE=worker",
+		"BOTMUX_SESSION_ID="+meta.SessionID,
+		"BOTMUX_DAEMON_ADDR="+d.cfg.ListenAddr,
+		"BOTMUX_CLI_TYPE="+meta.CliType,
+		"BOTMUX_CLI_PATH="+meta.CliPath,
+		"BOTMUX_WORKING_DIR="+meta.WorkingDir,
+		"BOTMUX_STORE_DIR="+d.cfg.SessionsDir,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	handle.Cmd = cmd
+
+	d.sessionsMu.Lock()
+	meta.Status = StatusSpawning
+	d.sessionsMu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		d.workersMu.Lock()
+		delete(d.workers, meta.SessionID)
+		d.workersMu.Unlock()
+		d.sessionsMu.Lock()
+		meta.Status = StatusRecovering
+		d.sessionsMu.Unlock()
+		return fmt.Errorf("spawn worker: %w", err)
+	}
+	handle.Pid = cmd.Process.Pid
+
+	d.workersMu.Lock()
+	d.workers[meta.SessionID] = handle
+	d.workersMu.Unlock()
+
+	_ = d.store.UpdateWorkerPID(meta.SessionID, handle.Pid)
+
+	go d.waitWorkerExit(handle)
+	go d.monitorReady(handle, meta)
+
+	log.Printf("[daemon] session %s spawned worker (cli=%s, pid=%d)", safeShort(meta.SessionID), meta.CliType, handle.Pid)
+	return nil
+}
+
+func (d *Daemon) monitorReady(handle *WorkerHandle, meta *SessionMeta) {
+	select {
+	case <-handle.Ready:
+		d.sessionsMu.Lock()
+		if !meta.Closed {
+			meta.Status = StatusReady
+		}
+		d.sessionsMu.Unlock()
+		log.Printf("[daemon] session %s -> READY", safeShort(meta.SessionID))
+	case <-time.After(10 * time.Second):
+		d.sessionsMu.Lock()
+		if !meta.Closed && meta.Status != StatusReady {
+			meta.Status = StatusRecovering
+		}
+		d.sessionsMu.Unlock()
+		log.Printf("[daemon] session %s: worker ready timeout, status=RECOVERING", safeShort(meta.SessionID))
+	case <-d.ctx.Done():
+	}
 }
 
 func (d *Daemon) restoreSessions() {
@@ -261,117 +261,165 @@ func (d *Daemon) restoreSessions() {
 	}
 	log.Printf("[daemon] restoring %d persisted session(s)", len(stored))
 	for _, ps := range stored {
-		ws := &WorkerSession{
-			SessionID:  ps.SessionID,
-			BotID:      ps.BotID,
-			CliType:    ps.CliType,
-			CliPath:    ps.CliPath,
-			WorkingDir: ps.WorkingDir,
-			LastOutput: ps.LastOutput,
-			Connected:  make(chan struct{}),
-			lastActive: time.Now(),
-			hbSeen:     time.Now(),
-		}
+		meta := SessionMetaFromPersisted(ps)
 		d.sessionsMu.Lock()
-		d.sessions[ps.SessionID] = ws
+		d.sessions[ps.SessionID] = meta
 		d.sessionsMu.Unlock()
-		log.Printf("[daemon] restored session %s (bot=%s, last_active=%s)",
-			safeShort(ps.SessionID), ps.BotID, ps.LastActive.Format("15:04:05"))
+		log.Printf("[daemon] restored session %s (bot=%s, status=%s, last_active=%s)",
+			safeShort(ps.SessionID), ps.BotID, meta.Status, meta.LastActive().Format("15:04:05"))
 	}
 }
 
-func (d *Daemon) waitWorkerExit(ws *WorkerSession) {
-	err := ws.Cmd.Wait()
-	exitMsg := fmt.Sprintf("worker exit (pid=%d):", ws.Cmd.Process.Pid)
+func (d *Daemon) waitWorkerExit(handle *WorkerHandle) {
+	err := handle.Cmd.Wait()
+	exitMsg := fmt.Sprintf("worker exit (pid=%d):", handle.Pid)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			log.Printf("[daemon] session %s %s err=%v", ws.SessionID[:8], exitMsg, err)
+			log.Printf("[daemon] session %s %s err=%v", safeShort(handle.SessionID), exitMsg, err)
 		}
 	}
-	d.removeSession(ws.SessionID)
+
+	d.workersMu.Lock()
+	h, exists := d.workers[handle.SessionID]
+	if exists && h == handle {
+		delete(d.workers, handle.SessionID)
+	}
+	d.workersMu.Unlock()
+
+	d.sessionsMu.Lock()
+	meta, ok := d.sessions[handle.SessionID]
+	if ok && !meta.Closed {
+		meta.Status = StatusRecovering
+	}
+	d.sessionsMu.Unlock()
+
+	handle.CloseConn()
+
+	if ok {
+		for _, fn := range meta.DrainOnClose() {
+			func() {
+				defer func() { _ = recover() }()
+				fn()
+			}()
+		}
+	}
 }
 
 func (d *Daemon) removeSession(id string) {
+	d.workersMu.Lock()
+	h, hasHandle := d.workers[id]
+	if hasHandle {
+		delete(d.workers, id)
+	}
+	d.workersMu.Unlock()
+
 	d.sessionsMu.Lock()
-	ws, ok := d.sessions[id]
-	if ok {
+	meta, hasMeta := d.sessions[id]
+	if hasMeta {
+		meta.Closed = true
+		meta.Status = StatusClosed
 		delete(d.sessions, id)
 	}
 	d.sessionsMu.Unlock()
-	if !ok || ws == nil {
+
+	if !hasMeta {
 		return
 	}
-	d.store.MarkClosed(id)
-	ws.mu.Lock()
-	closed := ws.closed
-	ws.closed = true
-	callbacks := ws.onClose
-	ws.onClose = nil
-	ws.mu.Unlock()
-	for _, fn := range callbacks {
+
+	_ = d.store.MarkClosed(id)
+
+	if hasHandle && h != nil {
+		h.CloseConn()
+	}
+
+	for _, fn := range meta.DrainOnClose() {
 		func() {
 			defer func() { _ = recover() }()
 			fn()
 		}()
 	}
-	if !closed && ws.Conn != nil {
-		_ = ws.Conn.Close()
-	}
 }
 
 func (d *Daemon) CloseSession(id, reason string) {
 	d.sessionsMu.RLock()
-	ws, ok := d.sessions[id]
+	_, ok := d.sessions[id]
 	d.sessionsMu.RUnlock()
 	if !ok {
 		return
 	}
-	msg := protocol.NewMessage(protocol.MsgClose, id, reason)
-	if ws.Conn != nil {
-		_, _ = msg.WriteTo(ws.Conn)
-	}
-	timeout := time.AfterFunc(2*time.Second, func() {
-		if ws.Cmd != nil && ws.Cmd.Process != nil {
-			_ = ws.Cmd.Process.Kill()
+
+	d.workersMu.RLock()
+	h := d.workers[id]
+	d.workersMu.RUnlock()
+
+	if h != nil {
+		msg := protocol.NewMessage(protocol.MsgClose, id, reason)
+		_ = h.Send(msg)
+		timeout := time.AfterFunc(2*time.Second, func() {
+			if h.Cmd != nil && h.Cmd.Process != nil {
+				_ = h.Cmd.Process.Kill()
+			}
+		})
+		defer timeout.Stop()
+		if h.Cmd != nil && h.Cmd.Process != nil {
+			_ = h.Cmd.Wait()
 		}
-	})
-	defer timeout.Stop()
-	if ws.Cmd != nil && ws.Cmd.Process != nil {
-		_ = ws.Cmd.Wait()
 	}
 	d.removeSession(id)
-	log.Printf("[daemon] session %s closed (reason=%s)", id[:8], reason)
+	log.Printf("[daemon] session %s closed (reason=%s)", safeShort(id), reason)
 }
 
 func (d *Daemon) SendInput(id, input string) error {
 	d.sessionsMu.RLock()
-	ws, ok := d.sessions[id]
+	meta, ok := d.sessions[id]
 	d.sessionsMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("session %s not found", id)
 	}
+	if meta.Closed {
+		return fmt.Errorf("session %s is closed", id)
+	}
+
+	d.workersMu.RLock()
+	h := d.workers[id]
+	d.workersMu.RUnlock()
+	if h == nil {
+		return fmt.Errorf("session %s has no worker (status=%s)", id, meta.Status)
+	}
+
 	select {
-	case <-ws.Connected:
+	case <-h.Ready:
 	case <-time.After(15 * time.Second):
-		return fmt.Errorf("session %s worker not connected", id)
+		return fmt.Errorf("session %s worker not connected (status=%s)", id, meta.Status)
 	}
-	if ws.Conn == nil {
-		return fmt.Errorf("session %s has no connection", id)
-	}
+
 	msg := protocol.NewMessage(protocol.MsgUserInput, id, input)
-	ws.touchActive()
-	_, err := msg.WriteTo(ws.Conn)
-	return err
+	meta.touchActive()
+	return h.Send(msg)
 }
 
-func (d *Daemon) Sessions() map[string]*WorkerSession {
+func (d *Daemon) Sessions() map[string]*SessionMeta {
 	d.sessionsMu.RLock()
 	defer d.sessionsMu.RUnlock()
-	out := make(map[string]*WorkerSession, len(d.sessions))
+	out := make(map[string]*SessionMeta, len(d.sessions))
 	for k, v := range d.sessions {
 		out[k] = v
 	}
 	return out
+}
+
+func (d *Daemon) GetSessionMeta(id string) (*SessionMeta, bool) {
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	m, ok := d.sessions[id]
+	return m, ok
+}
+
+func (d *Daemon) GetWorkerHandle(id string) (*WorkerHandle, bool) {
+	d.workersMu.RLock()
+	defer d.workersMu.RUnlock()
+	h, ok := d.workers[id]
+	return h, ok
 }
 
 func (d *Daemon) isClosed() bool {
@@ -415,29 +463,30 @@ func (d *Daemon) handleConn(conn net.Conn) {
 
 	sessionID := first.SessionID
 	d.sessionsMu.RLock()
-	ws, ok := d.sessions[sessionID]
+	meta, ok := d.sessions[sessionID]
 	d.sessionsMu.RUnlock()
 	if !ok {
 		log.Printf("[daemon] session %s not registered for incoming worker conn", safeShort(sessionID))
 		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "session not registered").WriteTo(conn)
 		return
 	}
-
-	ws.mu.Lock()
-	if ws.closed {
-		ws.mu.Unlock()
+	if meta.Closed {
 		return
 	}
-	if ws.Conn != nil && ws.Conn != conn {
-		_ = ws.Conn.Close()
+
+	d.workersMu.Lock()
+	h, hasH := d.workers[sessionID]
+	if !hasH || h == nil {
+		h = NewWorkerHandle(sessionID)
+		d.workers[sessionID] = h
 	}
-	ws.Conn = conn
-	ws.hbSeen = time.Now()
-	alreadyConnected := ws.Connected == nil || isClosedChan(ws.Connected)
-	if !alreadyConnected {
-		close(ws.Connected)
+	oldConn := h.SetConn(conn)
+	d.workersMu.Unlock()
+	if oldConn != nil && oldConn != conn {
+		_ = oldConn.Close()
 	}
-	ws.mu.Unlock()
+
+	h.markReady()
 
 	d.connMapMu.Lock()
 	d.connToSess[conn] = sessionID
@@ -449,7 +498,7 @@ func (d *Daemon) handleConn(conn net.Conn) {
 	}()
 
 	if first.Type != protocol.MsgNewSession {
-		d.routeMessage(first, ws)
+		d.routeMessage(first, meta, h)
 	}
 	for {
 		msg, err := reader.Read()
@@ -462,7 +511,7 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		if msg.SessionID == "" {
 			msg.SessionID = sessionID
 		}
-		d.routeMessage(msg, ws)
+		d.routeMessage(msg, meta, h)
 	}
 }
 
@@ -478,14 +527,18 @@ func (d *Daemon) handleClientConn(conn net.Conn, reader *protocol.MessageReader,
 		}
 		botID := first.Payload
 		log.Printf("[daemon] %s creating session %s (bot=%s)", cliID, safeShort(sid), botID)
-		var created *WorkerSession
-		var wsReady <-chan struct{} = nil
-		created, err := d.NewSession(NewSessionOpts{
+		var readyCh <-chan struct{} = nil
+		_, err := d.NewSession(NewSessionOpts{
 			SessionID: sid,
 			BotID:     botID,
 		})
 		if err == nil {
-			wsReady = created.Connected
+			d.workersMu.RLock()
+			h := d.workers[sid]
+			d.workersMu.RUnlock()
+			if h != nil {
+				readyCh = h.Ready
+			}
 		}
 		ackPayload := "ok"
 		if err != nil {
@@ -497,7 +550,7 @@ func (d *Daemon) handleClientConn(conn net.Conn, reader *protocol.MessageReader,
 			return
 		}
 		select {
-		case <-wsReady:
+		case <-readyCh:
 			_, _ = protocol.NewMessage(protocol.MsgReady, sid, "").WriteTo(conn)
 		case <-time.After(15 * time.Second):
 			log.Printf("[daemon] %s session %s ready timeout", cliID, safeShort(sid))
@@ -535,37 +588,46 @@ func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message
 		_, _ = protocol.NewMessage(protocol.MsgError, "", "missing session_id").WriteTo(clientConn)
 		return
 	}
+
 	d.sessionsMu.RLock()
-	ws, ok := d.sessions[msg.SessionID]
+	meta, ok := d.sessions[msg.SessionID]
 	d.sessionsMu.RUnlock()
 	if !ok {
 		_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "session not found").WriteTo(clientConn)
 		return
 	}
+	if meta.Closed {
+		_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "session is closed").WriteTo(clientConn)
+		return
+	}
+
+	d.workersMu.RLock()
+	h := d.workers[msg.SessionID]
+	d.workersMu.RUnlock()
+	if h == nil {
+		_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "worker not available").WriteTo(clientConn)
+		return
+	}
+
 	select {
-	case <-ws.Connected:
+	case <-h.Ready:
 	case <-time.After(15 * time.Second):
 		_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "worker not connected").WriteTo(clientConn)
 		return
 	}
+
 	if msg.Type == protocol.MsgUserInput {
-		if ws.Conn == nil {
-			_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "worker conn lost").WriteTo(clientConn)
-			return
-		}
 		inCopy := *msg
-		if _, err := inCopy.WriteTo(ws.Conn); err != nil {
+		if err := h.Send(&inCopy); err != nil {
 			_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "forward: "+err.Error()).WriteTo(clientConn)
 			return
 		}
-		ws.touchActive()
+		meta.touchActive()
 	}
 
 	connMu := sync.Mutex{}
 	stop := make(chan struct{})
-	ws.mu.Lock()
-	ws.onClose = append(ws.onClose, func() { closeOnce(stop) })
-	ws.mu.Unlock()
+	meta.AddOnClose(func() { closeOnce(stop) })
 
 	go func() {
 		ticker := time.NewTicker(200 * time.Millisecond)
@@ -580,12 +642,12 @@ func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message
 				return
 			case <-ticker.C:
 			}
-			outs := ws.SnapshotOutput()
+			outs := meta.SnapshotOutput()
 			if len(outs) <= seen {
 				continue
 			}
 			for i := seen; i < len(outs); i++ {
-				m := protocol.NewMessage(protocol.MsgOutput, ws.SessionID, outs[i])
+				m := protocol.NewMessage(protocol.MsgOutput, meta.SessionID, outs[i])
 				connMu.Lock()
 				_, _ = m.WriteTo(clientConn)
 				connMu.Unlock()
@@ -630,28 +692,26 @@ func isClosedChan(ch chan struct{}) bool {
 	}
 }
 
-func (d *Daemon) routeMessage(msg *protocol.Message, ws *WorkerSession) {
+func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *WorkerHandle) {
 	switch msg.Type {
 	case protocol.MsgReady:
-		log.Printf("[daemon] session %s -> READY", ws.SessionID[:8])
-		ws.touchActive()
-		d.store.UpdateLastActive(ws.SessionID)
+		log.Printf("[daemon] session %s -> READY", safeShort(meta.SessionID))
+		meta.touchActive()
+		_ = d.store.UpdateLastActive(meta.SessionID)
 	case protocol.MsgHeartbeat:
-		ws.mu.Lock()
-		ws.hbSeen = time.Now()
-		ws.mu.Unlock()
+		h.TouchHb()
 	case protocol.MsgOutput:
-		ws.AddOutput(msg.Payload)
-		ws.touchActive()
-		d.store.UpdateOutput(ws.SessionID, msg.Payload)
-		fmt.Printf("[session=%s] %s\n", ws.SessionID[:8], msg.Payload)
+		meta.AddOutput(msg.Payload)
+		meta.touchActive()
+		_ = d.store.UpdateOutput(meta.SessionID, msg.Payload)
+		fmt.Printf("[session=%s] %s\n", safeShort(meta.SessionID), msg.Payload)
 	case protocol.MsgError:
-		log.Printf("[daemon] session %s error: %s", ws.SessionID[:8], msg.Payload)
+		log.Printf("[daemon] session %s error: %s", safeShort(meta.SessionID), msg.Payload)
 	case protocol.MsgClose:
-		log.Printf("[daemon] session %s closed by worker", ws.SessionID[:8])
-		d.removeSession(ws.SessionID)
+		log.Printf("[daemon] session %s closed by worker", safeShort(meta.SessionID))
+		d.removeSession(meta.SessionID)
 	default:
-		log.Printf("[daemon] session %s unknown msg type=%s", ws.SessionID[:8], msg.Type)
+		log.Printf("[daemon] session %s unknown msg type=%s", safeShort(meta.SessionID), msg.Type)
 	}
 }
 
@@ -672,30 +732,34 @@ func (d *Daemon) periodicGC() {
 func (d *Daemon) runGC() {
 	now := time.Now()
 	d.sessionsMu.RLock()
-	snaps := make([]*WorkerSession, 0, len(d.sessions))
-	for _, ws := range d.sessions {
-		snaps = append(snaps, ws)
+	metas := make([]*SessionMeta, 0, len(d.sessions))
+	for _, m := range d.sessions {
+		metas = append(metas, m)
 	}
 	d.sessionsMu.RUnlock()
 	idleLimit := 15 * time.Minute
 	hbLimit := 20 * time.Second
-	for _, ws := range snaps {
-		ws.mu.Lock()
-		lastActive := ws.lastActive
-		lastHb := ws.hbSeen
-		closed := ws.closed
-		ws.mu.Unlock()
-		if closed {
+	for _, meta := range metas {
+		if meta.Closed {
 			continue
 		}
-		if now.Sub(lastHb) > hbLimit && isClosedChan(ws.Connected) {
-			log.Printf("[daemon] session %s heartbeat stale (>%s), closing", ws.SessionID[:8], hbLimit)
-			d.CloseSession(ws.SessionID, "heartbeat stale")
+		lastActive := meta.LastActive()
+		d.workersMu.RLock()
+		h, hasH := d.workers[meta.SessionID]
+		var lastHb time.Time
+		if hasH {
+			lastHb = h.LastHb()
+		}
+		d.workersMu.RUnlock()
+
+		if hasH && now.Sub(lastHb) > hbLimit && h.IsReady() {
+			log.Printf("[daemon] session %s heartbeat stale (>%s), closing", safeShort(meta.SessionID), hbLimit)
+			d.CloseSession(meta.SessionID, "heartbeat stale")
 			continue
 		}
 		if now.Sub(lastActive) > idleLimit {
-			log.Printf("[daemon] session %s idle (>%s), closing", ws.SessionID[:8], idleLimit)
-			d.CloseSession(ws.SessionID, "idle")
+			log.Printf("[daemon] session %s idle (>%s), closing", safeShort(meta.SessionID), idleLimit)
+			d.CloseSession(meta.SessionID, "idle")
 		}
 	}
 }
