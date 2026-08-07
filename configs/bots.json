@@ -1,0 +1,25 @@
+{
+  "listen_addr": "127.0.0.1:17890",
+  "log_level": "info",
+  "session_dir": "~/.botmux-go/sessions",
+  "bots": [
+    {
+      "name": "mock-bot",
+      "bot_id": "bot-mock",
+      "cli_type": "mock",
+      "backend_type": "pty",
+      "working_dir": "~",
+      "allowed_users": ["*"]
+    },
+    {
+      "name": "codex-bot",
+      "bot_id": "bot-codex",
+      "cli_type": "codex",
+      "cli_path": "",
+      "backend_type": "tmux",
+      "working_dir": "~/workspace",
+      "model": "claude-sonnet-4",
+      "allowed_users": ["user1_openid", "user2_openid"]
+    }
+  ]
+}
