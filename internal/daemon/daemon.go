@@ -18,13 +18,15 @@ import (
 )
 
 type Daemon struct {
-	cfg      *config.DaemonConfig
-	listener net.Listener
-	selfExe  string
-	store    *SessionStore
+	cfg          *config.DaemonConfig
+	listener     net.Listener
+	httpListener net.Listener
+	selfExe      string
+	store        *SessionStore
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
+	startedAt time.Time
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*SessionMeta
@@ -40,10 +42,10 @@ type Daemon struct {
 
 	wg sync.WaitGroup
 
-	monitorMu    sync.Mutex
-	monitorStop  chan struct{}
+	monitorMu     sync.Mutex
+	monitorStop   chan struct{}
 	spawnFailures map[string]*spawnFailure
-	spawnSem     chan struct{}
+	spawnSem      chan struct{}
 }
 
 func New(cfg *config.DaemonConfig) (*Daemon, error) {
@@ -73,14 +75,16 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("listen %s: %w", d.cfg.ListenAddr, err)
 	}
 	d.listener = ln
+	d.startedAt = time.Now()
 	log.Printf("[daemon] listening on %s (self=%s, sessions_dir=%s)", d.cfg.ListenAddr, d.selfExe, d.cfg.SessionsDir)
 
 	d.restoreSessions()
 	d.startSessionMonitor()
 
-	d.wg.Add(2)
+	d.wg.Add(3)
 	go d.acceptLoop()
 	go d.periodicGC()
+	go d.startHTTPServer()
 	return nil
 }
 
@@ -98,6 +102,9 @@ func (d *Daemon) Stop() error {
 	d.closeMu.Unlock()
 	d.cancel()
 	d.stopSessionMonitor()
+	if d.httpListener != nil {
+		_ = d.httpListener.Close()
+	}
 	if d.listener != nil {
 		_ = d.listener.Close()
 	}

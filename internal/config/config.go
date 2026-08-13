@@ -23,21 +23,22 @@ const (
 )
 
 type BotConfig struct {
-	Name        string      `json:"name"`
-	BotID       string      `json:"bot_id"`
-	CliType     CliType     `json:"cli_type"`
-	CliPath     string      `json:"cli_path,omitempty"`
-	BackendType BackendType `json:"backend_type,omitempty"`
-	WorkingDir  string      `json:"working_dir,omitempty"`
-	AllowedUsers []string   `json:"allowed_users,omitempty"`
-	Model       string      `json:"model,omitempty"`
+	Name         string      `json:"name"`
+	BotID        string      `json:"bot_id"`
+	CliType      CliType     `json:"cli_type"`
+	CliPath      string      `json:"cli_path,omitempty"`
+	BackendType  BackendType `json:"backend_type,omitempty"`
+	WorkingDir   string      `json:"working_dir,omitempty"`
+	AllowedUsers []string    `json:"allowed_users,omitempty"`
+	Model        string      `json:"model,omitempty"`
 }
 
 type DaemonConfig struct {
-	ListenAddr  string      `json:"listen_addr"`
-	LogLevel    string      `json:"log_level"`
-	SessionsDir string      `json:"sessions_dir"`
-	Bots        []BotConfig `json:"bots"`
+	ListenAddr    string      `json:"listen_addr"`
+	DashboardAddr string      `json:"dashboard_addr"`
+	LogLevel      string      `json:"log_level"`
+	SessionsDir   string      `json:"sessions_dir"`
+	Bots          []BotConfig `json:"bots"`
 }
 
 func DefaultConfig() *DaemonConfig {
@@ -47,9 +48,10 @@ func DefaultConfig() *DaemonConfig {
 		sessionsDir = filepath.Join(home, ".botmux-go", "sessions")
 	}
 	return &DaemonConfig{
-		ListenAddr:  "127.0.0.1:17890",
-		LogLevel:    "info",
-		SessionsDir: sessionsDir,
+		ListenAddr:    "127.0.0.1:17890",
+		DashboardAddr: "127.0.0.1:17891",
+		LogLevel:      "info",
+		SessionsDir:   sessionsDir,
 		Bots: []BotConfig{
 			{
 				Name:        "default",
@@ -98,6 +100,9 @@ func LoadFromDefaultPath() (*DaemonConfig, error) {
 func (c *DaemonConfig) applyDefaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = "127.0.0.1:17890"
+	}
+	if c.DashboardAddr == "" {
+		c.DashboardAddr = "127.0.0.1:17891"
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"

@@ -74,6 +74,7 @@ func runDaemon() {
 	cfgPath := flag.String("config", "", "path to bots.json config (optional)")
 	cmd := flag.String("cmd", "", "send command to running daemon: new <session_id> [<bot_id>] | send <session_id> <msg>")
 	listen := flag.String("listen", "", "override daemon listen addr (e.g. 127.0.0.1:17890)")
+	dashboard := flag.String("dashboard", "", "override dashboard listen addr (e.g. 127.0.0.1:17891)")
 	flag.Parse()
 
 	if *cmd != "" {
@@ -89,6 +90,9 @@ func runDaemon() {
 	if *listen != "" {
 		cfg.ListenAddr = *listen
 	}
+	if *dashboard != "" {
+		cfg.DashboardAddr = *dashboard
+	}
 	d, err := daemon.New(cfg)
 	if err != nil {
 		log.Fatalf("[daemon] init: %v", err)
@@ -101,8 +105,9 @@ func runDaemon() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
 	fmt.Printf("\n=== botmux-go daemon started ===\n")
-	fmt.Printf("  listen   : %s\n", cfg.ListenAddr)
-	fmt.Printf("  bots     : %d\n", len(cfg.Bots))
+	fmt.Printf("  listen    : %s\n", cfg.ListenAddr)
+	fmt.Printf("  dashboard : %s\n", cfg.DashboardAddr)
+	fmt.Printf("  bots      : %d\n", len(cfg.Bots))
 	for _, b := range cfg.Bots {
 		fmt.Printf("    - %s (%s, cli=%s, backend=%s)\n", b.Name, b.BotID, b.CliType, b.BackendType)
 	}
