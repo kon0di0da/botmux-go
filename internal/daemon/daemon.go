@@ -222,9 +222,23 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 	meta.Status = StatusSpawning
 	d.sessionsMu.Unlock()
 
+	d.workersMu.Lock()
+	if existing, ok := d.workers[meta.SessionID]; ok && existing != nil {
+		if existing.Cmd != nil && existing.Cmd.Process != nil {
+			_ = existing.Cmd.Process.Kill()
+		}
+		if existing.Conn != nil {
+			_ = existing.Conn.Close()
+		}
+	}
+	d.workers[meta.SessionID] = handle
+	d.workersMu.Unlock()
+
 	if err := cmd.Start(); err != nil {
 		d.workersMu.Lock()
-		delete(d.workers, meta.SessionID)
+		if cur, ok := d.workers[meta.SessionID]; ok && cur == handle {
+			delete(d.workers, meta.SessionID)
+		}
 		d.workersMu.Unlock()
 		d.sessionsMu.Lock()
 		meta.Status = StatusRecovering
@@ -232,10 +246,6 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 		return fmt.Errorf("spawn worker: %w", err)
 	}
 	handle.Pid = cmd.Process.Pid
-
-	d.workersMu.Lock()
-	d.workers[meta.SessionID] = handle
-	d.workersMu.Unlock()
 
 	_ = d.store.UpdateWorkerPID(meta.SessionID, handle.Pid)
 
@@ -352,6 +362,36 @@ func (d *Daemon) removeSession(id string) {
 			fn()
 		}()
 	}
+}
+
+func (d *Daemon) PurgeSession(id string) {
+	d.workersMu.Lock()
+	h, hasHandle := d.workers[id]
+	if hasHandle {
+		delete(d.workers, id)
+	}
+	d.workersMu.Unlock()
+
+	d.sessionsMu.Lock()
+	delete(d.sessions, id)
+	d.sessionsMu.Unlock()
+
+	if hasHandle && h != nil {
+		h.CloseConn()
+		if h.Cmd != nil && h.Cmd.Process != nil {
+			_ = h.Cmd.Process.Kill()
+			done := make(chan struct{})
+			go func() {
+				_, _ = h.Cmd.Process.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+	_ = d.store.remove(id)
 }
 
 func (d *Daemon) CloseSession(id, reason string) {

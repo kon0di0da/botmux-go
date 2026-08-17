@@ -14,7 +14,8 @@ docs/
 └── versions/
     ├── v1-architecture.md       V1 学习笔记（脚手架）
     ├── v2-architecture.md       V2 学习笔记（会话持久化与恢复）
-    ├── v3-architecture.md       （待实现）
+    ├── v3-architecture.md       V3 学习笔记（Session↔Worker 解耦与自愈）
+    ├── v4-architecture.md       V4 技术方案（HTTP Dashboard + REST API，方案阶段）
     └── ...
 ```
 
@@ -26,8 +27,8 @@ docs/
 |------|------|---------|--------|---------|---------|------|
 | **V1** | 脚手架搭建 | Daemon + Worker 双进程、TCP JSON 行协议、MockAdapter Factory、`-cmd new/send` 命令 | ~1000 行 | [v1-architecture.md](versions/v1-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/KAECwXNiPi08eEkEpg6cggNGnhe) | ✅ 完成 |
 | **V2** | 会话持久化与恢复 | SessionStore JSON 持久化、`restoreSessions()` 启动恢复、Worker 指数退避重连、tmux Adapter | ~716 行（改动） | [v2-architecture.md](versions/v2-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/WbpwwpjI1itL1fk7Cg7cYICAnTd) | ✅ 完成 |
-| **V3** | Session↔Worker 解耦 + 自动自愈 | SessionMeta/WorkerHandle 拆分、SessionMonitor 巡检自动拉 Worker、`-cmd list/history/close`、状态机可视化 | 预计 ~1000 行 | （待写） | （待创建） | 🔧 规划中 |
-| V4 | HTTP Dashboard + REST API | `GET /api/sessions`、会话详情页、心跳面板 | （待估） | （待写） | （待创建） | 📋 待规划 |
+| **V3** | Session↔Worker 解耦 + 自动自愈 | SessionMeta/WorkerHandle 双 map 解耦、SessionMonitor 每秒 reconcile 自动拉 Worker、`-cmd list/history/close`、6 状态状态机、5 层风暴防护 | ~1250 行 | [v3-architecture.md](versions/v3-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/I30SwgAlFi8eS5kKfgIcLOHznlc) | ✅ 完成 |
+| V4 | HTTP Dashboard + REST API | 内嵌 HTTP Server（17891）、6 个 REST 端点（healthz/sessions/bots）、纯静态 Dashboard 单页、`?bot_id/status/sort` 查询参数对齐官方 Session Discovery | ~865 行 | [v4-architecture.md](versions/v4-architecture.md) | （待创建）| 📋 方案已定 |
 | V5 | 真实 Agent CLI 接入 | CodexAdapter / BashAdapter / Provider Router | （待估） | （待写） | （待创建） | 📋 待规划 |
 | V6 | 飞书/Lark Channel 接入 | `@bot` mention 路由、卡片流式更新、工具调用按钮 | （待估） | （待写） | （待创建） | 📋 待规划 |
 
@@ -41,8 +42,8 @@ docs/
 |------|-----------------|---------|---------|
 | **V1** | botmux-go v1 学习笔记 & 架构演进 | https://bytedance.larkoffice.com/wiki/KAECwXNiPi08eEkEpg6cggNGnhe | 2026-08-06 |
 | **V2** | botmux-go v2 会话持久化与恢复 | https://bytedance.larkoffice.com/wiki/WbpwwpjI1itL1fk7Cg7cYICAnTd | 2026-08-06 |
-| **V3** | botmux-go v3 Session↔Worker 解耦与自愈 | （待创建后填入） | — |
-| **V4** | botmux-go v4 HTTP Dashboard | （待创建后填入） | — |
+| **V3** | botmux-go v3 Session↔Worker 解耦与自愈 | https://bytedance.larkoffice.com/wiki/I30SwgAlFi8eS5kKfgIcLOHznlc | 2026-08-12 |
+| **V4** | botmux-go v4 HTTP Dashboard + REST API | （待创建后填入） | — |
 | **V5** | botmux-go v5 真实 Agent CLI 接入 | （待创建后填入） | — |
 | **V6** | botmux-go v6 飞书 Channel 接入 | （待创建后填入） | — |
 
@@ -53,9 +54,10 @@ docs/
 1. **架构入门**：先通读 V1 文档的 3 张 Mermaid 架构图建立心智模型
 2. **代码起步**：按 V1「4 步快速跑通」把 Daemon + new + send 链路跑通
 3. **深入 V2**：按 V2 的「§十一 发现的问题」自己复现僵尸 Session，体会「为什么需要解耦」
-4. **进入 V3**：带着 V2 的 3 个 P0 痛点进入 V3 实现（结构体拆分 → Monitor → list/close 命令）
-5. **横向对标**：同步参考 TS 原版 `botmux/src/daemon.ts`、`botmux/src/core/worker-pool.ts` 对比 Go 实现差异
-6. **扩展动手**：V4/V5 任选一个方向做（Dashboard 或真实 CLI Adapter）
+4. **进入 V3**：读 V3 文档的「§二 架构演进图」+「§三 状态机」+「§五 reconcile 机制」，带 V2 痛点理解双 map 解耦的必要性
+5. **动手 V3**：按 V3 文档的「§八 测试 SOP」跑 6 个 Case，重点体验 Case 4（Worker 被杀自愈）和 Case 6（close 竞争防护）
+6. **横向对标**：同步参考 TS 原版 `botmux/src/daemon.ts`、`botmux/src/core/worker-pool.ts` 对比 Go 实现差异
+7. **扩展动手**：V4/V5 任选一个方向做（Dashboard 或真实 CLI Adapter）
 
 ---
 
@@ -94,4 +96,4 @@ rm -rf $BOTMUX_SESSIONS_DIR && mkdir -p $BOTMUX_SESSIONS_DIR
 
 ---
 
-最后更新：2026-08-07（V2 完成 + 目录初始化）
+最后更新：2026-08-12（V3 完成 + 双 map 解耦 + Monitor 自愈 + CLI 管理命令 + 6 Case 全回归）
