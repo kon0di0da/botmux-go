@@ -103,14 +103,16 @@ func (s *SessionStore) MarkClosed(sessionID string) error {
 	return s.save(ps)
 }
 
+const maxPersistedOutputLines = 5000
+
 func (s *SessionStore) UpdateOutput(sessionID string, output string) error {
 	ps, err := s.load(sessionID)
 	if err != nil {
 		return err
 	}
 	ps.LastOutput = append(ps.LastOutput, output)
-	if len(ps.LastOutput) > 100 {
-		ps.LastOutput = ps.LastOutput[len(ps.LastOutput)-100:]
+	if len(ps.LastOutput) > maxPersistedOutputLines {
+		ps.LastOutput = ps.LastOutput[len(ps.LastOutput)-maxPersistedOutputLines:]
 	}
 	ps.LastActive = time.Now()
 	return s.save(ps)

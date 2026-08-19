@@ -28,7 +28,7 @@ docs/
 | **V1** | 脚手架搭建 | Daemon + Worker 双进程、TCP JSON 行协议、MockAdapter Factory、`-cmd new/send` 命令 | ~1000 行 | [v1-architecture.md](versions/v1-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/KAECwXNiPi08eEkEpg6cggNGnhe) | ✅ 完成 |
 | **V2** | 会话持久化与恢复 | SessionStore JSON 持久化、`restoreSessions()` 启动恢复、Worker 指数退避重连、tmux Adapter | ~716 行（改动） | [v2-architecture.md](versions/v2-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/WbpwwpjI1itL1fk7Cg7cYICAnTd) | ✅ 完成 |
 | **V3** | Session↔Worker 解耦 + 自动自愈 | SessionMeta/WorkerHandle 双 map 解耦、SessionMonitor 每秒 reconcile 自动拉 Worker、`-cmd list/history/close`、6 状态状态机、5 层风暴防护 | ~1250 行 | [v3-architecture.md](versions/v3-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/I30SwgAlFi8eS5kKfgIcLOHznlc) | ✅ 完成 |
-| V4 | HTTP Dashboard + REST API | 内嵌 HTTP Server（17891）、6 个 REST 端点（healthz/sessions/bots）、纯静态 Dashboard 单页、`?bot_id/status/sort` 查询参数对齐官方 Session Discovery | ~865 行 | [v4-architecture.md](versions/v4-architecture.md) | （待创建）| 📋 方案已定 |
+| **V4** | HTTP Dashboard + REST API | 内嵌 HTTP Server（17891 双端口）、8 个 REST 端点、go:embed 深色终端 SPA 单页、YOU/BOT/SYS 彩色对话、增量 DOM 更新（打字不丢）、?bot_id/status/sort/limit/offset 查询、409 幂等 + ?force=true 强制重建、spawn 竞态修复（重连风暴根因）、SendInput 用户消息双写持久化 | ~1342 行（Go 740 + HTML 602）| [v4-architecture.md](versions/v4-architecture.md) | （待创建后填入飞书链接）| ✅ 完成 |
 | V5 | 真实 Agent CLI 接入 | CodexAdapter / BashAdapter / Provider Router | （待估） | （待写） | （待创建） | 📋 待规划 |
 | V6 | 飞书/Lark Channel 接入 | `@bot` mention 路由、卡片流式更新、工具调用按钮 | （待估） | （待写） | （待创建） | 📋 待规划 |
 

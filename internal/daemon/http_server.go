@@ -34,6 +34,7 @@ func (d *Daemon) startHTTPServer() {
 			d.httpListSessions(w, r)
 		}
 	}))
+	d.registerDashboardRoute(mux)
 
 	srv := &http.Server{Addr: d.cfg.DashboardAddr, Handler: mux}
 	go func() {
@@ -136,7 +137,7 @@ func (d *Daemon) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		SessionsCount: sessionsCount,
 		WorkersCount:  workersCount,
 		BotsCount:     len(d.cfg.Bots),
-		Version:       "v4-pr-b",
+		Version:       "v4-pr-c",
 	}
 
 	d.writeJSON(w, http.StatusOK, resp)
@@ -284,6 +285,9 @@ type sessionDetailResponse struct {
 	Closed     bool            `json:"closed"`
 	CreatedAt  string          `json:"created_at"`
 	LastActive string          `json:"last_active"`
+	TotalLines int             `json:"total_lines"`
+	Offset     int             `json:"offset"`
+	Limit      int             `json:"limit"`
 	Outputs    []string        `json:"outputs"`
 	Worker     *workerSnapshot `json:"worker"`
 }
@@ -294,13 +298,30 @@ type workerSnapshot struct {
 	LastHb string `json:"last_hb"`
 }
 
-func (d *Daemon) handleGetSession(w http.ResponseWriter, _ *http.Request, sid string) {
+func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid string) {
 	d.sessionsMu.RLock()
 	m, ok := d.sessions[sid]
 	d.sessionsMu.RUnlock()
 	if !ok {
 		d.writeError(w, http.StatusNotFound, "session not found: "+sid)
 		return
+	}
+	q := r.URL.Query()
+	defaultLimit := maxMemoryOutputLines
+	if defaultLimit > 500 {
+		defaultLimit = 500
+	}
+	limit := defaultLimit
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= maxMemoryOutputLines {
+			limit = n
+		}
+	}
+	offset := 0
+	if v := q.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
 	}
 	pid := 0
 	var ws *workerSnapshot
@@ -315,6 +336,17 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, _ *http.Request, sid st
 		}
 	}
 	d.workersMu.RUnlock()
+	all := m.SnapshotOutput()
+	total := len(all)
+	start := offset
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	paged := all[start:end]
 	resp := sessionDetailResponse{
 		SessionID:  m.SessionID,
 		BotID:      m.BotID,
@@ -326,7 +358,10 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, _ *http.Request, sid st
 		Closed:     m.Closed,
 		CreatedAt:  m.CreatedAt.Format(time.RFC3339),
 		LastActive: m.LastActive().Format(time.RFC3339),
-		Outputs:    m.SnapshotOutput(),
+		TotalLines: total,
+		Offset:     start,
+		Limit:      limit,
+		Outputs:    paged,
 		Worker:     ws,
 	}
 	d.writeJSON(w, http.StatusOK, resp)

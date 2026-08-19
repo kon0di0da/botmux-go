@@ -452,6 +452,10 @@ func (d *Daemon) SendInput(id, input string) error {
 
 	msg := protocol.NewMessage(protocol.MsgUserInput, id, input)
 	meta.touchActive()
+	userLine := "[user] " + input
+	meta.AddOutput(userLine)
+	_ = d.store.UpdateOutput(id, userLine)
+	fmt.Printf("[session=%s] %s\n", safeShort(id), userLine)
 	return h.Send(msg)
 }
 

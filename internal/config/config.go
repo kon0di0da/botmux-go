@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type CliType string
 
 const (
 	CliMock   CliType = "mock"
+	CliPty    CliType = "pty"
 	CliCodex  CliType = "codex"
 	CliClaude CliType = "claude-code"
 )
@@ -91,10 +93,21 @@ func LoadFromDefaultPath() (*DaemonConfig, error) {
 	}
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
-			return Load(p)
+			absPath, _ := filepath.Abs(p)
+			return Load(absPath)
 		}
 	}
 	return DefaultConfig(), nil
+}
+
+func expandPath(p string) string {
+	if strings.HasPrefix(p, "~") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	return p
 }
 
 func (c *DaemonConfig) applyDefaults() {
@@ -110,11 +123,13 @@ func (c *DaemonConfig) applyDefaults() {
 	if c.SessionsDir == "" {
 		envDir := os.Getenv("BOTMUX_SESSIONS_DIR")
 		if envDir != "" {
-			c.SessionsDir = envDir
+			c.SessionsDir = expandPath(envDir)
 		} else {
 			home, _ := os.UserHomeDir()
 			c.SessionsDir = filepath.Join(home, ".botmux-go", "sessions")
 		}
+	} else {
+		c.SessionsDir = expandPath(c.SessionsDir)
 	}
 	for i := range c.Bots {
 		if c.Bots[i].BackendType == "" {
@@ -123,6 +138,8 @@ func (c *DaemonConfig) applyDefaults() {
 		if c.Bots[i].WorkingDir == "" {
 			home, _ := os.UserHomeDir()
 			c.Bots[i].WorkingDir = home
+		} else {
+			c.Bots[i].WorkingDir = expandPath(c.Bots[i].WorkingDir)
 		}
 	}
 }

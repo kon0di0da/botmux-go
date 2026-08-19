@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -314,6 +315,14 @@ func (w *Worker) readCliOutput() {
 		}
 		text := string(buf)
 		buf = buf[:0]
+		// PTY outputs \r\n for newlines; ReadLine strips \n but leaves trailing \r.
+		// Also handle in-place \r (carriage return for progress bars/spinners)
+		// by keeping only the content after the last \r.
+		text = strings.TrimRight(text, "\r")
+		if idx := strings.LastIndexByte(text, '\r'); idx >= 0 {
+			text = text[idx+1:]
+		}
+		text = strings.TrimSpace(text)
 		if text == "" {
 			continue
 		}

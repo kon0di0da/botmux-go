@@ -43,12 +43,14 @@ func (m *SessionMeta) LastActive() time.Time {
 	return m.lastActive
 }
 
+const maxMemoryOutputLines = 2000
+
 func (m *SessionMeta) AddOutput(line string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.LastOutput = append(m.LastOutput, line)
-	if len(m.LastOutput) > 50 {
-		m.LastOutput = m.LastOutput[len(m.LastOutput)-50:]
+	if len(m.LastOutput) > maxMemoryOutputLines {
+		m.LastOutput = m.LastOutput[len(m.LastOutput)-maxMemoryOutputLines:]
 	}
 }
 

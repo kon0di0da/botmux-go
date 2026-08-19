@@ -1,7 +1,8 @@
 {
   "listen_addr": "127.0.0.1:17890",
+  "dashboard_addr": "127.0.0.1:17891",
   "log_level": "info",
-  "session_dir": "~/.botmux-go/sessions",
+  "sessions_dir": "~/.botmux-go/sessions",
   "bots": [
     {
       "name": "mock-bot",
@@ -9,6 +10,15 @@
       "cli_type": "mock",
       "backend_type": "pty",
       "working_dir": "~",
+      "allowed_users": ["*"]
+    },
+    {
+      "name": "bash-bot",
+      "bot_id": "bot-bash",
+      "cli_type": "pty",
+      "cli_path": "/bin/bash",
+      "backend_type": "pty",
+      "working_dir": "/Users/bytedance/botmux-go",
       "allowed_users": ["*"]
     },
     {
