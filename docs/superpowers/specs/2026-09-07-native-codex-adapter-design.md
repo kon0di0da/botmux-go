@@ -133,11 +133,14 @@ resumed session.
 
 `CliStartResult` gains:
 
-- `Ready <-chan struct{}` for adapters with authoritative readiness;
+- `ReadyResult <-chan error` for adapters with authoritative readiness (`nil`
+  means ready; a non-nil error means the CLI exited or readiness timed out);
 - `Events <-chan AdapterEvent` for structured output and terminal events;
 - `StructuredOutput bool` to suppress forwarding raw TUI lines as answers.
 
 Existing `ReadyDelay` remains for legacy adapters.
+`ReadyResult` is separate from the existing process-exit `ErrCh`, so startup
+waiting and steady-state output handling never race to consume one error.
 
 `CliAdapter.Send` returns `SendResult`:
 
@@ -225,8 +228,8 @@ session close.
 ### 5.1 READY
 
 The Worker starts PTY output consumption immediately. For Codex it feeds
-normalized screen text into the adapter readiness detector. Only the adapter's
-`Ready` channel permits Worker `MsgReady`.
+normalized screen text into the adapter readiness detector. Only a nil result
+from the adapter's `ReadyResult` channel permits Worker `MsgReady`.
 
 Startup output, heartbeats, and TCP connection establishment cannot mark Codex
 READY.
