@@ -396,7 +396,10 @@ func codexComposerReady(screen string) bool {
 ```
 
 Keep a bounded rolling raw screen buffer so prompt fragments spanning reads are
-recognized. Strip ANSI before applying the predicate.
+recognized. Add `stripCodexANSI(string) string` in `codex.go` and strip ANSI
+before applying the predicate. `ready` is buffered with capacity one;
+`observeReady` sends `nil` exactly once, while the `cmd.Wait` goroutine sends
+the process error exactly once when readiness has not yet succeeded.
 
 - [ ] **Step 4: Make Worker wait for authoritative readiness**
 
@@ -501,6 +504,18 @@ func TestMatchCodexHistoryDelta(t *testing.T) {
 		t.Fatalf("got (%q,%v), want owned,true", got, ok)
 	}
 }
+
+func appendFile(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, content); err != nil {
+		t.Fatal(err)
+	}
+}
 ```
 
 - [ ] **Step 2: Confirm red**
@@ -560,6 +575,23 @@ Only accept:
 
 If ownership cannot be proven, history confirmation fails closed.
 
+Inject the ownership lookup for deterministic tests:
+
+```go
+type codexDependencies struct {
+	ownedRollouts func(pid int) (map[string]struct{}, error)
+}
+
+func (a *CodexAdapter) ownsSession(id string) bool {
+	owned, err := a.deps.ownedRollouts(a.cmd.Process.Pid)
+	if err != nil {
+		return false
+	}
+	_, ok := owned[strings.ToLower(id)]
+	return ok
+}
+```
+
 - [ ] **Step 5: Implement verified input**
 
 `CodexAdapter.Send` must:
@@ -583,6 +615,37 @@ for attempt := 0; attempt < 3; attempt++ {
 	}
 }
 return SendResult{}, errors.New("codex submit not confirmed after 3 Enter attempts")
+```
+
+Implement these local helpers in `codex.go`:
+
+```go
+func normalizeCodexInput(input string) string {
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	input = strings.ReplaceAll(input, "\r", "\n")
+	return strings.TrimRight(input, "\n")
+}
+
+func writeAll(ctx context.Context, w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+	return nil
+}
 ```
 
 Never resend `body`. Serialize all sends with `sendMu`.
@@ -985,7 +1048,7 @@ case protocol.MsgTurnCompleted:
 	var terminal protocol.TurnTerminal
 	if err := json.Unmarshal([]byte(msg.Payload), &terminal); err != nil {
 		terminal = protocol.TurnTerminal{
-			Status: "failed", ErrorCode: "invalid_terminal",
+			Status: protocol.TurnFailed, ErrorCode: "invalid_terminal",
 			ErrorDetail: err.Error(),
 		}
 	}
