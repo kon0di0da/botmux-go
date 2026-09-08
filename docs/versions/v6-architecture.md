@@ -1,7 +1,7 @@
 # botmux-go V6 技术设计 - Native Codex 单轮闭环
 
 > **日期**: 2026-09-08
-> **状态**: 自动化验证完成；真实 Codex 验收脚本已提供，未在本次开发中执行
+> **状态**: 自动化与真实 Codex 验收完成
 > **前置版本**: [V5](v5-architecture.md)
 
 ## 目标与边界
@@ -50,11 +50,11 @@ sequenceDiagram
   D-->>C: output + terminal
 ```
 
-重启时 daemon 将保存的 `CliSessionID` 放入 Worker 环境；adapter 使用 `codex resume <id>`，并刻意不携带 profile 或 model，防止覆盖原会话元数据。
+重启时 daemon 将保存的 `CliSessionID` 放入 Worker 环境；adapter 使用 `codex resume <id>`。resume 保留已选 `--profile`，因为 ArkCLI 等 provider 需要 profile 恢复鉴权上下文；仍不传 `--model`，避免覆盖原会话模型选择。
 
 ## Profile
 
-仅发现 `${CODEX_HOME:-~/.codex}/*.config.toml` 的合法名称。profile 内容不会被读取、记录或通过 API 返回。fresh launch 接受 bot 默认或创建会话时的覆盖值；resume 忽略它。
+仅发现 `${CODEX_HOME:-~/.codex}/*.config.toml` 的合法名称。profile 内容不会被读取、记录或通过 API 返回。fresh launch 接受 bot 默认或创建会话时的覆盖值；resume 重用已持久化的 profile。
 
 ## 失败处理
 
@@ -71,7 +71,7 @@ sequenceDiagram
 
 已通过 `go test ./...`、`go test -race ./...`、`go build ./...`、`go vet ./...`。fake Codex 测试覆盖 fresh/profile、multiline、history ownership、rollout final/terminal 和 resume argv。
 
-真实账号验收见 [v6_codex_e2e.sh](../../scripts/v6_codex_e2e.sh)。运行前确认 `configs/bots.json` 的工作目录、模型与 profile 可用。
+真实账号验收于 2026-09-08 执行 [v6_codex_e2e.sh](../../scripts/v6_codex_e2e.sh)：fresh 回合返回 `CODEX_V6_ONE` 与 `CODEX_V6_TWO`；daemon 重启后 native resume 回答了两个 marker。脚本会等待 daemon 监听并在恢复期重试 worker-not-ready。
 
 ## 后续
 

@@ -94,6 +94,9 @@ func (a *CodexAdapter) buildArgs(workingDir string) []string {
 		"-c", "check_for_update_on_startup=false",
 	}
 	if a.resumeID != "" {
+		if a.profile != "" {
+			base = append(base, "--profile", a.profile)
+		}
 		return append([]string{"resume"}, append(base, a.resumeID)...)
 	}
 	if a.profile != "" {
@@ -298,6 +301,12 @@ func (a *CodexAdapter) publishReady(err error) {
 }
 
 func codexComposerReady(screen string) bool {
+	if strings.Contains(screen, "Resuming session") ||
+		strings.Contains(screen, "model: loading") ||
+		strings.Contains(screen, "Welcome to Codex") ||
+		strings.Contains(screen, "Sign in with") {
+		return false
+	}
 	if strings.Contains(screen, "% left") {
 		return true
 	}

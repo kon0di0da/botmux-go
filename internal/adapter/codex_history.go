@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -124,17 +125,75 @@ func codexRolloutsOwnedByPID(pid int) (map[string]struct{}, error) {
 	if pid <= 0 {
 		return nil, fmt.Errorf("invalid pid %d", pid)
 	}
-	targets, err := codexProcessOpenTargets(pid)
+	pids, err := codexProcessTreePIDs(pid)
 	if err != nil {
 		return nil, err
 	}
+	return codexRolloutsOwnedByPIDs(pids, codexProcessOpenTargets)
+}
+
+func codexRolloutsOwnedByPIDs(
+	pids []int,
+	openTargets func(int) ([]string, error),
+) (map[string]struct{}, error) {
 	owned := make(map[string]struct{})
-	for _, target := range targets {
-		if sessionID, ok := codexSessionIDFromRolloutPath(target); ok {
-			owned[strings.ToLower(sessionID)] = struct{}{}
+	var lastErr error
+	successes := 0
+	for _, pid := range pids {
+		targets, err := openTargets(pid)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		successes++
+		for _, target := range targets {
+			if sessionID, ok := codexSessionIDFromRolloutPath(target); ok {
+				owned[strings.ToLower(sessionID)] = struct{}{}
+			}
 		}
 	}
+	if successes == 0 && lastErr != nil {
+		return nil, lastErr
+	}
 	return owned, nil
+}
+
+func codexProcessTreePIDs(root int) ([]int, error) {
+	pids := []int{root}
+	seen := map[int]struct{}{root: {}}
+	for index := 0; index < len(pids); index++ {
+		children, err := codexChildPIDs(pids[index])
+		if err != nil {
+			return nil, err
+		}
+		for _, child := range children {
+			if _, exists := seen[child]; exists {
+				continue
+			}
+			seen[child] = struct{}{}
+			pids = append(pids, child)
+		}
+	}
+	return pids, nil
+}
+
+func codexChildPIDs(pid int) ([]int, error) {
+	out, err := exec.Command("pgrep", "-P", fmt.Sprintf("%d", pid)).Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list child processes for pid %d: %w", pid, err)
+	}
+	children := make([]int, 0)
+	for _, line := range strings.Fields(string(out)) {
+		child, err := strconv.Atoi(line)
+		if err != nil {
+			continue
+		}
+		children = append(children, child)
+	}
+	return children, nil
 }
 
 func codexProcessOpenTargets(pid int) ([]string, error) {

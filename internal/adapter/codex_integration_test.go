@@ -84,7 +84,7 @@ func TestCodexAdapterFakeProcessCompletesMultilineTurn(t *testing.T) {
 	}
 }
 
-func TestCodexAdapterFakeProcessResumeOmitsFreshOverrides(t *testing.T) {
+func TestCodexAdapterFakeProcessResumeKeepsProfileButOmitsModel(t *testing.T) {
 	fakeBin := buildFakeCodex(t)
 	home := t.TempDir()
 	argvPath := filepath.Join(home, "argv.txt")
@@ -122,7 +122,12 @@ func TestCodexAdapterFakeProcessResumeOmitsFreshOverrides(t *testing.T) {
 			t.Fatalf("resume argv %q missing %q", got, value)
 		}
 	}
-	for _, forbidden := range []string{"--profile", "arkcli", "--model", "new-default"} {
+	for _, required := range []string{"--profile", "arkcli"} {
+		if !strings.Contains(got, required) {
+			t.Fatalf("resume argv %q missing %q", got, required)
+		}
+	}
+	for _, forbidden := range []string{"--model", "new-default"} {
 		if strings.Contains(got, forbidden) {
 			t.Fatalf("resume argv unexpectedly contains %q: %q", forbidden, got)
 		}

@@ -32,7 +32,7 @@ func TestCodexBuildArgsFresh(t *testing.T) {
 	}
 }
 
-func TestCodexBuildArgsResumeDoesNotOverrideModelOrProfile(t *testing.T) {
+func TestCodexBuildArgsResumeKeepsProfileButDoesNotOverrideModel(t *testing.T) {
 	a := NewCodexAdapter(AdapterOptions{
 		CliType:         "codex",
 		Model:           "new-default",
@@ -46,6 +46,7 @@ func TestCodexBuildArgsResumeDoesNotOverrideModelOrProfile(t *testing.T) {
 		"--dangerously-bypass-hook-trust",
 		"--no-alt-screen",
 		"-c", "check_for_update_on_startup=false",
+		"--profile", "arkcli",
 		"native-session",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -61,6 +62,20 @@ func TestCodexResumeUsesPersistedNativeSessionID(t *testing.T) {
 	got := a.buildArgs("/tmp/repo")
 	if got[0] != "resume" || got[len(got)-1] != "01234567-89ab-cdef-0123-456789abcdef" {
 		t.Fatalf("resume args = %#v, want persisted native session ID", got)
+	}
+}
+
+func TestCodexComposerReadyRejectsResumeLoadingScreen(t *testing.T) {
+	screen := "model: loading\nResuming session… › Ask Codex to do anything"
+	if codexComposerReady(screen) {
+		t.Fatal("resume loading screen was treated as READY")
+	}
+}
+
+func TestCodexComposerReadyAcceptsLoadedComposer(t *testing.T) {
+	screen := "model: gpt-5.5\n› Ask Codex to do anything"
+	if !codexComposerReady(screen) {
+		t.Fatal("loaded composer was not treated as READY")
 	}
 }
 

@@ -50,6 +50,22 @@ func TestMatchCodexHistoryDeltaRequiresNewlineTerminator(t *testing.T) {
 	}
 }
 
+func TestCodexRolloutsOwnedByPIDsIncludesChildProcess(t *testing.T) {
+	rollout := "/tmp/.codex/sessions/2026/09/08/rollout-2026-09-08T00-00-00-01234567-89ab-cdef-0123-456789abcdef.jsonl"
+	got, err := codexRolloutsOwnedByPIDs([]int{100, 101}, func(pid int) ([]string, error) {
+		if pid == 101 {
+			return []string{rollout}, nil
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["01234567-89ab-cdef-0123-456789abcdef"]; !ok {
+		t.Fatalf("owned sessions = %#v, want child rollout session", got)
+	}
+}
+
 func appendCodexHistory(t *testing.T, path, content string) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
