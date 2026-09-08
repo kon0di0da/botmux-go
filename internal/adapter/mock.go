@@ -103,23 +103,23 @@ func (m *MockAdapter) echoLoop(ctx context.Context) {
 	}
 }
 
-func (m *MockAdapter) Send(ctx context.Context, input string) error {
+func (m *MockAdapter) Send(ctx context.Context, input string) (SendResult, error) {
 	m.mu.Lock()
 	closed := m.closed
 	writer := m.inputW
 	m.mu.Unlock()
 	if closed {
-		return fmt.Errorf("mock adapter is closed")
+		return SendResult{}, fmt.Errorf("mock adapter is closed")
 	}
 	if writer == nil {
-		return fmt.Errorf("mock adapter not started")
+		return SendResult{}, fmt.Errorf("mock adapter not started")
 	}
 	data := input
 	if len(data) == 0 || data[len(data)-1] != '\n' {
 		data = data + "\n"
 	}
 	_, err := writer.Write([]byte(data))
-	return err
+	return SendResult{}, err
 }
 
 func (m *MockAdapter) Close() error {

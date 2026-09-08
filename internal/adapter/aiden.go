@@ -161,7 +161,7 @@ func (a *AidenAdapter) Start(ctx context.Context, workingDir string) (*CliStartR
 	}, nil
 }
 
-func (a *AidenAdapter) Send(ctx context.Context, input string) error {
+func (a *AidenAdapter) Send(ctx context.Context, input string) (SendResult, error) {
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
 
@@ -178,31 +178,31 @@ func (a *AidenAdapter) Send(ctx context.Context, input string) error {
 	confirmTimeout := a.confirmTimeout
 	a.mu.Unlock()
 	if closed {
-		return fmt.Errorf("aiden adapter is closed")
+		return SendResult{}, fmt.Errorf("aiden adapter is closed")
 	}
 	if writer == nil {
-		return fmt.Errorf("aiden adapter not started")
+		return SendResult{}, fmt.Errorf("aiden adapter not started")
 	}
 
 	normalized := normalizeAidenInput(input)
 	if strings.TrimSpace(normalized) == "" {
-		return nil
+		return SendResult{}, nil
 	}
 
 	chunks := splitUTF8Chunks(normalized, chunkBytes)
 	for i, chunk := range chunks {
 		if err := writeAllWithRetry(ctx, writer, []byte(chunk), writeRetryAttempts, writeRetryDelay); err != nil {
-			return fmt.Errorf("aiden write text chunk %d/%d: %w", i+1, len(chunks), err)
+			return SendResult{}, fmt.Errorf("aiden write text chunk %d/%d: %w", i+1, len(chunks), err)
 		}
 		if i < len(chunks)-1 {
 			if err := waitContext(ctx, chunkDelay); err != nil {
-				return err
+				return SendResult{}, err
 			}
 		}
 	}
 
 	if err := waitContext(ctx, sendDelay); err != nil {
-		return err
+		return SendResult{}, err
 	}
 
 	if maxEnterAttempts <= 0 {
@@ -211,22 +211,22 @@ func (a *AidenAdapter) Send(ctx context.Context, input string) error {
 	for attempt := 1; attempt <= maxEnterAttempts; attempt++ {
 		activitySeq, activityCh := a.outputSubscription()
 		if err := writeAllWithRetry(ctx, writer, []byte{'\r'}, writeRetryAttempts, writeRetryDelay); err != nil {
-			return fmt.Errorf("aiden write enter attempt %d/%d: %w", attempt, maxEnterAttempts, err)
+			return SendResult{}, fmt.Errorf("aiden write enter attempt %d/%d: %w", attempt, maxEnterAttempts, err)
 		}
 		confirmed, err := a.waitForOutput(ctx, activitySeq, activityCh, confirmTimeout)
 		if err != nil {
-			return err
+			return SendResult{}, err
 		}
 		if confirmed {
-			return nil
+			return SendResult{}, nil
 		}
 		if attempt < maxEnterAttempts {
 			if err := waitContext(ctx, enterRetryDelay); err != nil {
-				return err
+				return SendResult{}, err
 			}
 		}
 	}
-	return fmt.Errorf("aiden submit not confirmed after %d Enter attempts", maxEnterAttempts)
+	return SendResult{}, fmt.Errorf("aiden submit not confirmed after %d Enter attempts", maxEnterAttempts)
 }
 
 func (a *AidenAdapter) Close() error {

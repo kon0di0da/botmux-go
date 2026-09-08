@@ -62,17 +62,17 @@ func (t *TmuxAdapter) Start(ctx context.Context, workingDir string) (*CliStartRe
 	}, nil
 }
 
-func (t *TmuxAdapter) Send(ctx context.Context, input string) error {
+func (t *TmuxAdapter) Send(ctx context.Context, input string) (SendResult, error) {
 	if err := t.ensureTmux(); err != nil {
-		return err
+		return SendResult{}, err
 	}
 	escaped := escapeTmuxKeys(input)
 	cmd := exec.Command("tmux", "send-keys", "-t", t.sessionName, escaped, "Enter")
 	cmd.Dir = t.workingDir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux send-keys: %s: %w", string(out), err)
+		return SendResult{}, fmt.Errorf("tmux send-keys: %s: %w", string(out), err)
 	}
-	return nil
+	return SendResult{}, nil
 }
 
 func (t *TmuxAdapter) Close() error {

@@ -289,7 +289,7 @@ func (w *Worker) readDaemonMessages() {
 			w.deduper.Reset()
 			log.Printf("[worker:%s] sending to cli: %q", safeShortID(w.sessionID), msg.Payload)
 			w.outputIdleObserver.BeginInput(time.Now())
-			if err := w.cliAdapter.Send(w.ctx, msg.Payload); err != nil {
+			if _, err := w.cliAdapter.Send(w.ctx, msg.Payload); err != nil {
 				w.outputIdleObserver.CancelInput()
 				log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
 			}

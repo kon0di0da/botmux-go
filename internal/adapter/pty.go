@@ -68,23 +68,23 @@ func (p *PtyAdapter) Start(ctx context.Context, workingDir string) (*CliStartRes
 	return &CliStartResult{Input: ptmx, Output: ptmx, ErrCh: p.errCh}, nil
 }
 
-func (p *PtyAdapter) Send(ctx context.Context, input string) error {
+func (p *PtyAdapter) Send(ctx context.Context, input string) (SendResult, error) {
 	p.mu.Lock()
 	closed := p.closed
 	ptmx := p.ptmx
 	p.mu.Unlock()
 	if closed {
-		return fmt.Errorf("pty adapter is closed")
+		return SendResult{}, fmt.Errorf("pty adapter is closed")
 	}
 	if ptmx == nil {
-		return fmt.Errorf("pty adapter not started")
+		return SendResult{}, fmt.Errorf("pty adapter not started")
 	}
 	data := input
 	if len(data) > 0 && data[len(data)-1] != '\r' {
 		data = data + "\r"
 	}
 	_, err := ptmx.Write([]byte(data))
-	return err
+	return SendResult{}, err
 }
 
 func (p *PtyAdapter) Close() error {

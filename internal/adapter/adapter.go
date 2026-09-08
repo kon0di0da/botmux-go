@@ -7,16 +7,46 @@ import (
 	"time"
 )
 
+type TurnStatus string
+
+const (
+	TurnCompleted TurnStatus = "completed"
+	TurnAborted   TurnStatus = "aborted"
+	TurnFailed    TurnStatus = "failed"
+)
+
+type AdapterEventKind string
+
+const (
+	AdapterOutput       AdapterEventKind = "output"
+	AdapterTurnTerminal AdapterEventKind = "turn_terminal"
+)
+
+type AdapterEvent struct {
+	Kind        AdapterEventKind
+	Output      string
+	Status      TurnStatus
+	ErrorCode   string
+	ErrorDetail string
+}
+
+type SendResult struct {
+	CliSessionID string
+}
+
 type CliStartResult struct {
-	Input      io.WriteCloser
-	Output     io.ReadCloser
-	ErrCh      <-chan error
-	ReadyDelay time.Duration
+	Input            io.WriteCloser
+	Output           io.ReadCloser
+	ErrCh            <-chan error
+	ReadyResult      <-chan error
+	Events           <-chan AdapterEvent
+	StructuredOutput bool
+	ReadyDelay       time.Duration
 }
 
 type CliAdapter interface {
 	Start(ctx context.Context, workingDir string) (*CliStartResult, error)
-	Send(ctx context.Context, input string) error
+	Send(ctx context.Context, input string) (SendResult, error)
 	Close() error
 	Name() string
 }
@@ -26,9 +56,11 @@ type CliOutputObserver interface {
 }
 
 type AdapterOptions struct {
-	CliType string
-	CliPath string
-	Model   string
+	CliType         string
+	CliPath         string
+	Model           string
+	Profile         string
+	ResumeSessionID string
 }
 
 type AdapterFactory func(opts AdapterOptions) CliAdapter

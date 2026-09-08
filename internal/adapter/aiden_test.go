@@ -35,7 +35,7 @@ func TestAidenSendPreservesMultilineInput(t *testing.T) {
 	var dst bytes.Buffer
 	a := newTestAidenAdapter(&dst, 1024)
 
-	if err := a.Send(context.Background(), "first\r\n  second\rthird\n"); err != nil {
+	if _, err := a.Send(context.Background(), "first\r\n  second\rthird\n"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -53,7 +53,7 @@ func TestAidenSendChunksWithoutSplittingUTF8(t *testing.T) {
 	a := newTestAidenAdapter(dst, 5)
 	input := "ab你cd好ef"
 
-	if err := a.Send(context.Background(), input); err != nil {
+	if _, err := a.Send(context.Background(), input); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -82,7 +82,7 @@ func TestAidenSendCompletesShortWrites(t *testing.T) {
 	dst := &recordingWriter{maxWrite: 2}
 	a := newTestAidenAdapter(dst, 1024)
 
-	if err := a.Send(context.Background(), "abcdef"); err != nil {
+	if _, err := a.Send(context.Background(), "abcdef"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if got := string(dst.Bytes()); got != "abcdef\r" {
@@ -96,13 +96,15 @@ func TestAidenSendSerializesConcurrentInputs(t *testing.T) {
 
 	firstDone := make(chan error, 1)
 	go func() {
-		firstDone <- a.Send(context.Background(), "first")
+		_, err := a.Send(context.Background(), "first")
+		firstDone <- err
 	}()
 	<-dst.firstWrite
 
 	secondDone := make(chan error, 1)
 	go func() {
-		secondDone <- a.Send(context.Background(), "second")
+		_, err := a.Send(context.Background(), "second")
+		secondDone <- err
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -127,7 +129,7 @@ func TestAidenSendRetriesRemainingBytesWithoutDuplicatingPrefix(t *testing.T) {
 	a := newTestAidenAdapter(dst, 1024)
 	a.writeRetryAttempts = 3
 
-	if err := a.Send(context.Background(), "abcdef"); err != nil {
+	if _, err := a.Send(context.Background(), "abcdef"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if got := string(dst.Bytes()); got != "abcdef\r" {
@@ -150,7 +152,7 @@ func TestAidenSendRetriesEnterUntilPTYActivity(t *testing.T) {
 		}
 	}
 
-	if err := a.Send(context.Background(), "prompt"); err != nil {
+	if _, err := a.Send(context.Background(), "prompt"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if dst.EnterCount() != 2 {
@@ -168,7 +170,7 @@ func TestAidenSendFailsWhenEnterCannotBeConfirmed(t *testing.T) {
 	a.enterRetryDelay = 0
 	a.maxEnterAttempts = 3
 
-	err := a.Send(context.Background(), "prompt")
+	_, err := a.Send(context.Background(), "prompt")
 	if err == nil || !strings.Contains(err.Error(), "not confirmed") {
 		t.Fatalf("Send error = %v, want submit confirmation error", err)
 	}

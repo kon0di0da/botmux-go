@@ -20,7 +20,7 @@ func TestMockAdapterEchoesInputAndRecordsHistory(t *testing.T) {
 	}
 	defer mock.Close()
 
-	if err := mock.Send(ctx, "hello"); err != nil {
+	if _, err := mock.Send(ctx, "hello"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -56,7 +56,7 @@ func TestMockAdapterSendValidatesLifecycle(t *testing.T) {
 	ctx := context.Background()
 	mock := NewMockAdapter("")
 
-	if err := mock.Send(ctx, "before start"); err == nil || !strings.Contains(err.Error(), "not started") {
+	if _, err := mock.Send(ctx, "before start"); err == nil || !strings.Contains(err.Error(), "not started") {
 		t.Fatalf("Send before Start error = %v, want not started", err)
 	}
 
@@ -72,7 +72,7 @@ func TestMockAdapterSendValidatesLifecycle(t *testing.T) {
 	if err := mock.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	if err := mock.Send(ctx, "after close"); err == nil || !strings.Contains(err.Error(), "closed") {
+	if _, err := mock.Send(ctx, "after close"); err == nil || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("Send after Close error = %v, want closed", err)
 	}
 	if _, err := mock.Start(ctx, t.TempDir()); err == nil || !strings.Contains(err.Error(), "already closed") {
