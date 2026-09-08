@@ -35,11 +35,12 @@
       "name": "codex-bot",
       "bot_id": "bot-codex",
       "cli_type": "codex",
-      "cli_path": "",
-      "backend_type": "tmux",
-      "working_dir": "~/workspace",
-      "model": "claude-sonnet-4",
-      "allowed_users": ["user1_openid", "user2_openid"]
+      "cli_path": "codex",
+      "backend_type": "pty",
+      "working_dir": "/Users/bytedance/botmux-go",
+      "model": "gpt-5.5",
+      "codex_profile": "arkcli",
+      "allowed_users": ["*"]
     }
   ]
 }

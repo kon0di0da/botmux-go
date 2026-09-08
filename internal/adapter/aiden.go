@@ -93,16 +93,8 @@ func (a *AidenAdapter) resolveBin() (string, error) {
 	return p, nil
 }
 
-func (a *AidenAdapter) buildArgs(workingDir string) []string {
-	args := []string{
-		"x",
-		"codex",
-		"--dangerously-bypass-approvals-and-sandbox",
-		"--no-alt-screen",
-	}
-	if workingDir != "" {
-		args = append(args, "-C", workingDir)
-	}
+func (a *AidenAdapter) buildArgs(_ string) []string {
+	args := []string{"--permission-mode", "agentFull"}
 	if a.model != "" {
 		args = append(args, "--model", a.model)
 	}

@@ -106,20 +106,9 @@ func (w *Worker) Run() error {
 	go w.readCliOutput()
 	go w.sendHeartbeats()
 
-	if w.startResult != nil && w.startResult.ReadyDelay > 0 {
-		select {
-		case <-time.After(w.startResult.ReadyDelay):
-		case <-w.ctx.Done():
-			return w.ctx.Err()
-		case err, ok := <-w.startResult.ErrCh:
-			_ = ok
-			if err != nil {
-				w.sendError("cli_exit_during_ready: " + err.Error())
-				return fmt.Errorf("cli exited during ready wait: %w", err)
-			}
-			w.sendError("cli_exit_during_ready: exited with no error")
-			return fmt.Errorf("cli exited during ready wait")
-		}
+	if err := w.waitForCLIReady(); err != nil {
+		w.sendError("cli_ready: " + err.Error())
+		return err
 	}
 
 	close(w.readyCh)
@@ -130,6 +119,39 @@ func (w *Worker) Run() error {
 
 	w.wg.Wait()
 	return nil
+}
+
+func (w *Worker) waitForCLIReady() error {
+	if w.startResult == nil {
+		return errors.New("cli start result missing")
+	}
+	if w.startResult.ReadyResult != nil {
+		select {
+		case err := <-w.startResult.ReadyResult:
+			if err != nil {
+				return fmt.Errorf("cli readiness failed: %w", err)
+			}
+			return nil
+		case <-time.After(45 * time.Second):
+			return errors.New("cli ready timeout")
+		case <-w.ctx.Done():
+			return w.ctx.Err()
+		}
+	}
+	if w.startResult.ReadyDelay <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(w.startResult.ReadyDelay):
+		return nil
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	case err, ok := <-w.startResult.ErrCh:
+		if ok && err != nil {
+			return fmt.Errorf("cli exited during ready wait: %w", err)
+		}
+		return errors.New("cli exited during ready wait")
+	}
 }
 
 func (w *Worker) connectToDaemon() error {

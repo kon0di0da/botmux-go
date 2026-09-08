@@ -13,16 +13,12 @@ import (
 	"unicode/utf8"
 )
 
-func TestAidenBuildArgsUsesConfiguredCodexLauncher(t *testing.T) {
+func TestAidenBuildArgsUsesNativeAiden(t *testing.T) {
 	a := NewAidenAdapter(AdapterOptions{CliType: "aiden", Model: "gpt-5.5"})
 	got := a.buildArgs("/tmp/workspace")
 	want := []string{
-		"x",
-		"codex",
-		"--dangerously-bypass-approvals-and-sandbox",
-		"--no-alt-screen",
-		"-C",
-		"/tmp/workspace",
+		"--permission-mode",
+		"agentFull",
 		"--model",
 		"gpt-5.5",
 	}
