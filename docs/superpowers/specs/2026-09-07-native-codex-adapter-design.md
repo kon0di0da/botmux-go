@@ -1,7 +1,7 @@
 # Native Codex Adapter Design
 
 Date: 2026-09-07
-Status: Approved design, pending implementation plan
+Status: Approved design, implementation planned
 
 ## 1. Goal
 
@@ -16,6 +16,8 @@ provide a reliable single-turn-at-a-time loop:
 5. Read final output and terminal status from Codex rollout JSONL.
 6. Persist the native Codex session ID and resume it after Worker recreation.
 7. Let the client exit on an explicit turn-terminal protocol message.
+8. Select an optional native Codex profile for a fresh session without exposing
+   its configuration contents.
 
 The 120-second client deadline remains a fault-containment fallback, not the
 normal completion mechanism.
@@ -26,6 +28,10 @@ normal completion mechanism.
 
 - Native `codex` executable.
 - Fresh launch and exact `codex resume <cliSessionId>`.
+- Profile discovery from `${CODEX_HOME:-~/.codex}/*.config.toml`, excluding
+  the base `config.toml` and backup files.
+- Bot-level default profile plus an optional profile override supplied when a
+  new session is created.
 - `--no-alt-screen`, working directory, model, approval/sandbox bypass flags.
 - Real prompt-ready detection.
 - Bracketed-paste input and separate Enter submission.
@@ -84,6 +90,29 @@ queued and is not injected into the active Codex turn.
 Type-ahead requires a dedicated attribution queue and HOL-block-drop semantics;
 it is deferred rather than approximated.
 
+### 3.4 Profiles are names, not configuration payloads
+
+Native Codex defines `--profile <name>` as a layer loaded from:
+
+```text
+${CODEX_HOME:-~/.codex}/<name>.config.toml
+```
+
+For example, `--profile arkcli` reads `~/.codex/arkcli.config.toml` on this
+machine. Botmux exposes only discovered profile names and never parses,
+returns, logs, or copies profile contents, because they may contain provider
+configuration or credentials.
+
+A Codex bot may declare `codex_profile` as its default. The client may override
+it when creating a new session through the CLI or HTTP API. The daemon validates
+the profile name against `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` and requires its
+regular file to exist under the current `CODEX_HOME`. Invalid or missing
+profiles fail session creation before spawning a worker.
+
+Profile selection applies only to a fresh launch. A resumed native Codex
+session uses its persisted conversation metadata and does not accept a model
+or profile override, preventing provider/model drift.
+
 ## 4. Components
 
 ### 4.1 `CodexAdapter`
@@ -109,8 +138,10 @@ Fresh argv:
 
 ```text
 codex --dangerously-bypass-approvals-and-sandbox \
+  --dangerously-bypass-hook-trust \
   --no-alt-screen \
   -c check_for_update_on_startup=false \
+  [--profile <profile>] \
   -C <workingDir> \
   [--model <model>]
 ```
@@ -126,8 +157,8 @@ codex resume \
 ```
 
 Resume does not reapply model selection. The persisted Codex conversation owns
-its provider/model metadata; injecting current defaults can silently drift a
-resumed session.
+its provider/model metadata; injecting current defaults or a new profile can
+silently drift a resumed session.
 
 ### 4.2 Adapter contract extensions
 
@@ -308,13 +339,17 @@ If a resume ID is invalid:
 2. **C2: Reliable input and session binding**
    Bracketed paste, history confirmation, native session ID persistence.
 
-3. **C3: Transcript output and terminal protocol**
+3. **C3: Profile discovery and session selection**
+   Discover profile names, validate fresh-session selection, and persist the
+   selected name for observability only.
+
+4. **C4: Transcript output and terminal protocol**
    Rollout parser, structured event channel, `MsgTurnCompleted`, CLI exit.
 
-4. **C4: Exact resume**
+5. **C5: Exact resume**
    Worker startup propagation, `codex resume`, restart behavior tests.
 
-5. **C5: Acceptance and documentation**
+6. **C6: Acceptance and documentation**
    Fake-Codex integration, real two-turn test, daemon restart continuation, V6
    architecture notes.
 
@@ -326,6 +361,8 @@ Each slice must independently pass `go test ./...`, `go build ./...`, and
 ### Unit tests
 
 - fresh/resume argv and model omission on resume;
+- profile discovery, invalid profile rejection, fresh-launch propagation, and
+  omission from resume argv;
 - composer READY matcher excludes update menus;
 - CRLF normalization and UTF-8/multiline paste;
 - history parser ignores old, partial, malformed, and wrong-text entries;

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a native Codex CLI adapter with real readiness, verified multiline submission, rollout-based final output, explicit turn completion, and exact session resume.
+**Goal:** Add a native Codex CLI adapter with real readiness, verified multiline submission, profile-aware fresh launch, rollout-based final output, explicit turn completion, and exact session resume.
 
-**Architecture:** `CodexAdapter` owns the PTY, readiness detection, history confirmation, and rollout watcher. Worker translates structured adapter events into protocol messages; Daemon serializes one active turn per session, persists the native Codex session ID, and broadcasts output plus terminal events to the waiting CLI.
+**Architecture:** `CodexAdapter` owns the PTY, readiness detection, history confirmation, and rollout watcher. The configuration and daemon layers discover and validate native Codex profile names before a fresh session starts; the adapter only receives a validated name and never reads profile contents. Worker translates structured adapter events into protocol messages; Daemon serializes one active turn per session, persists the native Codex session ID, and broadcasts output plus terminal events to the waiting CLI.
 
 **Tech Stack:** Go 1.23, `creack/pty/v2`, JSON Lines, TCP JSON protocol, Go standard library tests.
 
@@ -20,6 +20,7 @@
 - `internal/adapter/codex_test.go`: launch, readiness, and input behavior.
 - `internal/adapter/codex_history_test.go`: history and ownership tests.
 - `internal/adapter/codex_transcript_test.go`: real-shape JSONL parser tests.
+- `internal/config/codex_profile_test.go`: profile discovery and validation tests.
 - `internal/worker/codex_flow_test.go`: Worker event and terminal forwarding tests.
 - `internal/daemon/turn_state_test.go`: active-turn gate and terminal broadcast tests.
 - `internal/daemon/session_resume_test.go`: native session persistence and worker env tests.
@@ -34,86 +35,37 @@
 - `internal/adapter/tmux.go`: return empty `SendResult`.
 - `internal/adapter/aiden.go`: return empty `SendResult`; restore native Aiden argv.
 - `internal/adapter/aiden_test.go`: update signatures and native argv assertion.
+- `internal/config/config.go`: add a Codex bot default profile.
 - `internal/worker/worker.go`: authoritative READY, adapter event pump, session binding.
 - `internal/protocol/protocol.go`: session-bound and turn-completed messages.
-- `internal/daemon/session_meta.go`: turn gate, terminal broadcast, native session ID.
-- `internal/daemon/session_store.go`: persist native session ID.
-- `internal/daemon/daemon.go`: route new worker events, forward terminal to client.
-- `cmd/daemon/main.go`: pass resume ID to Worker and exit send on terminal.
+- `internal/daemon/session_meta.go`: turn gate, terminal broadcast, native session ID, profile name.
+- `internal/daemon/session_store.go`: persist native session ID and selected profile name.
+- `internal/daemon/daemon.go`: validate and select fresh-session profiles, route worker events, forward terminal to client.
+- `internal/daemon/http_server.go`: expose profile names and accept a session-create override.
+- `cmd/daemon/main.go`: pass resume ID and profile to Worker, accept a CLI session-create override, and exit send on terminal.
 - `cmd/daemon/main_test.go`: terminal-driven CLI exit.
 - `configs/bots.json`: native Codex bot configuration.
 - `docs/README.md`: V6 entry and status.
 
-## Task 0: Establish a Clean V5 Baseline
+## Task 0: Confirm the V5 Baseline
 
-The current worktree contains the completed V5 implementation but it is not
-committed. Codex changes touch the same shared files, so checkpoint V5 before
-starting C1. Do not include `docs/.DS_Store`.
+V5 is already committed as `9987360 feat(v5): stabilize Aiden and output
+delivery`. Codex work starts after that checkpoint.
 
-- [ ] **Step 1: Review the exact V5 worktree**
+- [ ] **Step 1: Confirm the worktree and baseline**
 
 Run:
 
 ```bash
 git status --short
 git diff --check
-git diff --stat
-```
-
-Expected: only the known V5 files are modified/untracked; no unrelated user
-files are staged.
-
-- [ ] **Step 2: Run the V5 verification baseline**
-
-Run:
-
-```bash
 go test ./...
 go test -race ./...
 go build ./...
 go vet ./...
 ```
 
-Expected: all commands exit `0`.
-
-- [ ] **Step 3: Remove generated Finder metadata**
-
-Run:
-
-```bash
-rm -f docs/.DS_Store
-```
-
-Expected: `docs/.DS_Store` no longer appears in `git status --short`.
-
-- [ ] **Step 4: Commit only the V5 implementation**
-
-Run:
-
-```bash
-git add \
-  cmd/daemon/main.go cmd/daemon/main_test.go \
-  configs/bots.json docs/README.md docs/versions/v5-architecture.md \
-  internal/adapter/adapter.go internal/adapter/mock.go \
-  internal/adapter/pty.go internal/adapter/tmux.go \
-  internal/adapter/aiden.go internal/adapter/aiden_test.go \
-  internal/config/config.go \
-  internal/daemon/daemon.go internal/daemon/session_meta.go \
-  internal/daemon/session_monitor.go internal/daemon/session_store.go \
-  internal/daemon/worker_handle.go \
-  internal/daemon/session_meta_test.go \
-  internal/daemon/session_monitor_test.go \
-  internal/daemon/worker_ready_test.go \
-  internal/worker/worker.go internal/worker/output_idle_observer.go \
-  internal/worker/output_idle_observer_test.go \
-  internal/worker/tui_screen.go internal/worker/tui_screen_test.go \
-  scripts/v5_aiden_e2e.sh
-git diff --cached --check
-git commit -m "feat(v5): stabilize Aiden and output delivery"
-```
-
-Expected: the pre-existing V5 changes are isolated from subsequent Codex
-commits.
+Expected: no source changes before this plan begins; all Go commands exit `0`.
 
 ## Task 1: Add Structured Adapter Contracts
 
@@ -265,12 +217,16 @@ Add:
 
 ```go
 func TestCodexBuildArgsFresh(t *testing.T) {
-	a := NewCodexAdapter(AdapterOptions{CliType: "codex", Model: "gpt-5.5"})
+	a := NewCodexAdapter(AdapterOptions{
+		CliType: "codex", Model: "gpt-5.5", Profile: "arkcli",
+	})
 	got := a.buildArgs("/tmp/repo")
 	want := []string{
 		"--dangerously-bypass-approvals-and-sandbox",
+		"--dangerously-bypass-hook-trust",
 		"--no-alt-screen",
 		"-c", "check_for_update_on_startup=false",
+		"--profile", "arkcli",
 		"--model", "gpt-5.5",
 		"-C", "/tmp/repo",
 	}
@@ -288,6 +244,7 @@ func TestCodexBuildArgsResumeDoesNotOverrideModel(t *testing.T) {
 	want := []string{
 		"resume",
 		"--dangerously-bypass-approvals-and-sandbox",
+		"--dangerously-bypass-hook-trust",
 		"--no-alt-screen",
 		"-c", "check_for_update_on_startup=false",
 		"native-session",
@@ -329,6 +286,7 @@ type AdapterOptions struct {
 	CliType         string
 	CliPath         string
 	Model           string
+	Profile         string
 	ResumeSessionID string
 }
 ```
@@ -341,6 +299,7 @@ type CodexAdapter struct {
 	sendMu   sync.Mutex
 	cmdPath  string
 	model    string
+	profile  string
 	resumeID string
 	cmd      *exec.Cmd
 	ptmx     *os.File
@@ -394,6 +353,13 @@ func codexComposerReady(screen string) bool {
 	}
 }
 ```
+
+`buildArgs` must append `--dangerously-bypass-hook-trust` immediately after
+`--dangerously-bypass-approvals-and-sandbox`: a native managed Codex TUI can
+otherwise stop at the interactive `Press t to trust` hook gate. Add
+`--profile <profile>` on fresh launch only, after the update-check config and
+before `--model` / `-C`. Resume must omit both `--profile` and `--model` so the
+stored native conversation keeps its provider/model metadata.
 
 Keep a bounded rolling raw screen buffer so prompt fragments spanning reads are
 recognized. Add `stripCodexANSI(string) string` in `codex.go` and strip ANSI
@@ -453,9 +419,13 @@ Set the sample Codex bot to:
   "backend_type": "pty",
   "working_dir": "/Users/bytedance/botmux-go",
   "model": "gpt-5.5",
+  "codex_profile": "arkcli",
   "allowed_users": ["*"]
 }
 ```
+
+The profile task validates this sample value before a Codex worker starts. It
+must not make the profile part of resume argv.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -675,7 +645,228 @@ git add internal/adapter/codex.go \
 git commit -m "feat(codex): verify native input submission"
 ```
 
-## Task 4: Parse Rollout Output and Terminal Events
+## Task 4: Discover and Select Native Codex Profiles
+
+**Files:**
+
+- Create: `internal/config/codex_profile.go`
+- Create: `internal/config/codex_profile_test.go`
+- Modify: `internal/config/config.go`
+- Modify: `internal/daemon/session_meta.go`
+- Modify: `internal/daemon/session_store.go`
+- Modify: `internal/daemon/daemon.go`
+- Modify: `internal/daemon/http_server.go`
+- Modify: `internal/daemon/http_server_test.go`
+- Modify: `internal/daemon/dashboard.html`
+- Modify: `cmd/daemon/main.go`
+- Modify: `cmd/daemon/main_test.go`
+- Modify: `internal/worker/worker.go`
+
+- [ ] **Step 1: Write failing profile discovery tests**
+
+In `internal/config/codex_profile_test.go`, create a temporary `CODEX_HOME`
+with these files:
+
+```text
+config.toml
+arkcli.config.toml
+staging_1.config.toml
+config.toml.bak
+bad.name.config.toml
+nested/ignored.config.toml
+```
+
+Write tests that assert:
+
+```go
+func TestDiscoverCodexProfiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	for _, name := range []string{
+		"config.toml", "arkcli.config.toml", "staging_1.config.toml",
+		"config.toml.bak", "bad.name.config.toml",
+	} {
+		if err := os.WriteFile(filepath.Join(home, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := DiscoverCodexProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"arkcli", "staging_1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DiscoverCodexProfiles() = %#v, want %#v", got, want)
+	}
+}
+
+func TestValidateCodexProfileRejectsTraversalAndMissingFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	if _, err := ValidateCodexProfile("../arkcli"); err == nil {
+		t.Fatal("traversal profile accepted")
+	}
+	if _, err := ValidateCodexProfile("missing"); err == nil {
+		t.Fatal("missing profile accepted")
+	}
+}
+```
+
+- [ ] **Step 2: Confirm profile tests are red**
+
+Run:
+
+```bash
+go test ./internal/config -run 'Test(Discover|Validate)CodexProfile' -count=1
+```
+
+Expected: compile failure because the profile functions do not exist.
+
+- [ ] **Step 3: Implement discovery and validation without reading contents**
+
+Create `internal/config/codex_profile.go`:
+
+```go
+package config
+
+const CodexProfileSuffix = ".config.toml"
+
+func CodexHome() string
+func DiscoverCodexProfiles() ([]string, error)
+func ValidateCodexProfile(name string) (string, error)
+```
+
+`CodexHome` returns `CODEX_HOME` when non-empty, otherwise
+`filepath.Join(os.UserHomeDir(), ".codex")`. `DiscoverCodexProfiles` reads only
+the immediate directory, accepts regular files matching
+`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.config\.toml$`, removes the suffix, and
+returns sorted names. It never opens profile files. `ValidateCodexProfile`
+returns `""` for an empty selection; otherwise it validates the same name
+grammar, verifies `${CODEX_HOME}/<name>.config.toml` is a regular file, and
+returns the normalized name.
+
+Add `CodexProfile string \`json:"codex_profile,omitempty"\`` to `BotConfig`.
+Its value is a default for `cli_type=codex`; do not validate it while loading
+all bot configuration because a profile may be created after daemon startup.
+
+- [ ] **Step 4: Write failing daemon/API selection tests**
+
+In `internal/daemon/http_server_test.go`, build a daemon with a Codex bot whose
+`CodexProfile` is `arkcli`, use a temporary `CODEX_HOME`, and write
+`arkcli.config.toml` and `manual.config.toml`. Assert:
+
+```go
+func TestCreateCodexSessionUsesValidatedProfileOverride(t *testing.T) {
+	// POST {"session_id":"s1","bot_id":"bot-codex","codex_profile":"manual"}
+	// accepts the request and its SessionMeta has CodexProfile == "manual".
+}
+
+func TestCreateCodexSessionRejectsMissingProfile(t *testing.T) {
+	// POST {"session_id":"s1","bot_id":"bot-codex","codex_profile":"missing"}
+	// returns HTTP 400 before any worker starts.
+}
+
+func TestListCodexProfilesReturnsNamesOnly(t *testing.T) {
+	// GET /api/codex/profiles returns {"profiles":["arkcli","manual"]}.
+	// The response does not contain the profile TOML contents.
+}
+```
+
+- [ ] **Step 5: Route selected profiles through daemon, worker, API, and dashboard**
+
+Add `CodexProfile string` to `NewSessionOpts`, `SessionMeta`,
+`PersistedSession`, and `worker.Options`. In `Daemon.NewSession`, resolve the
+requested profile as:
+
+```go
+profile := opts.CodexProfile
+if profile == "" && cliType == string(config.CliCodex) {
+	profile = bot.CodexProfile
+}
+if cliType == string(config.CliCodex) {
+	var err error
+	profile, err = config.ValidateCodexProfile(profile)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Codex profile: %w", err)
+	}
+}
+```
+
+Store `profile` in metadata before `spawnWorkerForSession`. Add
+`BOTMUX_CODEX_PROFILE=<profile>` to the worker environment, read it in
+`cmd/daemon/main.go`, and pass it to `adapter.AdapterOptions.Profile`.
+
+Extend `createSessionRequest` with:
+
+```go
+CodexProfile string `json:"codex_profile,omitempty"`
+```
+
+Pass it to `NewSessionOpts`. Add a read-only `GET /api/codex/profiles` handler
+that returns only `{"profiles":[...]}`. Include profile names in `GET
+/api/bots`, `GET /api/sessions`, and session-detail responses.
+
+In `dashboard.html`, load `/api/codex/profiles` with the existing bot/session
+data, render a `Codex profile` select in the New Session form, disable it for
+non-Codex bots, and send a non-empty selection as `codex_profile`. Use profile
+names as text only; do not fetch or render TOML content.
+
+For the terminal CLI, accept:
+
+```text
+botmux-go -cmd new <session_id> [<bot_id>] [<codex_profile>]
+```
+
+Put the selected profile in the `MsgNewSession` payload as JSON:
+
+```go
+type newSessionPayload struct {
+	BotID       string `json:"bot_id,omitempty"`
+	CodexProfile string `json:"codex_profile,omitempty"`
+}
+```
+
+Update daemon decoding to preserve backward compatibility: first try JSON,
+then treat a non-JSON payload as the legacy bot ID.
+
+- [ ] **Step 6: Persist profile only for observability**
+
+Add:
+
+```go
+CodexProfile string `json:"codex_profile,omitempty"`
+```
+
+to `PersistedSession`, and preserve it through `SessionMeta.ToPersisted` and
+`SessionMetaFromPersisted`. The value is shown in read APIs but must not cause
+a resumed `codex resume <id>` argv to receive `--profile`; `CodexAdapter`
+already omits the profile whenever `ResumeSessionID` is set.
+
+- [ ] **Step 7: Verify and commit**
+
+Run:
+
+```bash
+gofmt -w internal/config internal/daemon internal/worker cmd/daemon
+go test ./internal/config ./internal/daemon ./cmd/daemon -count=1
+go test -race ./internal/config ./internal/daemon ./cmd/daemon -count=1
+go test ./...
+go build ./...
+go vet ./...
+git diff --check
+git add internal/config/codex_profile.go internal/config/codex_profile_test.go \
+  internal/config/config.go internal/daemon/session_meta.go \
+  internal/daemon/session_store.go internal/daemon/daemon.go \
+  internal/daemon/http_server.go internal/daemon/http_server_test.go \
+  internal/daemon/dashboard.html internal/worker/worker.go \
+  cmd/daemon/main.go cmd/daemon/main_test.go
+git commit -m "feat(codex): select validated launch profiles"
+```
+
+Expected: all commands exit `0`; profile contents are absent from the
+responses, logs, and persisted session JSON.
+
+## Task 5: Parse Rollout Output and Terminal Events
 
 **Files:**
 
@@ -690,7 +881,7 @@ Use real-shape records:
 ```go
 const rolloutFixture = `
 {"timestamp":"2026-09-07T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
-{"timestamp":"2026-09-07T10:00:01Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"world"}}
+{"timestamp":"2026-09-07T10:00:01Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"world"}}
 `
 ```
 
@@ -778,7 +969,7 @@ git add internal/adapter/codex.go \
 git commit -m "feat(codex): emit rollout terminal events"
 ```
 
-## Task 5: Add Terminal Protocol and Worker Event Pump
+## Task 6: Add Terminal Protocol and Worker Event Pump
 
 **Files:**
 
@@ -930,7 +1121,7 @@ git add internal/protocol/protocol.go internal/worker/worker.go \
 git commit -m "feat(codex): terminate clients from structured turns"
 ```
 
-## Task 6: Persist Native Session ID and Serialize Turns
+## Task 7: Persist Native Session ID and Serialize Turns
 
 **Files:**
 
@@ -1090,7 +1281,7 @@ git add internal/daemon/session_meta.go internal/daemon/session_store.go \
 git commit -m "feat(codex): persist and resume native sessions"
 ```
 
-## Task 7: Fake-Codex Integration and V6 Documentation
+## Task 8: Fake-Codex Integration and V6 Documentation
 
 **Files:**
 
@@ -1116,7 +1307,7 @@ Use this terminal record:
 
 ```go
 fmt.Fprintf(rollout,
-	"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":%q}}\n",
+	"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"fake-turn-1\",\"last_agent_message\":%q}}\n",
 	"fake final: "+input,
 )
 ```
@@ -1133,6 +1324,8 @@ Test:
 6. Worker restart uses `resume <id>`;
 7. a concurrent second send returns busy;
 8. fake process exit produces failed terminal and clears the gate.
+9. a fresh Codex launch includes `--profile arkcli`, while the resumed launch
+   omits it.
 
 - [ ] **Step 3: Run the complete automated matrix**
 
@@ -1231,6 +1424,7 @@ git status --short
 refactor(adapter): add structured turn contracts
 feat(codex): add native launch and readiness
 feat(codex): verify native input submission
+feat(codex): select validated launch profiles
 feat(codex): emit rollout terminal events
 feat(codex): terminate clients from structured turns
 feat(codex): persist and resume native sessions
