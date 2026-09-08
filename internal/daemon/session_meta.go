@@ -26,16 +26,17 @@ func NewSessionMeta(sid, botID string) *SessionMeta {
 }
 
 type SessionMeta struct {
-	SessionID  string
-	BotID      string
-	CliType    string
-	CliPath    string
-	Model      string
-	WorkingDir string
-	LastOutput []string
-	CreatedAt  time.Time
-	Closed     bool
-	Status     SessionStatus
+	SessionID    string
+	BotID        string
+	CliType      string
+	CliPath      string
+	Model        string
+	CodexProfile string
+	WorkingDir   string
+	LastOutput   []string
+	CreatedAt    time.Time
+	Closed       bool
+	Status       SessionStatus
 
 	mu             sync.Mutex
 	lastActive     time.Time
@@ -143,15 +144,17 @@ func (m *SessionMeta) ToPersisted() *PersistedSession {
 	copy(lastOutput, m.LastOutput)
 	m.mu.Unlock()
 	return &PersistedSession{
-		SessionID:  m.SessionID,
-		BotID:      m.BotID,
-		CliType:    m.CliType,
-		CliPath:    m.CliPath,
-		WorkingDir: m.WorkingDir,
-		LastOutput: lastOutput,
-		LastActive: lastActive,
-		CreatedAt:  m.CreatedAt,
-		Closed:     m.Closed,
+		SessionID:    m.SessionID,
+		BotID:        m.BotID,
+		CliType:      m.CliType,
+		CliPath:      m.CliPath,
+		Model:        m.Model,
+		CodexProfile: m.CodexProfile,
+		WorkingDir:   m.WorkingDir,
+		LastOutput:   lastOutput,
+		LastActive:   lastActive,
+		CreatedAt:    m.CreatedAt,
+		Closed:       m.Closed,
 	}
 }
 
@@ -176,6 +179,7 @@ func SessionMetaFromPersisted(ps *PersistedSession) *SessionMeta {
 		CliType:        ps.CliType,
 		CliPath:        ps.CliPath,
 		Model:          ps.Model,
+		CodexProfile:   ps.CodexProfile,
 		WorkingDir:     ps.WorkingDir,
 		LastOutput:     lastOutput,
 		CreatedAt:      createdAt,

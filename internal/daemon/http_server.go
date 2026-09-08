@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"botmux-go/internal/config"
 )
 
 func (d *Daemon) startHTTPServer() {
@@ -26,6 +28,7 @@ func (d *Daemon) startHTTPServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/healthz", d.cors(d.handleHealthz))
 	mux.HandleFunc("/api/bots", d.cors(d.handleListBots))
+	mux.HandleFunc("/api/codex/profiles", d.cors(d.handleListCodexProfiles))
 	mux.HandleFunc("/api/sessions/", d.cors(d.handleSessionsSubrouter))
 	mux.HandleFunc("/api/sessions", d.cors(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -156,15 +159,16 @@ func (d *Daemon) writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 type sessionListItem struct {
-	SessionID  string   `json:"session_id"`
-	BotID      string   `json:"bot_id"`
-	CliType    string   `json:"cli_type"`
-	Status     string   `json:"status"`
-	Pid        int      `json:"pid"`
-	Closed     bool     `json:"closed"`
-	CreatedAt  string   `json:"created_at"`
-	LastActive string   `json:"last_active"`
-	Outputs    []string `json:"outputs"`
+	SessionID    string   `json:"session_id"`
+	BotID        string   `json:"bot_id"`
+	CliType      string   `json:"cli_type"`
+	CodexProfile string   `json:"codex_profile,omitempty"`
+	Status       string   `json:"status"`
+	Pid          int      `json:"pid"`
+	Closed       bool     `json:"closed"`
+	CreatedAt    string   `json:"created_at"`
+	LastActive   string   `json:"last_active"`
+	Outputs      []string `json:"outputs"`
 }
 
 type sessionListResponse struct {
@@ -252,15 +256,16 @@ func (d *Daemon) httpListSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		d.workersMu.RUnlock()
 		items = append(items, sessionListItem{
-			SessionID:  m.SessionID,
-			BotID:      m.BotID,
-			CliType:    m.CliType,
-			Status:     string(m.Status),
-			Pid:        pid,
-			Closed:     m.Closed,
-			CreatedAt:  m.CreatedAt.Format(time.RFC3339),
-			LastActive: m.LastActive().Format(time.RFC3339),
-			Outputs:    m.SnapshotOutput(),
+			SessionID:    m.SessionID,
+			BotID:        m.BotID,
+			CliType:      m.CliType,
+			CodexProfile: m.CodexProfile,
+			Status:       string(m.Status),
+			Pid:          pid,
+			Closed:       m.Closed,
+			CreatedAt:    m.CreatedAt.Format(time.RFC3339),
+			LastActive:   m.LastActive().Format(time.RFC3339),
+			Outputs:      m.SnapshotOutput(),
 		})
 	}
 
@@ -275,21 +280,22 @@ func (d *Daemon) httpListSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 type sessionDetailResponse struct {
-	SessionID  string          `json:"session_id"`
-	BotID      string          `json:"bot_id"`
-	CliType    string          `json:"cli_type"`
-	CliPath    string          `json:"cli_path"`
-	WorkingDir string          `json:"working_dir"`
-	Status     string          `json:"status"`
-	Pid        int             `json:"pid"`
-	Closed     bool            `json:"closed"`
-	CreatedAt  string          `json:"created_at"`
-	LastActive string          `json:"last_active"`
-	TotalLines int             `json:"total_lines"`
-	Offset     int             `json:"offset"`
-	Limit      int             `json:"limit"`
-	Outputs    []string        `json:"outputs"`
-	Worker     *workerSnapshot `json:"worker"`
+	SessionID    string          `json:"session_id"`
+	BotID        string          `json:"bot_id"`
+	CliType      string          `json:"cli_type"`
+	CodexProfile string          `json:"codex_profile,omitempty"`
+	CliPath      string          `json:"cli_path"`
+	WorkingDir   string          `json:"working_dir"`
+	Status       string          `json:"status"`
+	Pid          int             `json:"pid"`
+	Closed       bool            `json:"closed"`
+	CreatedAt    string          `json:"created_at"`
+	LastActive   string          `json:"last_active"`
+	TotalLines   int             `json:"total_lines"`
+	Offset       int             `json:"offset"`
+	Limit        int             `json:"limit"`
+	Outputs      []string        `json:"outputs"`
+	Worker       *workerSnapshot `json:"worker"`
 }
 
 type workerSnapshot struct {
@@ -348,21 +354,22 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid st
 	}
 	paged := all[start:end]
 	resp := sessionDetailResponse{
-		SessionID:  m.SessionID,
-		BotID:      m.BotID,
-		CliType:    m.CliType,
-		CliPath:    m.CliPath,
-		WorkingDir: m.WorkingDir,
-		Status:     string(m.Status),
-		Pid:        pid,
-		Closed:     m.Closed,
-		CreatedAt:  m.CreatedAt.Format(time.RFC3339),
-		LastActive: m.LastActive().Format(time.RFC3339),
-		TotalLines: total,
-		Offset:     start,
-		Limit:      limit,
-		Outputs:    paged,
-		Worker:     ws,
+		SessionID:    m.SessionID,
+		BotID:        m.BotID,
+		CliType:      m.CliType,
+		CodexProfile: m.CodexProfile,
+		CliPath:      m.CliPath,
+		WorkingDir:   m.WorkingDir,
+		Status:       string(m.Status),
+		Pid:          pid,
+		Closed:       m.Closed,
+		CreatedAt:    m.CreatedAt.Format(time.RFC3339),
+		LastActive:   m.LastActive().Format(time.RFC3339),
+		TotalLines:   total,
+		Offset:       start,
+		Limit:        limit,
+		Outputs:      paged,
+		Worker:       ws,
 	}
 	d.writeJSON(w, http.StatusOK, resp)
 }
@@ -395,8 +402,9 @@ func (d *Daemon) handleGetSessionHistory(w http.ResponseWriter, r *http.Request,
 }
 
 type createSessionRequest struct {
-	SessionID string `json:"session_id"`
-	BotID     string `json:"bot_id"`
+	SessionID    string `json:"session_id"`
+	BotID        string `json:"bot_id"`
+	CodexProfile string `json:"codex_profile,omitempty"`
 }
 
 type createSessionResponse struct {
@@ -448,9 +456,10 @@ func (d *Daemon) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	readyCh := make(chan struct{})
 	opts := NewSessionOpts{
-		SessionID: req.SessionID,
-		BotID:     req.BotID,
-		OnReady:   func(meta *SessionMeta) { closeOnce(readyCh) },
+		SessionID:    req.SessionID,
+		BotID:        req.BotID,
+		CodexProfile: req.CodexProfile,
+		OnReady:      func(meta *SessionMeta) { closeOnce(readyCh) },
 	}
 	if _, err := d.NewSession(opts); err != nil {
 		d.writeError(w, http.StatusBadRequest, err.Error())
@@ -556,12 +565,13 @@ func (d *Daemon) httpCloseSession(w http.ResponseWriter, r *http.Request, sid st
 }
 
 type botListItem struct {
-	Name        string `json:"name"`
-	BotID       string `json:"bot_id"`
-	CliType     string `json:"cli_type"`
-	CliPath     string `json:"cli_path,omitempty"`
-	BackendType string `json:"backend_type"`
-	WorkingDir  string `json:"working_dir,omitempty"`
+	Name         string `json:"name"`
+	BotID        string `json:"bot_id"`
+	CliType      string `json:"cli_type"`
+	CliPath      string `json:"cli_path,omitempty"`
+	BackendType  string `json:"backend_type"`
+	WorkingDir   string `json:"working_dir,omitempty"`
+	CodexProfile string `json:"codex_profile,omitempty"`
 }
 
 func (d *Daemon) handleListBots(w http.ResponseWriter, r *http.Request) {
@@ -572,16 +582,30 @@ func (d *Daemon) handleListBots(w http.ResponseWriter, r *http.Request) {
 	items := make([]botListItem, 0, len(d.cfg.Bots))
 	for _, b := range d.cfg.Bots {
 		items = append(items, botListItem{
-			Name:        b.Name,
-			BotID:       b.BotID,
-			CliType:     string(b.CliType),
-			CliPath:     b.CliPath,
-			BackendType: string(b.BackendType),
-			WorkingDir:  b.WorkingDir,
+			Name:         b.Name,
+			BotID:        b.BotID,
+			CliType:      string(b.CliType),
+			CliPath:      b.CliPath,
+			BackendType:  string(b.BackendType),
+			WorkingDir:   b.WorkingDir,
+			CodexProfile: b.CodexProfile,
 		})
 	}
 	d.writeJSON(w, http.StatusOK, map[string]any{
 		"total": len(items),
 		"bots":  items,
 	})
+}
+
+func (d *Daemon) handleListCodexProfiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		d.writeError(w, http.StatusMethodNotAllowed, "method not allowed: "+r.Method)
+		return
+	}
+	profiles, err := config.DiscoverCodexProfiles()
+	if err != nil {
+		d.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	d.writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles})
 }

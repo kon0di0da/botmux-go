@@ -131,6 +131,7 @@ const API = '';
 let healthData = null;
 let sessionsData = { items: [] };
 let botsData = { bots: [] };
+let codexProfilesData = { profiles: [] };
 let currentSessionId = null;
 let pollTimer = null;
 let chatPollTimer = null;
@@ -228,6 +229,13 @@ async function refreshBots() {
   }
 }
 
+async function refreshCodexProfiles() {
+  var data = await api('/api/codex/profiles', { silent: true });
+  if (data && data.profiles) {
+    codexProfilesData = data;
+  }
+}
+
 function renderHome() {
   var activeCount = sessionsData.items.filter(function(s) { return !s.closed; }).length;
   var closedCount = sessionsData.items.filter(function(s) { return s.closed; }).length;
@@ -274,9 +282,25 @@ function renderNew() {
   html += '<div class="form">';
   html += '<div class="form-group"><label>Session ID</label><input type="text" id="new-sid" placeholder="auto-generated if empty"><div class="hint">Optional, will be auto-generated if not provided</div></div>';
   html += '<div class="form-group"><label>Bot</label><select id="new-bot">' + botOptions + '</select></div>';
+  var profileOptions = '<option value="">(bot default)</option>';
+  codexProfilesData.profiles.forEach(function(profile) {
+    profileOptions += '<option value="' + escapeHtml(profile) + '">' + escapeHtml(profile) + '</option>';
+  });
+  html += '<div class="form-group"><label>Codex Profile</label><select id="new-codex-profile">' + profileOptions + '</select><div class="hint">Applied only when starting a new Codex session</div></div>';
   html += '<button class="btn btn-primary" onclick="createSession()">Create Session</button>';
   html += '</div>';
   document.getElementById('app').innerHTML = html;
+  syncCodexProfileControl();
+  document.getElementById('new-bot').addEventListener('change', syncCodexProfileControl);
+}
+
+function syncCodexProfileControl() {
+  var botId = document.getElementById('new-bot').value;
+  var bot = botsData.bots.find(function(item) { return item.bot_id === botId; });
+  var enabled = !bot || bot.cli_type === 'codex';
+  var select = document.getElementById('new-codex-profile');
+  select.disabled = !enabled;
+  if (!enabled) select.value = '';
 }
 
 function renderBots() {
@@ -427,9 +451,11 @@ function renderChat(sid) {
 async function createSession() {
   var sid = document.getElementById('new-sid').value.trim();
   var botId = document.getElementById('new-bot').value;
+  var codexProfile = document.getElementById('new-codex-profile').value;
   var body = {};
   if (sid) body.session_id = sid;
   if (botId) body.bot_id = botId;
+  if (codexProfile) body.codex_profile = codexProfile;
   var resp = await api('/api/sessions', { method: 'POST', body: body });
   if (resp && resp.ok) {
     toast('Session ' + resp.session_id + ' created (' + resp.status + ')', 'success');
@@ -519,6 +545,7 @@ async function poll() {
   await refreshHealth();
   await refreshSessions();
   await refreshBots();
+  await refreshCodexProfiles();
   updateTopbar();
   var route = resolveRoute();
   if (route.name !== currentRoute || (route.name === 'chat' && route.sid !== renderedSessionId)) {
@@ -606,7 +633,10 @@ function updateHomeTable() {
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  fullRender();
+  Promise.all([refreshHealth(), refreshSessions(), refreshBots(), refreshCodexProfiles()]).then(function() {
+    updateTopbar();
+    fullRender();
+  });
   pollTimer = setInterval(poll, 2000);
 }
 

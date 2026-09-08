@@ -121,12 +121,18 @@ func (d *Daemon) Stop() error {
 }
 
 type NewSessionOpts struct {
-	SessionID  string
-	BotID      string
-	CliType    string
-	CliPath    string
-	WorkingDir string
-	OnReady    func(meta *SessionMeta)
+	SessionID    string
+	BotID        string
+	CliType      string
+	CliPath      string
+	WorkingDir   string
+	CodexProfile string
+	OnReady      func(meta *SessionMeta)
+}
+
+type newSessionPayload struct {
+	BotID        string `json:"bot_id,omitempty"`
+	CodexProfile string `json:"codex_profile,omitempty"`
 }
 
 func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
@@ -155,6 +161,17 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 	if workingDir == "" {
 		workingDir = bot.WorkingDir
 	}
+	profile := opts.CodexProfile
+	if profile == "" && cliType == string(config.CliCodex) {
+		profile = bot.CodexProfile
+	}
+	if cliType == string(config.CliCodex) {
+		var err error
+		profile, err = config.ValidateCodexProfile(profile)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Codex profile: %w", err)
+		}
+	}
 
 	now := time.Now()
 	meta := &SessionMeta{
@@ -163,6 +180,7 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 		CliType:        cliType,
 		CliPath:        cliPath,
 		Model:          bot.Model,
+		CodexProfile:   profile,
 		WorkingDir:     workingDir,
 		LastOutput:     []string{},
 		CreatedAt:      now,
@@ -218,6 +236,7 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 		"BOTMUX_CLI_TYPE="+meta.CliType,
 		"BOTMUX_CLI_PATH="+meta.CliPath,
 		"BOTMUX_MODEL="+meta.Model,
+		"BOTMUX_CODEX_PROFILE="+meta.CodexProfile,
 		"BOTMUX_WORKING_DIR="+meta.WorkingDir,
 		"BOTMUX_STORE_DIR="+d.cfg.SessionsDir,
 	)
@@ -618,12 +637,17 @@ func (d *Daemon) handleClientConn(conn net.Conn, reader *protocol.MessageReader,
 		if sid == "" {
 			sid = fmt.Sprintf("s-%d", time.Now().UnixNano())
 		}
-		botID := first.Payload
+		payload := newSessionPayload{}
+		if err := json.Unmarshal([]byte(first.Payload), &payload); err != nil {
+			payload.BotID = first.Payload
+		}
+		botID := payload.BotID
 		log.Printf("[daemon] %s creating session %s (bot=%s)", cliID, safeShort(sid), botID)
 		var readyCh <-chan struct{} = nil
 		_, err := d.NewSession(NewSessionOpts{
-			SessionID: sid,
-			BotID:     botID,
+			SessionID:    sid,
+			BotID:        botID,
+			CodexProfile: payload.CodexProfile,
 		})
 		if err == nil {
 			d.workersMu.RLock()

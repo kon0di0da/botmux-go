@@ -13,16 +13,17 @@ func TestSessionStoreSaveLoadRoundTripPreservesModel(t *testing.T) {
 	createdAt := time.Now().Add(-time.Hour).Round(0)
 	lastActive := time.Now().Add(-time.Minute).Round(0)
 	want := &PersistedSession{
-		SessionID:  "session-1",
-		BotID:      "bot-1",
-		CliType:    "aiden",
-		CliPath:    "/usr/local/bin/aiden",
-		Model:      "gpt-5.5",
-		WorkingDir: "/tmp/workspace",
-		WorkerPID:  1234,
-		LastOutput: []string{"line-1", "line-2"},
-		LastActive: lastActive,
-		CreatedAt:  createdAt,
+		SessionID:    "session-1",
+		BotID:        "bot-1",
+		CliType:      "aiden",
+		CliPath:      "/usr/local/bin/aiden",
+		Model:        "gpt-5.5",
+		CodexProfile: "arkcli",
+		WorkingDir:   "/tmp/workspace",
+		WorkerPID:    1234,
+		LastOutput:   []string{"line-1", "line-2"},
+		LastActive:   lastActive,
+		CreatedAt:    createdAt,
 	}
 
 	if err := store.save(want); err != nil {
@@ -35,6 +36,9 @@ func TestSessionStoreSaveLoadRoundTripPreservesModel(t *testing.T) {
 
 	if got.Model != want.Model {
 		t.Fatalf("Model = %q, want %q", got.Model, want.Model)
+	}
+	if got.CodexProfile != want.CodexProfile {
+		t.Fatalf("CodexProfile = %q, want %q", got.CodexProfile, want.CodexProfile)
 	}
 	if got.WorkerPID != want.WorkerPID {
 		t.Fatalf("WorkerPID = %d, want %d", got.WorkerPID, want.WorkerPID)

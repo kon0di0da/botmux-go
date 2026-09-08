@@ -57,22 +57,25 @@ type Worker struct {
 }
 
 type Options struct {
-	SessionID  string
-	DaemonAddr string
-	CliType    string
-	CliPath    string
-	Model      string
-	WorkingDir string
-	StoreDir   string
+	SessionID    string
+	DaemonAddr   string
+	CliType      string
+	CliPath      string
+	Model        string
+	CodexProfile string
+	WorkingDir   string
+	StoreDir     string
 }
 
 func New(opts Options) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Worker{
-		sessionID:            opts.SessionID,
-		daemonAddr:           opts.DaemonAddr,
-		storeDir:             opts.StoreDir,
-		cliAdapter:           adapter.Create(adapter.AdapterOptions{CliType: opts.CliType, CliPath: opts.CliPath, Model: opts.Model}),
+		sessionID:  opts.SessionID,
+		daemonAddr: opts.DaemonAddr,
+		storeDir:   opts.StoreDir,
+		cliAdapter: adapter.Create(adapter.AdapterOptions{
+			CliType: opts.CliType, CliPath: opts.CliPath, Model: opts.Model, Profile: opts.CodexProfile,
+		}),
 		workingDir:           opts.WorkingDir,
 		ctx:                  ctx,
 		cancel:               cancel,

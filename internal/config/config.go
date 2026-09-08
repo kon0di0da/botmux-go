@@ -34,6 +34,7 @@ type BotConfig struct {
 	WorkingDir   string      `json:"working_dir,omitempty"`
 	AllowedUsers []string    `json:"allowed_users,omitempty"`
 	Model        string      `json:"model,omitempty"`
+	CodexProfile string      `json:"codex_profile,omitempty"`
 }
 
 type DaemonConfig struct {

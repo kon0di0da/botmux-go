@@ -12,22 +12,23 @@ import (
 	"syscall"
 	"time"
 
+	_ "botmux-go/internal/adapter"
 	"botmux-go/internal/config"
 	"botmux-go/internal/daemon"
-	_ "botmux-go/internal/adapter"
 	"botmux-go/internal/protocol"
 	"botmux-go/internal/worker"
 )
 
 const (
-	EnvRole       = "BOTMUX_ROLE"
-	EnvSessionID  = "BOTMUX_SESSION_ID"
-	EnvDaemonAddr = "BOTMUX_DAEMON_ADDR"
-	EnvCliType    = "BOTMUX_CLI_TYPE"
-	EnvCliPath    = "BOTMUX_CLI_PATH"
-	EnvModel      = "BOTMUX_MODEL"
-	EnvWorkingDir = "BOTMUX_WORKING_DIR"
-	EnvStoreDir   = "BOTMUX_STORE_DIR"
+	EnvRole         = "BOTMUX_ROLE"
+	EnvSessionID    = "BOTMUX_SESSION_ID"
+	EnvDaemonAddr   = "BOTMUX_DAEMON_ADDR"
+	EnvCliType      = "BOTMUX_CLI_TYPE"
+	EnvCliPath      = "BOTMUX_CLI_PATH"
+	EnvModel        = "BOTMUX_MODEL"
+	EnvCodexProfile = "BOTMUX_CODEX_PROFILE"
+	EnvWorkingDir   = "BOTMUX_WORKING_DIR"
+	EnvStoreDir     = "BOTMUX_STORE_DIR"
 )
 
 func main() {
@@ -53,6 +54,7 @@ func runWorker() {
 	}
 	cliPath := os.Getenv(EnvCliPath)
 	model := os.Getenv(EnvModel)
+	codexProfile := os.Getenv(EnvCodexProfile)
 	workingDir := os.Getenv(EnvWorkingDir)
 	if workingDir == "" {
 		home, _ := os.UserHomeDir()
@@ -60,13 +62,14 @@ func runWorker() {
 	}
 	storeDir := os.Getenv(EnvStoreDir)
 	w := worker.New(worker.Options{
-		SessionID:  sessionID,
-		DaemonAddr: daemonAddr,
-		CliType:    cliType,
-		CliPath:    cliPath,
-		Model:      model,
-		WorkingDir: workingDir,
-		StoreDir:   storeDir,
+		SessionID:    sessionID,
+		DaemonAddr:   daemonAddr,
+		CliType:      cliType,
+		CliPath:      cliPath,
+		Model:        model,
+		CodexProfile: codexProfile,
+		WorkingDir:   workingDir,
+		StoreDir:     storeDir,
 	})
 	if err := w.Run(); err != nil {
 		log.Fatalf("[worker] fatal: %v", err)
@@ -75,7 +78,7 @@ func runWorker() {
 
 func runDaemon() {
 	cfgPath := flag.String("config", "", "path to bots.json config (optional)")
-	cmd := flag.String("cmd", "", "send command to running daemon: new <session_id> [<bot_id>] | send <session_id> <msg>")
+	cmd := flag.String("cmd", "", "send command to running daemon: new <session_id> [<bot_id>] [<codex_profile>] | send <session_id> <msg>")
 	listen := flag.String("listen", "", "override daemon listen addr (e.g. 127.0.0.1:17890)")
 	dashboard := flag.String("dashboard", "", "override dashboard listen addr (e.g. 127.0.0.1:17891)")
 	flag.Parse()
@@ -156,11 +159,15 @@ func execCommand(daemonOverride, sub string, rest []string) {
 	case "new", "ns", "newsession":
 		sid := ""
 		botID := ""
+		codexProfile := ""
 		if len(rest) > 0 {
 			sid = rest[0]
 		}
 		if len(rest) > 1 {
 			botID = rest[1]
+		}
+		if len(rest) > 2 {
+			codexProfile = rest[2]
 		}
 		if sid == "" {
 			sid = fmt.Sprintf("s-%d", time.Now().Unix())
@@ -171,7 +178,18 @@ func execCommand(daemonOverride, sub string, rest []string) {
 			os.Exit(1)
 		}
 		defer conn.Close()
-		m := protocol.NewMessage(protocol.MsgNewSession, sid, botID)
+		payload, err := json.Marshal(struct {
+			BotID        string `json:"bot_id,omitempty"`
+			CodexProfile string `json:"codex_profile,omitempty"`
+		}{
+			BotID:        botID,
+			CodexProfile: codexProfile,
+		})
+		if err != nil {
+			fmt.Printf("[cli] encode new session request: %v\n", err)
+			os.Exit(1)
+		}
+		m := protocol.NewMessage(protocol.MsgNewSession, sid, string(payload))
 		fmt.Printf("[cli] -> %s new session %s (bot=%s)\n", addr, short(sid), botID)
 		if _, err := m.WriteTo(conn); err != nil {
 			fmt.Printf("[cli] write: %v\n", err)

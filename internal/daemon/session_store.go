@@ -9,17 +9,18 @@ import (
 )
 
 type PersistedSession struct {
-	SessionID  string    `json:"session_id"`
-	BotID      string    `json:"bot_id"`
-	CliType    string    `json:"cli_type"`
-	CliPath    string    `json:"cli_path,omitempty"`
-	Model      string    `json:"model,omitempty"`
-	WorkingDir string    `json:"working_dir"`
-	WorkerPID  int       `json:"worker_pid"`
-	LastOutput []string  `json:"last_output"`
-	LastActive time.Time `json:"last_active"`
-	CreatedAt  time.Time `json:"created_at"`
-	Closed     bool      `json:"closed"`
+	SessionID    string    `json:"session_id"`
+	BotID        string    `json:"bot_id"`
+	CliType      string    `json:"cli_type"`
+	CliPath      string    `json:"cli_path,omitempty"`
+	Model        string    `json:"model,omitempty"`
+	CodexProfile string    `json:"codex_profile,omitempty"`
+	WorkingDir   string    `json:"working_dir"`
+	WorkerPID    int       `json:"worker_pid"`
+	LastOutput   []string  `json:"last_output"`
+	LastActive   time.Time `json:"last_active"`
+	CreatedAt    time.Time `json:"created_at"`
+	Closed       bool      `json:"closed"`
 }
 
 type SessionStore struct {
