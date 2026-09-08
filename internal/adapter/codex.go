@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/creack/pty/v2"
 )
@@ -43,6 +44,11 @@ type CodexAdapter struct {
 	closed    bool
 	started   bool
 	screen    string
+	deps      codexDependencies
+}
+
+type codexDependencies struct {
+	ownedRollouts func(pid int) (map[string]struct{}, error)
 }
 
 func NewCodexAdapter(opts AdapterOptions) *CodexAdapter {
@@ -58,6 +64,9 @@ func NewCodexAdapter(opts AdapterOptions) *CodexAdapter {
 		errCh:    make(chan error, 1),
 		ready:    make(chan error, 1),
 		events:   make(chan AdapterEvent, 8),
+		deps: codexDependencies{
+			ownedRollouts: codexRolloutsOwnedByPID,
+		},
 	}
 }
 
@@ -164,10 +173,35 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 	if ptmx == nil {
 		return SendResult{}, fmt.Errorf("codex adapter not started")
 	}
-	if _, err := ptmx.Write([]byte(input)); err != nil {
-		return SendResult{}, fmt.Errorf("codex write input: %w", err)
+	normalized := normalizeCodexInput(input)
+	if strings.TrimSpace(normalized) == "" {
+		return SendResult{}, nil
 	}
-	return SendResult{}, nil
+	historyPath := codexHistoryPath()
+	baseline := currentFileSize(historyPath)
+	body := "\x1b[200~" + normalized + "\x1b[201~"
+	if err := writeAll(ctx, ptmx, []byte(body)); err != nil {
+		return SendResult{}, fmt.Errorf("codex paste input: %w", err)
+	}
+	if err := waitContext(ctx, 200*time.Millisecond); err != nil {
+		return SendResult{}, err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := writeAll(ctx, ptmx, []byte{'\r'}); err != nil {
+			return SendResult{}, fmt.Errorf("codex submit input: %w", err)
+		}
+		sessionID, err := waitForCodexHistory(
+			ctx,
+			historyPath,
+			baseline,
+			normalized,
+			a.ownsSession,
+		)
+		if err == nil {
+			return SendResult{CliSessionID: sessionID}, nil
+		}
+	}
+	return SendResult{}, fmt.Errorf("codex submit not confirmed after 3 Enter attempts")
 }
 
 func (a *CodexAdapter) Close() error {
@@ -301,4 +335,47 @@ func stripCodexANSI(input string) string {
 		}
 	}
 	return out.String()
+}
+
+func normalizeCodexInput(input string) string {
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	input = strings.ReplaceAll(input, "\r", "\n")
+	return strings.TrimRight(input, "\n")
+}
+
+func writeAll(ctx context.Context, writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		n, err := writer.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+	return nil
+}
+
+func (a *CodexAdapter) ownsSession(sessionID string) bool {
+	a.mu.Lock()
+	cmd := a.cmd
+	deps := a.deps
+	a.mu.Unlock()
+	if cmd == nil || cmd.Process == nil || deps.ownedRollouts == nil {
+		return false
+	}
+	owned, err := deps.ownedRollouts(cmd.Process.Pid)
+	if err != nil {
+		return false
+	}
+	_, ok := owned[strings.ToLower(sessionID)]
+	return ok
 }
