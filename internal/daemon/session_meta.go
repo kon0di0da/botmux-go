@@ -3,6 +3,8 @@ package daemon
 import (
 	"sync"
 	"time"
+
+	"botmux-go/internal/protocol"
 )
 
 type SessionStatus string
@@ -17,11 +19,12 @@ const (
 
 func NewSessionMeta(sid, botID string) *SessionMeta {
 	return &SessionMeta{
-		SessionID:      sid,
-		BotID:          botID,
-		CreatedAt:      time.Now(),
-		Status:         StatusCreated,
-		outputNotifyCh: make(chan struct{}),
+		SessionID:        sid,
+		BotID:            botID,
+		CreatedAt:        time.Now(),
+		Status:           StatusCreated,
+		outputNotifyCh:   make(chan struct{}),
+		terminalNotifyCh: make(chan struct{}),
 	}
 }
 
@@ -39,11 +42,15 @@ type SessionMeta struct {
 	Closed       bool
 	Status       SessionStatus
 
-	mu             sync.Mutex
-	lastActive     time.Time
-	onClose        []func()
-	outputSeq      uint64
-	outputNotifyCh chan struct{}
+	mu               sync.Mutex
+	lastActive       time.Time
+	onClose          []func()
+	outputSeq        uint64
+	outputNotifyCh   chan struct{}
+	turnActive       bool
+	terminalSeq      uint64
+	terminals        []protocol.TurnTerminal
+	terminalNotifyCh chan struct{}
 }
 
 func (m *SessionMeta) touchActive() {
@@ -124,6 +131,84 @@ func (m *SessionMeta) ensureOutputStateLocked() {
 	}
 }
 
+const maxMemoryTerminals = 16
+
+func (m *SessionMeta) BeginTurn() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.turnActive {
+		return false
+	}
+	m.turnActive = true
+	return true
+}
+
+func (m *SessionMeta) FinishTurn() {
+	m.mu.Lock()
+	m.turnActive = false
+	m.mu.Unlock()
+}
+
+func (m *SessionMeta) PublishTerminal(terminal protocol.TurnTerminal) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureTerminalStateLocked()
+	m.terminals = append(m.terminals, terminal)
+	m.terminalSeq++
+	if len(m.terminals) > maxMemoryTerminals {
+		m.terminals = m.terminals[len(m.terminals)-maxMemoryTerminals:]
+	}
+	notifyCh := m.terminalNotifyCh
+	m.terminalNotifyCh = make(chan struct{})
+	close(notifyCh)
+}
+
+func (m *SessionMeta) TerminalSubscription() (uint64, <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureTerminalStateLocked()
+	return m.terminalSeq, m.terminalNotifyCh
+}
+
+func (m *SessionMeta) SnapshotTerminalsSince(cursor uint64) ([]protocol.TurnTerminal, uint64, <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureTerminalStateLocked()
+	next := m.terminalSeq
+	base := next - uint64(len(m.terminals))
+	if cursor < base {
+		cursor = base
+	}
+	if cursor > next {
+		cursor = next
+	}
+	start := int(cursor - base)
+	terminals := make([]protocol.TurnTerminal, len(m.terminals)-start)
+	copy(terminals, m.terminals[start:])
+	return terminals, next, m.terminalNotifyCh
+}
+
+func (m *SessionMeta) SetCliSessionID(id string) {
+	m.mu.Lock()
+	m.CliSessionID = id
+	m.mu.Unlock()
+}
+
+func (m *SessionMeta) GetCliSessionID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.CliSessionID
+}
+
+func (m *SessionMeta) ensureTerminalStateLocked() {
+	if m.terminalNotifyCh == nil {
+		m.terminalNotifyCh = make(chan struct{})
+	}
+	if minimum := uint64(len(m.terminals)); m.terminalSeq < minimum {
+		m.terminalSeq = minimum
+	}
+}
+
 func (m *SessionMeta) AddOnClose(fn func()) {
 	m.mu.Lock()
 	m.onClose = append(m.onClose, fn)
@@ -176,20 +261,21 @@ func SessionMetaFromPersisted(ps *PersistedSession) *SessionMeta {
 		createdAt = time.Now()
 	}
 	return &SessionMeta{
-		SessionID:      ps.SessionID,
-		BotID:          ps.BotID,
-		CliType:        ps.CliType,
-		CliPath:        ps.CliPath,
-		Model:          ps.Model,
-		CodexProfile:   ps.CodexProfile,
-		CliSessionID:   ps.CliSessionID,
-		WorkingDir:     ps.WorkingDir,
-		LastOutput:     lastOutput,
-		CreatedAt:      createdAt,
-		Closed:         ps.Closed,
-		Status:         status,
-		lastActive:     lastActive,
-		outputSeq:      uint64(len(lastOutput)),
-		outputNotifyCh: make(chan struct{}),
+		SessionID:        ps.SessionID,
+		BotID:            ps.BotID,
+		CliType:          ps.CliType,
+		CliPath:          ps.CliPath,
+		Model:            ps.Model,
+		CodexProfile:     ps.CodexProfile,
+		CliSessionID:     ps.CliSessionID,
+		WorkingDir:       ps.WorkingDir,
+		LastOutput:       lastOutput,
+		CreatedAt:        createdAt,
+		Closed:           ps.Closed,
+		Status:           status,
+		lastActive:       lastActive,
+		outputSeq:        uint64(len(lastOutput)),
+		outputNotifyCh:   make(chan struct{}),
+		terminalNotifyCh: make(chan struct{}),
 	}
 }

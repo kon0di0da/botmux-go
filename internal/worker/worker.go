@@ -3,6 +3,7 @@ package worker
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -336,10 +337,15 @@ func (w *Worker) readDaemonMessages() {
 				w.finishTurn()
 				w.outputIdleObserver.CancelInput()
 				log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
+				w.sendTurnTerminal(protocol.TurnTerminal{
+					Status:      protocol.TurnFailed,
+					ErrorCode:   "codex_submit_failed",
+					ErrorDetail: err.Error(),
+				})
 				continue
 			}
 			if result.CliSessionID != "" {
-				if err := w.sendMessage(protocol.MsgSessionUpdate, result.CliSessionID); err != nil {
+				if err := w.sendMessage(protocol.MsgCliSessionBound, result.CliSessionID); err != nil {
 					log.Printf("[worker:%s] persist CLI session ID: %v", safeShortID(w.sessionID), err)
 				}
 			}
@@ -464,15 +470,24 @@ func (w *Worker) readAdapterEvents() {
 			case adapter.AdapterTurnTerminal:
 				w.finishTurn()
 				w.outputIdleObserver.CancelInput()
-				if event.Status != adapter.TurnCompleted {
-					detail := event.ErrorCode
-					if event.ErrorDetail != "" {
-						detail += ": " + event.ErrorDetail
-					}
-					w.sendError(detail)
-				}
+				w.sendTurnTerminal(protocol.TurnTerminal{
+					Status:      protocol.TurnStatus(event.Status),
+					ErrorCode:   event.ErrorCode,
+					ErrorDetail: event.ErrorDetail,
+				})
 			}
 		}
+	}
+}
+
+func (w *Worker) sendTurnTerminal(terminal protocol.TurnTerminal) {
+	payload, err := json.Marshal(terminal)
+	if err != nil {
+		w.sendError("encode Codex terminal: " + err.Error())
+		return
+	}
+	if err := w.sendMessage(protocol.MsgTurnCompleted, string(payload)); err != nil {
+		log.Printf("[worker:%s] send turn terminal: %v", safeShortID(w.sessionID), err)
 	}
 }
 

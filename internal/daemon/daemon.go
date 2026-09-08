@@ -492,13 +492,20 @@ func (d *Daemon) SendInput(id, input string) error {
 		return fmt.Errorf("session %s worker not connected (status=%s)", id, meta.Status)
 	}
 
+	if meta.CliType == string(config.CliCodex) && !meta.BeginTurn() {
+		return fmt.Errorf("session %s already has an active turn", id)
+	}
 	msg := protocol.NewMessage(protocol.MsgUserInput, id, input)
 	meta.touchActive()
 	userLine := "[user] " + input
 	meta.AddOutput(userLine)
 	_ = d.store.UpdateOutput(id, userLine)
 	fmt.Printf("[session=%s] %s\n", safeShort(id), userLine)
-	return h.Send(msg)
+	if err := h.Send(msg); err != nil {
+		meta.FinishTurn()
+		return err
+	}
+	return nil
 }
 
 func (d *Daemon) Sessions() map[string]*SessionMeta {
@@ -818,9 +825,15 @@ func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message
 	}
 
 	cursor, outputCh := meta.OutputSubscription()
+	terminalCursor, terminalCh := meta.TerminalSubscription()
 	if msg.Type == protocol.MsgUserInput {
+		if meta.CliType == string(config.CliCodex) && !meta.BeginTurn() {
+			_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "session already has an active turn").WriteTo(clientConn)
+			return
+		}
 		inCopy := *msg
 		if err := h.Send(&inCopy); err != nil {
+			meta.FinishTurn()
 			_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "forward: "+err.Error()).WriteTo(clientConn)
 			return
 		}
@@ -860,6 +873,24 @@ func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message
 						log.Printf("[daemon] forward output write err: %v", err)
 						return
 					}
+				}
+			case <-terminalCh:
+				terminals, next, nextTerminalCh := meta.SnapshotTerminalsSince(terminalCursor)
+				terminalCursor = next
+				terminalCh = nextTerminalCh
+				for _, terminal := range terminals {
+					payload, err := json.Marshal(terminal)
+					if err != nil {
+						log.Printf("[daemon] encode turn terminal: %v", err)
+						return
+					}
+					connMu.Lock()
+					_, err = protocol.NewMessage(protocol.MsgTurnCompleted, meta.SessionID, string(payload)).WriteTo(clientConn)
+					connMu.Unlock()
+					if err != nil {
+						log.Printf("[daemon] forward turn terminal write err: %v", err)
+					}
+					return
 				}
 			}
 		}
@@ -929,16 +960,27 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 		fmt.Printf("[session=%s] %s\n", safeShort(meta.SessionID), msg.Payload)
 	case protocol.MsgError:
 		log.Printf("[daemon] session %s error: %s", safeShort(meta.SessionID), msg.Payload)
-	case protocol.MsgSessionUpdate:
+	case protocol.MsgCliSessionBound:
 		if !isCodexSessionID(msg.Payload) {
 			log.Printf("[daemon] session %s ignored invalid Codex session ID", safeShort(meta.SessionID))
 			return
 		}
-		meta.CliSessionID = msg.Payload
+		meta.SetCliSessionID(msg.Payload)
 		meta.touchActive()
 		if err := d.store.UpdateCliSessionID(meta.SessionID, msg.Payload); err != nil {
 			log.Printf("[daemon] session %s persist Codex session ID: %v", safeShort(meta.SessionID), err)
 		}
+	case protocol.MsgTurnCompleted:
+		var terminal protocol.TurnTerminal
+		if err := json.Unmarshal([]byte(msg.Payload), &terminal); err != nil {
+			terminal = protocol.TurnTerminal{
+				Status:      protocol.TurnFailed,
+				ErrorCode:   "invalid_terminal",
+				ErrorDetail: err.Error(),
+			}
+		}
+		meta.PublishTerminal(terminal)
+		meta.FinishTurn()
 	case protocol.MsgClose:
 		log.Printf("[daemon] session %s closed by worker", safeShort(meta.SessionID))
 		d.removeSession(meta.SessionID)

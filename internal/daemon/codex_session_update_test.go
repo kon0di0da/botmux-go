@@ -15,7 +15,7 @@ func TestSessionUpdatePersistsCodexNativeSessionID(t *testing.T) {
 	d := &Daemon{store: store}
 
 	d.routeMessage(
-		protocol.NewMessage(protocol.MsgSessionUpdate, meta.SessionID, "01234567-89ab-cdef-0123-456789abcdef"),
+		protocol.NewMessage(protocol.MsgCliSessionBound, meta.SessionID, "01234567-89ab-cdef-0123-456789abcdef"),
 		meta,
 		nil,
 	)

@@ -10,16 +10,16 @@ import (
 type MessageType string
 
 const (
-	MsgNewSession    MessageType = "new_session"
-	MsgUserInput     MessageType = "user_input"
-	MsgClose         MessageType = "close"
-	MsgOutput        MessageType = "output"
-	MsgReady         MessageType = "ready"
-	MsgError         MessageType = "error"
-	MsgSessionUpdate MessageType = "session_update"
-	MsgTurnTerminal  MessageType = "turn_terminal"
-	MsgHeartbeat     MessageType = "heartbeat"
-	MsgAck           MessageType = "ack"
+	MsgNewSession      MessageType = "new_session"
+	MsgUserInput       MessageType = "user_input"
+	MsgClose           MessageType = "close"
+	MsgOutput          MessageType = "output"
+	MsgReady           MessageType = "ready"
+	MsgError           MessageType = "error"
+	MsgCliSessionBound MessageType = "cli_session_bound"
+	MsgTurnCompleted   MessageType = "turn_completed"
+	MsgHeartbeat       MessageType = "heartbeat"
+	MsgAck             MessageType = "ack"
 
 	MsgListSessions    MessageType = "list_sessions"
 	MsgListSessionsRsp MessageType = "list_sessions_rsp"
@@ -28,6 +28,20 @@ const (
 	MsgCloseSession    MessageType = "close_session"
 	MsgCloseSessionAck MessageType = "close_session_ack"
 )
+
+type TurnStatus string
+
+const (
+	TurnCompleted TurnStatus = "completed"
+	TurnAborted   TurnStatus = "aborted"
+	TurnFailed    TurnStatus = "failed"
+)
+
+type TurnTerminal struct {
+	Status      TurnStatus `json:"status"`
+	ErrorCode   string     `json:"error_code,omitempty"`
+	ErrorDetail string     `json:"error_detail,omitempty"`
+}
 
 type Message struct {
 	Type      MessageType `json:"type"`

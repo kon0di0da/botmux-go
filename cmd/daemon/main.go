@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -240,46 +241,9 @@ func execCommand(daemonOverride, sub string, rest []string) {
 			fmt.Printf("message is empty\n")
 			os.Exit(1)
 		}
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		if err != nil {
-			fmt.Printf("[cli] connect daemon %s: %v\n", addr, err)
+		if err := execSendCommand(addr, sid, message, os.Stdout); err != nil {
+			fmt.Printf("[cli] send: %v\n", err)
 			os.Exit(1)
-		}
-		defer conn.Close()
-		m := protocol.NewMessage(protocol.MsgUserInput, sid, message)
-		fmt.Printf("[cli] -> session %s type=user_input payload=%q\n", short(sid), message)
-		if _, err := m.WriteTo(conn); err != nil {
-			fmt.Printf("[cli] write: %v\n", err)
-			os.Exit(1)
-		}
-		br := protocol.NewMessageReader(conn)
-		fmt.Printf("[output] waiting...\n")
-		deadline := time.Now().Add(120 * time.Second)
-		gotAny := false
-		for time.Now().Before(deadline) {
-			_ = conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
-			msg, err := br.Read()
-			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					continue
-				}
-				break
-			}
-			_ = conn.SetReadDeadline(time.Time{})
-			if msg.Type == protocol.MsgError && (msg.SessionID == sid || msg.SessionID == "") {
-				fmt.Printf("  !! error: %s\n", msg.Payload)
-				os.Exit(1)
-			}
-			if msg.SessionID == sid && msg.Type == protocol.MsgOutput {
-				fmt.Printf("  << %s\n", msg.Payload)
-				gotAny = true
-			}
-		}
-		_ = conn.SetReadDeadline(time.Time{})
-		if gotAny {
-			fmt.Printf("[cli] done\n")
-		} else {
-			fmt.Printf("[cli] no output received within deadline. Is session %s running?\n", short(sid))
 		}
 
 	case "list", "ls", "sessions":
@@ -446,6 +410,60 @@ func execCommand(daemonOverride, sub string, rest []string) {
 		fmt.Printf("  close <session_id> [<reason>]   Close a session (stop auto-recover)\n")
 		os.Exit(2)
 	}
+}
+
+func execSendCommand(addr, sid, message string, out io.Writer) error {
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect daemon %s: %w", addr, err)
+	}
+	defer conn.Close()
+
+	if _, err := fmt.Fprintf(out, "[cli] -> session %s type=user_input payload=%q\n", short(sid), message); err != nil {
+		return err
+	}
+	if _, err := protocol.NewMessage(protocol.MsgUserInput, sid, message).WriteTo(conn); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if _, err := fmt.Fprintln(out, "[output] waiting..."); err != nil {
+		return err
+	}
+
+	reader := protocol.NewMessageReader(conn)
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+		msg, err := reader.Read()
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			return fmt.Errorf("read: %w", err)
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		if msg.SessionID != sid && msg.SessionID != "" {
+			continue
+		}
+		switch msg.Type {
+		case protocol.MsgError:
+			return fmt.Errorf("%s", msg.Payload)
+		case protocol.MsgOutput:
+			if _, err := fmt.Fprintf(out, "  << %s\n", msg.Payload); err != nil {
+				return err
+			}
+		case protocol.MsgTurnCompleted:
+			var terminal protocol.TurnTerminal
+			if err := json.Unmarshal([]byte(msg.Payload), &terminal); err != nil {
+				return fmt.Errorf("decode turn terminal: %w", err)
+			}
+			if terminal.Status != protocol.TurnCompleted {
+				return fmt.Errorf("%s: %s", terminal.ErrorCode, terminal.ErrorDetail)
+			}
+			_, err := fmt.Fprintln(out, "[cli] done")
+			return err
+		}
+	}
+	return fmt.Errorf("timeout waiting for turn completion")
 }
 
 func short(s string) string {
