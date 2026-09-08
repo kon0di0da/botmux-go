@@ -45,6 +45,7 @@ type CodexAdapter struct {
 	started   bool
 	screen    string
 	deps      codexDependencies
+	ctx       context.Context
 }
 
 type codexDependencies struct {
@@ -137,6 +138,7 @@ func (a *CodexAdapter) Start(ctx context.Context, workingDir string) (*CliStartR
 	a.ptmx = ptmx
 	a.outputR = outputR
 	a.outputW = outputW
+	a.ctx = ctx
 	a.started = true
 
 	go a.pumpOutput()
@@ -177,6 +179,20 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 	if strings.TrimSpace(normalized) == "" {
 		return SendResult{}, nil
 	}
+	a.mu.Lock()
+	resumeID := a.resumeID
+	baseCtx := a.ctx
+	started := a.started
+	a.mu.Unlock()
+	if baseCtx == nil {
+		baseCtx = ctx
+	}
+	rolloutOffset := int64(0)
+	if resumeID != "" {
+		if rolloutPath, ok := findCodexRolloutBySessionID(resumeID); ok {
+			rolloutOffset = currentFileSize(rolloutPath)
+		}
+	}
 	historyPath := codexHistoryPath()
 	baseline := currentFileSize(historyPath)
 	body := "\x1b[200~" + normalized + "\x1b[201~"
@@ -198,6 +214,9 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 			a.ownsSession,
 		)
 		if err == nil {
+			if started {
+				go a.watchTranscript(baseCtx, sessionID, normalized, rolloutOffset)
+			}
 			return SendResult{CliSessionID: sessionID}, nil
 		}
 	}
@@ -378,4 +397,66 @@ func (a *CodexAdapter) ownsSession(sessionID string) bool {
 	}
 	_, ok := owned[strings.ToLower(sessionID)]
 	return ok
+}
+
+func (a *CodexAdapter) watchTranscript(ctx context.Context, sessionID, input string, offset int64) {
+	const discoveryTimeout = 10 * time.Second
+	const pollInterval = 100 * time.Millisecond
+
+	deadline := time.NewTimer(discoveryTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	var cursor *codexTranscriptCursor
+	for cursor == nil {
+		if path, ok := findCodexRolloutBySessionID(sessionID); ok {
+			cursor = &codexTranscriptCursor{Path: path, Offset: offset, Input: input}
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			a.publishAdapterEvent(ctx, AdapterEvent{
+				Kind:        AdapterTurnTerminal,
+				Status:      TurnFailed,
+				ErrorCode:   "codex_rollout_missing",
+				ErrorDetail: "Codex rollout was not created after submission",
+			})
+			return
+		case <-ticker.C:
+		}
+	}
+
+	for {
+		events, err := cursor.ReadNew()
+		if err != nil {
+			a.publishAdapterEvent(ctx, AdapterEvent{
+				Kind:        AdapterTurnTerminal,
+				Status:      TurnFailed,
+				ErrorCode:   "codex_rollout_read_error",
+				ErrorDetail: safeCodexErrorDetail(err.Error()),
+			})
+			return
+		}
+		for _, event := range events {
+			a.publishAdapterEvent(ctx, event)
+			if event.Kind == AdapterTurnTerminal {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (a *CodexAdapter) publishAdapterEvent(ctx context.Context, event AdapterEvent) {
+	select {
+	case a.events <- event:
+	case <-ctx.Done():
+	}
 }

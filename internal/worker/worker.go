@@ -104,7 +104,14 @@ func (w *Worker) Run() error {
 		return err
 	}
 
-	w.wg.Add(3)
+	goroutines := 3
+	if w.startResult.Events != nil {
+		goroutines++
+	}
+	w.wg.Add(goroutines)
+	if w.startResult.Events != nil {
+		go w.readAdapterEvents()
+	}
 	go w.readDaemonMessages()
 	go w.readCliOutput()
 	go w.sendHeartbeats()
@@ -392,7 +399,7 @@ func (w *Worker) readCliOutput() {
 			clean = strings.TrimRight(clean, "\r")
 			clean = stripAnsi(clean)
 			clean = strings.TrimSpace(clean)
-			if clean != "" {
+			if clean != "" && !w.startResult.StructuredOutput {
 				if out := w.deduper.Check(clean); out != "" {
 					emitCount++
 					if err := w.sendMessage(protocol.MsgOutput, out); err != nil {
@@ -413,6 +420,39 @@ func (w *Worker) readCliOutput() {
 				line, err := reader.ReadString('\n')
 				readCh <- readResult{data: line, err: err}
 			}()
+		}
+	}
+}
+
+func (w *Worker) readAdapterEvents() {
+	defer w.wg.Done()
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case event, ok := <-w.startResult.Events:
+			if !ok {
+				return
+			}
+			switch event.Kind {
+			case adapter.AdapterOutput:
+				if event.Output == "" {
+					continue
+				}
+				w.outputIdleObserver.MarkOutput(time.Now())
+				if err := w.sendMessage(protocol.MsgOutput, event.Output); err != nil {
+					log.Printf("[worker:%s] send structured output: %v", safeShortID(w.sessionID), err)
+				}
+			case adapter.AdapterTurnTerminal:
+				w.outputIdleObserver.CancelInput()
+				if event.Status != adapter.TurnCompleted {
+					detail := event.ErrorCode
+					if event.ErrorDetail != "" {
+						detail += ": " + event.ErrorDetail
+					}
+					w.sendError(detail)
+				}
+			}
 		}
 	}
 }
