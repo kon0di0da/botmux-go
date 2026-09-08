@@ -34,3 +34,26 @@ func TestStructuredAdapterOutputUsesProtocolOutput(t *testing.T) {
 	w.Cancel()
 	w.wg.Wait()
 }
+
+func TestCodexTurnGateRejectsSecondInFlightTurn(t *testing.T) {
+	w := New(Options{CliType: "codex"})
+	if !w.beginTurn() {
+		t.Fatal("first Codex turn was rejected")
+	}
+	if w.beginTurn() {
+		t.Fatal("second in-flight Codex turn was accepted")
+	}
+	w.finishTurn()
+	if !w.beginTurn() {
+		t.Fatal("Codex turn was not released after terminal event")
+	}
+}
+
+func TestLegacyTurnGateAllowsTurns(t *testing.T) {
+	w := New(Options{CliType: "mock"})
+	first := w.beginTurn()
+	second := w.beginTurn()
+	if !first || !second {
+		t.Fatal("legacy adapter unexpectedly has a single-turn gate")
+	}
+}

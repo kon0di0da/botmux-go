@@ -10,14 +10,16 @@ import (
 type MessageType string
 
 const (
-	MsgNewSession  MessageType = "new_session"
-	MsgUserInput   MessageType = "user_input"
-	MsgClose       MessageType = "close"
-	MsgOutput      MessageType = "output"
-	MsgReady       MessageType = "ready"
-	MsgError       MessageType = "error"
-	MsgHeartbeat   MessageType = "heartbeat"
-	MsgAck         MessageType = "ack"
+	MsgNewSession    MessageType = "new_session"
+	MsgUserInput     MessageType = "user_input"
+	MsgClose         MessageType = "close"
+	MsgOutput        MessageType = "output"
+	MsgReady         MessageType = "ready"
+	MsgError         MessageType = "error"
+	MsgSessionUpdate MessageType = "session_update"
+	MsgTurnTerminal  MessageType = "turn_terminal"
+	MsgHeartbeat     MessageType = "heartbeat"
+	MsgAck           MessageType = "ack"
 
 	MsgListSessions    MessageType = "list_sessions"
 	MsgListSessionsRsp MessageType = "list_sessions_rsp"

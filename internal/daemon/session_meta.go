@@ -32,6 +32,7 @@ type SessionMeta struct {
 	CliPath      string
 	Model        string
 	CodexProfile string
+	CliSessionID string
 	WorkingDir   string
 	LastOutput   []string
 	CreatedAt    time.Time
@@ -150,6 +151,7 @@ func (m *SessionMeta) ToPersisted() *PersistedSession {
 		CliPath:      m.CliPath,
 		Model:        m.Model,
 		CodexProfile: m.CodexProfile,
+		CliSessionID: m.CliSessionID,
 		WorkingDir:   m.WorkingDir,
 		LastOutput:   lastOutput,
 		LastActive:   lastActive,
@@ -180,6 +182,7 @@ func SessionMetaFromPersisted(ps *PersistedSession) *SessionMeta {
 		CliPath:        ps.CliPath,
 		Model:          ps.Model,
 		CodexProfile:   ps.CodexProfile,
+		CliSessionID:   ps.CliSessionID,
 		WorkingDir:     ps.WorkingDir,
 		LastOutput:     lastOutput,
 		CreatedAt:      createdAt,

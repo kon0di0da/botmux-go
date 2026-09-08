@@ -15,6 +15,7 @@ type PersistedSession struct {
 	CliPath      string    `json:"cli_path,omitempty"`
 	Model        string    `json:"model,omitempty"`
 	CodexProfile string    `json:"codex_profile,omitempty"`
+	CliSessionID string    `json:"cli_session_id,omitempty"`
 	WorkingDir   string    `json:"working_dir"`
 	WorkerPID    int       `json:"worker_pid"`
 	LastOutput   []string  `json:"last_output"`
@@ -135,6 +136,16 @@ func (s *SessionStore) UpdateWorkerPID(sessionID string, pid int) error {
 		return err
 	}
 	ps.WorkerPID = pid
+	return s.save(ps)
+}
+
+func (s *SessionStore) UpdateCliSessionID(sessionID, cliSessionID string) error {
+	ps, err := s.load(sessionID)
+	if err != nil {
+		return err
+	}
+	ps.CliSessionID = cliSessionID
+	ps.LastActive = time.Now()
 	return s.save(ps)
 }
 

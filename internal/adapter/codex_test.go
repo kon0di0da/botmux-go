@@ -53,6 +53,17 @@ func TestCodexBuildArgsResumeDoesNotOverrideModelOrProfile(t *testing.T) {
 	}
 }
 
+func TestCodexResumeUsesPersistedNativeSessionID(t *testing.T) {
+	a := NewCodexAdapter(AdapterOptions{
+		CliType:         "codex",
+		ResumeSessionID: "01234567-89ab-cdef-0123-456789abcdef",
+	})
+	got := a.buildArgs("/tmp/repo")
+	if got[0] != "resume" || got[len(got)-1] != "01234567-89ab-cdef-0123-456789abcdef" {
+		t.Fatalf("resume args = %#v, want persisted native session ID", got)
+	}
+}
+
 func TestCodexSendUsesBracketedPasteAndReturnsConfirmedSession(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)

@@ -32,6 +32,7 @@ type Worker struct {
 	storeDir   string
 	cliAdapter adapter.CliAdapter
 	workingDir string
+	cliType    string
 
 	conn      net.Conn
 	connMu    sync.Mutex
@@ -54,17 +55,20 @@ type Worker struct {
 
 	deduper            *LineDeduper
 	outputIdleObserver *cliOutputIdleObserver
+	turnMu             sync.Mutex
+	turnInFlight       bool
 }
 
 type Options struct {
-	SessionID    string
-	DaemonAddr   string
-	CliType      string
-	CliPath      string
-	Model        string
-	CodexProfile string
-	WorkingDir   string
-	StoreDir     string
+	SessionID       string
+	DaemonAddr      string
+	CliType         string
+	CliPath         string
+	Model           string
+	CodexProfile    string
+	ResumeSessionID string
+	WorkingDir      string
+	StoreDir        string
 }
 
 func New(opts Options) *Worker {
@@ -75,8 +79,10 @@ func New(opts Options) *Worker {
 		storeDir:   opts.StoreDir,
 		cliAdapter: adapter.Create(adapter.AdapterOptions{
 			CliType: opts.CliType, CliPath: opts.CliPath, Model: opts.Model, Profile: opts.CodexProfile,
+			ResumeSessionID: opts.ResumeSessionID,
 		}),
 		workingDir:           opts.WorkingDir,
+		cliType:              opts.CliType,
 		ctx:                  ctx,
 		cancel:               cancel,
 		readyCh:              make(chan struct{}),
@@ -319,11 +325,23 @@ func (w *Worker) readDaemonMessages() {
 				return
 			}
 			w.deduper.Reset()
+			if !w.beginTurn() {
+				w.sendError("codex_turn_in_progress")
+				continue
+			}
 			log.Printf("[worker:%s] sending to cli: %q", safeShortID(w.sessionID), msg.Payload)
 			w.outputIdleObserver.BeginInput(time.Now())
-			if _, err := w.cliAdapter.Send(w.ctx, msg.Payload); err != nil {
+			result, err := w.cliAdapter.Send(w.ctx, msg.Payload)
+			if err != nil {
+				w.finishTurn()
 				w.outputIdleObserver.CancelInput()
 				log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
+				continue
+			}
+			if result.CliSessionID != "" {
+				if err := w.sendMessage(protocol.MsgSessionUpdate, result.CliSessionID); err != nil {
+					log.Printf("[worker:%s] persist CLI session ID: %v", safeShortID(w.sessionID), err)
+				}
 			}
 		case protocol.MsgClose:
 			log.Printf("[worker:%s] close requested by daemon", safeShortID(w.sessionID))
@@ -444,6 +462,7 @@ func (w *Worker) readAdapterEvents() {
 					log.Printf("[worker:%s] send structured output: %v", safeShortID(w.sessionID), err)
 				}
 			case adapter.AdapterTurnTerminal:
+				w.finishTurn()
 				w.outputIdleObserver.CancelInput()
 				if event.Status != adapter.TurnCompleted {
 					detail := event.ErrorCode
@@ -455,6 +474,28 @@ func (w *Worker) readAdapterEvents() {
 			}
 		}
 	}
+}
+
+func (w *Worker) beginTurn() bool {
+	if w.cliType != "codex" {
+		return true
+	}
+	w.turnMu.Lock()
+	defer w.turnMu.Unlock()
+	if w.turnInFlight {
+		return false
+	}
+	w.turnInFlight = true
+	return true
+}
+
+func (w *Worker) finishTurn() {
+	if w.cliType != "codex" {
+		return
+	}
+	w.turnMu.Lock()
+	w.turnInFlight = false
+	w.turnMu.Unlock()
 }
 
 type readResult struct {

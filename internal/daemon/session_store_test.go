@@ -19,6 +19,7 @@ func TestSessionStoreSaveLoadRoundTripPreservesModel(t *testing.T) {
 		CliPath:      "/usr/local/bin/aiden",
 		Model:        "gpt-5.5",
 		CodexProfile: "arkcli",
+		CliSessionID: "native-codex-session",
 		WorkingDir:   "/tmp/workspace",
 		WorkerPID:    1234,
 		LastOutput:   []string{"line-1", "line-2"},
@@ -39,6 +40,9 @@ func TestSessionStoreSaveLoadRoundTripPreservesModel(t *testing.T) {
 	}
 	if got.CodexProfile != want.CodexProfile {
 		t.Fatalf("CodexProfile = %q, want %q", got.CodexProfile, want.CodexProfile)
+	}
+	if got.CliSessionID != want.CliSessionID {
+		t.Fatalf("CliSessionID = %q, want %q", got.CliSessionID, want.CliSessionID)
 	}
 	if got.WorkerPID != want.WorkerPID {
 		t.Fatalf("WorkerPID = %d, want %d", got.WorkerPID, want.WorkerPID)

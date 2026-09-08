@@ -237,6 +237,7 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 		"BOTMUX_CLI_PATH="+meta.CliPath,
 		"BOTMUX_MODEL="+meta.Model,
 		"BOTMUX_CODEX_PROFILE="+meta.CodexProfile,
+		"BOTMUX_RESUME_SESSION_ID="+meta.CliSessionID,
 		"BOTMUX_WORKING_DIR="+meta.WorkingDir,
 		"BOTMUX_STORE_DIR="+d.cfg.SessionsDir,
 	)
@@ -928,12 +929,40 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 		fmt.Printf("[session=%s] %s\n", safeShort(meta.SessionID), msg.Payload)
 	case protocol.MsgError:
 		log.Printf("[daemon] session %s error: %s", safeShort(meta.SessionID), msg.Payload)
+	case protocol.MsgSessionUpdate:
+		if !isCodexSessionID(msg.Payload) {
+			log.Printf("[daemon] session %s ignored invalid Codex session ID", safeShort(meta.SessionID))
+			return
+		}
+		meta.CliSessionID = msg.Payload
+		meta.touchActive()
+		if err := d.store.UpdateCliSessionID(meta.SessionID, msg.Payload); err != nil {
+			log.Printf("[daemon] session %s persist Codex session ID: %v", safeShort(meta.SessionID), err)
+		}
 	case protocol.MsgClose:
 		log.Printf("[daemon] session %s closed by worker", safeShort(meta.SessionID))
 		d.removeSession(meta.SessionID)
 	default:
 		log.Printf("[daemon] session %s unknown msg type=%s", safeShort(meta.SessionID), msg.Type)
 	}
+}
+
+func isCodexSessionID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, b := range value {
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			if b != '-' {
+				return false
+			}
+		case (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F'):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Daemon) periodicGC() {
