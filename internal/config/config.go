@@ -13,6 +13,7 @@ type CliType string
 const (
 	CliMock   CliType = "mock"
 	CliPty    CliType = "pty"
+	CliAiden  CliType = "aiden"
 	CliCodex  CliType = "codex"
 	CliClaude CliType = "claude-code"
 )

@@ -20,13 +20,14 @@ import (
 )
 
 const (
-	EnvRole      = "BOTMUX_ROLE"
-	EnvSessionID = "BOTMUX_SESSION_ID"
+	EnvRole       = "BOTMUX_ROLE"
+	EnvSessionID  = "BOTMUX_SESSION_ID"
 	EnvDaemonAddr = "BOTMUX_DAEMON_ADDR"
-	EnvCliType   = "BOTMUX_CLI_TYPE"
-	EnvCliPath   = "BOTMUX_CLI_PATH"
+	EnvCliType    = "BOTMUX_CLI_TYPE"
+	EnvCliPath    = "BOTMUX_CLI_PATH"
+	EnvModel      = "BOTMUX_MODEL"
 	EnvWorkingDir = "BOTMUX_WORKING_DIR"
-	EnvStoreDir  = "BOTMUX_STORE_DIR"
+	EnvStoreDir   = "BOTMUX_STORE_DIR"
 )
 
 func main() {
@@ -51,6 +52,7 @@ func runWorker() {
 		cliType = "mock"
 	}
 	cliPath := os.Getenv(EnvCliPath)
+	model := os.Getenv(EnvModel)
 	workingDir := os.Getenv(EnvWorkingDir)
 	if workingDir == "" {
 		home, _ := os.UserHomeDir()
@@ -62,6 +64,7 @@ func runWorker() {
 		DaemonAddr: daemonAddr,
 		CliType:    cliType,
 		CliPath:    cliPath,
+		Model:      model,
 		WorkingDir: workingDir,
 		StoreDir:   storeDir,
 	})
@@ -230,7 +233,7 @@ func execCommand(daemonOverride, sub string, rest []string) {
 		}
 		br := protocol.NewMessageReader(conn)
 		fmt.Printf("[output] waiting...\n")
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.Now().Add(120 * time.Second)
 		gotAny := false
 		for time.Now().Before(deadline) {
 			_ = conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
@@ -249,7 +252,6 @@ func execCommand(daemonOverride, sub string, rest []string) {
 			if msg.SessionID == sid && msg.Type == protocol.MsgOutput {
 				fmt.Printf("  << %s\n", msg.Payload)
 				gotAny = true
-				break
 			}
 		}
 		_ = conn.SetReadDeadline(time.Time{})

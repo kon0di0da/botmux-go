@@ -17,10 +17,11 @@ type WorkerHandle struct {
 	Ready     chan struct{}
 	Pid       int
 
-	mu      sync.Mutex
-	hbSeen  time.Time
-	isReady bool
-	closed  bool
+	mu                     sync.Mutex
+	hbSeen                 time.Time
+	isReady                bool
+	closed                 bool
+	startupFailureRecorded bool
 }
 
 func NewWorkerHandle(sessionID string) *WorkerHandle {
@@ -85,6 +86,16 @@ func (h *WorkerHandle) IsReady() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.isReady
+}
+
+func (h *WorkerHandle) markStartupFailure() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.isReady || h.startupFailureRecorded {
+		return false
+	}
+	h.startupFailureRecorded = true
+	return true
 }
 
 func (h *WorkerHandle) CloseConn() {

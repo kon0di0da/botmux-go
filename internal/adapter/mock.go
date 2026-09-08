@@ -10,21 +10,22 @@ import (
 )
 
 type MockAdapter struct {
-	mu          sync.Mutex
-	name        string
-	inputR      *io.PipeReader
-	inputW      *io.PipeWriter
-	outputR     *io.PipeReader
-	outputW     *io.PipeWriter
-	errCh       chan error
-	closed      bool
-	echoDelay   time.Duration
-	history     []string
+	mu        sync.Mutex
+	name      string
+	inputR    *io.PipeReader
+	inputW    *io.PipeWriter
+	outputR   *io.PipeReader
+	outputW   *io.PipeWriter
+	errCh     chan error
+	closed    bool
+	echoDelay time.Duration
+	history   []string
+	wg        sync.WaitGroup
 }
 
 func init() {
-	RegisterFactory("mock", func(kind, cliPath string) CliAdapter {
-		return NewMockAdapter(kind)
+	RegisterFactory("mock", func(opts AdapterOptions) CliAdapter {
+		return NewMockAdapter(opts.CliType)
 	})
 }
 
@@ -52,6 +53,7 @@ func (m *MockAdapter) Start(ctx context.Context, workingDir string) (*CliStartRe
 	m.inputR, m.inputW = io.Pipe()
 	m.outputR, m.outputW = io.Pipe()
 
+	m.wg.Add(1)
 	go m.echoLoop(ctx)
 
 	return &CliStartResult{
@@ -62,6 +64,7 @@ func (m *MockAdapter) Start(ctx context.Context, workingDir string) (*CliStartRe
 }
 
 func (m *MockAdapter) echoLoop(ctx context.Context) {
+	defer m.wg.Done()
 	buf := make([]byte, 4096)
 	var lineBuf bytes.Buffer
 	for {
@@ -121,8 +124,8 @@ func (m *MockAdapter) Send(ctx context.Context, input string) error {
 
 func (m *MockAdapter) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
@@ -138,6 +141,9 @@ func (m *MockAdapter) Close() error {
 	if m.outputR != nil {
 		m.outputR.Close()
 	}
+	m.mu.Unlock()
+
+	m.wg.Wait()
 	close(m.errCh)
 	return nil
 }

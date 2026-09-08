@@ -18,6 +18,14 @@ import (
 	"botmux-go/internal/protocol"
 )
 
+const (
+	cliOutputIdleAfter     = 15 * time.Second
+	cliOutputStallAfter    = 60 * time.Second
+	cliOutputIdleLogEvery  = 15 * time.Second
+	cliOutputObserveFor    = 130 * time.Second
+	cliOutputCheckInterval = 5 * time.Second
+)
+
 type Worker struct {
 	sessionID  string
 	daemonAddr string
@@ -43,6 +51,9 @@ type Worker struct {
 	connected   bool
 
 	daemonDisconnectedCh chan struct{}
+
+	deduper            *LineDeduper
+	outputIdleObserver *cliOutputIdleObserver
 }
 
 type Options struct {
@@ -50,6 +61,7 @@ type Options struct {
 	DaemonAddr string
 	CliType    string
 	CliPath    string
+	Model      string
 	WorkingDir string
 	StoreDir   string
 }
@@ -60,12 +72,19 @@ func New(opts Options) *Worker {
 		sessionID:            opts.SessionID,
 		daemonAddr:           opts.DaemonAddr,
 		storeDir:             opts.StoreDir,
-		cliAdapter:           adapter.Create(opts.CliType, opts.CliPath),
+		cliAdapter:           adapter.Create(adapter.AdapterOptions{CliType: opts.CliType, CliPath: opts.CliPath, Model: opts.Model}),
 		workingDir:           opts.WorkingDir,
 		ctx:                  ctx,
 		cancel:               cancel,
 		readyCh:              make(chan struct{}),
 		daemonDisconnectedCh: make(chan struct{}, 1),
+		deduper:              NewLineDeduper(400),
+		outputIdleObserver: newCLIOutputIdleObserver(
+			cliOutputIdleAfter,
+			cliOutputStallAfter,
+			cliOutputIdleLogEvery,
+			cliOutputObserveFor,
+		),
 	}
 }
 
@@ -81,16 +100,33 @@ func (w *Worker) Run() error {
 		w.sendError("start_cli: " + err.Error())
 		return err
 	}
-	close(w.readyCh)
-
-	if err := w.sendReady(); err != nil {
-		return err
-	}
 
 	w.wg.Add(3)
 	go w.readDaemonMessages()
 	go w.readCliOutput()
 	go w.sendHeartbeats()
+
+	if w.startResult != nil && w.startResult.ReadyDelay > 0 {
+		select {
+		case <-time.After(w.startResult.ReadyDelay):
+		case <-w.ctx.Done():
+			return w.ctx.Err()
+		case err, ok := <-w.startResult.ErrCh:
+			_ = ok
+			if err != nil {
+				w.sendError("cli_exit_during_ready: " + err.Error())
+				return fmt.Errorf("cli exited during ready wait: %w", err)
+			}
+			w.sendError("cli_exit_during_ready: exited with no error")
+			return fmt.Errorf("cli exited during ready wait")
+		}
+	}
+
+	close(w.readyCh)
+
+	if err := w.sendReady(); err != nil {
+		return err
+	}
 
 	w.wg.Wait()
 	return nil
@@ -250,7 +286,11 @@ func (w *Worker) readDaemonMessages() {
 			case <-w.ctx.Done():
 				return
 			}
+			w.deduper.Reset()
+			log.Printf("[worker:%s] sending to cli: %q", safeShortID(w.sessionID), msg.Payload)
+			w.outputIdleObserver.BeginInput(time.Now())
 			if err := w.cliAdapter.Send(w.ctx, msg.Payload); err != nil {
+				w.outputIdleObserver.CancelInput()
 				log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
 			}
 		case protocol.MsgClose:
@@ -267,71 +307,94 @@ func (w *Worker) readDaemonMessages() {
 func (w *Worker) readCliOutput() {
 	defer w.wg.Done()
 	defer w.Cancel()
-	reader := bufio.NewReader(w.startResult.Output)
-	var buf []byte
-	type lineFrame struct {
-		data     []byte
-		isPrefix bool
-		err      error
-	}
+	reader := bufio.NewReaderSize(w.startResult.Output, 64*1024)
+	var rawCount, emitCount int
+	lastLog := time.Now()
+	idleTicker := time.NewTicker(cliOutputCheckInterval)
+	defer idleTicker.Stop()
+
+	readCh := make(chan readResult, 1)
+	go func() {
+		line, err := reader.ReadString('\n')
+		readCh <- readResult{data: line, err: err}
+	}()
+
 	for {
 		select {
 		case <-w.ctx.Done():
 			return
 		case err, ok := <-w.startResult.ErrCh:
 			if ok && err != nil {
-				log.Printf("[worker:%s] cli error: %v", safeShortID(w.sessionID), err)
+				log.Printf("[worker:%s] cli error: %v (raw=%d emitted=%d)", safeShortID(w.sessionID), err, rawCount, emitCount)
+			} else {
+				log.Printf("[worker:%s] cli exited (raw=%d emitted=%d)", safeShortID(w.sessionID), rawCount, emitCount)
 			}
 			return
-		default:
-		}
-		ch := make(chan lineFrame, 1)
-		go func() {
-			l, p, e := reader.ReadLine()
-			cp := make([]byte, len(l))
-			copy(cp, l)
-			ch <- lineFrame{data: cp, isPrefix: p, err: e}
-		}()
-		var f lineFrame
-		select {
-		case <-w.ctx.Done():
-			return
-		case err, ok := <-w.startResult.ErrCh:
-			if ok && err != nil {
-				log.Printf("[worker:%s] cli error: %v", safeShortID(w.sessionID), err)
+		case now := <-idleTicker.C:
+			if diag, ok := w.outputIdleObserver.Diagnostic(now); ok {
+				log.Printf(
+					"[worker:%s] cli output idle: state=%s idle=%s since_input=%s output_seen=%t raw=%d emitted=%d pty_read_pending=true",
+					safeShortID(w.sessionID),
+					diag.State,
+					diag.IdleFor.Round(time.Second),
+					diag.SinceInput.Round(time.Second),
+					diag.OutputSeen,
+					rawCount,
+					emitCount,
+				)
 			}
-			return
-		case f = <-ch:
-		}
-		if f.err != nil {
-			if !errors.Is(f.err, io.EOF) {
-				log.Printf("[worker:%s] cli readline: %v", safeShortID(w.sessionID), f.err)
+		case r := <-readCh:
+			if r.err != nil {
+				if !errors.Is(r.err, io.EOF) {
+					log.Printf("[worker:%s] cli read: %v (raw=%d emitted=%d)", safeShortID(w.sessionID), r.err, rawCount, emitCount)
+				} else {
+					log.Printf("[worker:%s] cli EOF (raw=%d emitted=%d)", safeShortID(w.sessionID), rawCount, emitCount)
+				}
+				return
 			}
-			return
-		}
-		buf = append(buf, f.data...)
-		if f.isPrefix {
-			continue
-		}
-		text := string(buf)
-		buf = buf[:0]
-		// PTY outputs \r\n for newlines; ReadLine strips \n but leaves trailing \r.
-		// Also handle in-place \r (carriage return for progress bars/spinners)
-		// by keeping only the content after the last \r.
-		text = strings.TrimRight(text, "\r")
-		if idx := strings.LastIndexByte(text, '\r'); idx >= 0 {
-			text = text[idx+1:]
-		}
-		text = strings.TrimSpace(text)
-		if text == "" {
-			continue
-		}
-		if err := w.sendMessage(protocol.MsgOutput, text); err != nil {
-			log.Printf("[worker:%s] send output to daemon: %v", safeShortID(w.sessionID), err)
-			time.Sleep(1 * time.Second)
-			continue
+			if observer, ok := w.cliAdapter.(adapter.CliOutputObserver); ok {
+				observer.NotifyOutput()
+			}
+			w.outputIdleObserver.MarkOutput(time.Now())
+			rawCount++
+			rawLine := strings.TrimRight(r.data, "\r\n")
+			clean := rawLine
+			if strings.ContainsRune(clean, '\r') {
+				if idx := strings.LastIndexByte(clean, '\r'); idx >= 0 {
+					clean = clean[idx+1:]
+				}
+			}
+			clean = strings.TrimRight(clean, "\r")
+			clean = stripAnsi(clean)
+			clean = strings.TrimSpace(clean)
+			if clean != "" {
+				if out := w.deduper.Check(clean); out != "" {
+					emitCount++
+					if err := w.sendMessage(protocol.MsgOutput, out); err != nil {
+						log.Printf("[worker:%s] send output: %v", safeShortID(w.sessionID), err)
+						time.Sleep(500 * time.Millisecond)
+					} else if time.Since(lastLog) > 5*time.Second || emitCount <= 5 {
+						preview := out
+						if len(preview) > 120 {
+							preview = preview[:120] + "..."
+						}
+						log.Printf("[worker:%s] >> %s", safeShortID(w.sessionID), preview)
+						lastLog = time.Now()
+					}
+				}
+			}
+			readCh = make(chan readResult, 1)
+			go func() {
+				line, err := reader.ReadString('\n')
+				readCh <- readResult{data: line, err: err}
+			}()
 		}
 	}
+}
+
+type readResult struct {
+	data string
+	err  error
 }
 
 func (w *Worker) sendHeartbeats() {

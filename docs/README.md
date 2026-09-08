@@ -16,6 +16,7 @@ docs/
     ├── v2-architecture.md       V2 学习笔记（会话持久化与恢复）
     ├── v3-architecture.md       V3 学习笔记（Session↔Worker 解耦与自愈）
     ├── v4-architecture.md       V4 技术方案（HTTP Dashboard + REST API，方案阶段）
+    ├── v5-architecture.md       V5 技术方案（Aiden CLI 基础闭环与可靠性）
     └── ...
 ```
 
@@ -29,8 +30,10 @@ docs/
 | **V2** | 会话持久化与恢复 | SessionStore JSON 持久化、`restoreSessions()` 启动恢复、Worker 指数退避重连、tmux Adapter | ~716 行（改动） | [v2-architecture.md](versions/v2-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/WbpwwpjI1itL1fk7Cg7cYICAnTd) | ✅ 完成 |
 | **V3** | Session↔Worker 解耦 + 自动自愈 | SessionMeta/WorkerHandle 双 map 解耦、SessionMonitor 每秒 reconcile 自动拉 Worker、`-cmd list/history/close`、6 状态状态机、5 层风暴防护 | ~1250 行 | [v3-architecture.md](versions/v3-architecture.md) | [飞书 Wiki](https://bytedance.larkoffice.com/wiki/I30SwgAlFi8eS5kKfgIcLOHznlc) | ✅ 完成 |
 | **V4** | HTTP Dashboard + REST API | 内嵌 HTTP Server（17891 双端口）、8 个 REST 端点、go:embed 深色终端 SPA 单页、YOU/BOT/SYS 彩色对话、增量 DOM 更新（打字不丢）、?bot_id/status/sort/limit/offset 查询、409 幂等 + ?force=true 强制重建、spawn 竞态修复（重连风暴根因）、SendInput 用户消息双写持久化 | ~1342 行（Go 740 + HTML 602）| [v4-architecture.md](versions/v4-architecture.md) | （待创建后填入飞书链接）| ✅ 完成 |
-| V5 | 真实 Agent CLI 接入 | CodexAdapter / BashAdapter / Provider Router | （待估） | （待写） | （待创建） | 📋 待规划 |
-| V6 | 飞书/Lark Channel 接入 | `@bot` mention 路由、卡片流式更新、工具调用按钮 | （待估） | （待写） | （待创建） | 📋 待规划 |
+| **V5** | Aiden CLI 基础闭环 | Aiden PTY Adapter、显式 READY、可靠多行/长输入、提交确认、事件广播输出、ANSI/去重校准、启动失败熔断 | ~700 行（含测试） | [v5-architecture.md](versions/v5-architecture.md) | （待创建后填入） | ⛔ 候选验收：Aiden 上游模型权限阻塞 |
+| V6 | Aiden 会话恢复 | 原生 `--resume`、Worker CLI restart loop、结构化历史、systemHints、`MsgTurnCompleted` | （待估） | （待写） | （待创建） | 📋 待规划 |
+| V7 | 多 CLI Adapter | Claude/Codex/CoCo/Gemini Adapter | （待估） | （待写） | （待创建） | 📋 待规划 |
+| V8 | 沙盒与交互终端 | OverlayFS、可操作终端、Dashboard 增强、i18n | （待估） | （待写） | （待创建） | 📋 待规划 |
 
 ---
 
@@ -44,8 +47,8 @@ docs/
 | **V2** | botmux-go v2 会话持久化与恢复 | https://bytedance.larkoffice.com/wiki/WbpwwpjI1itL1fk7Cg7cYICAnTd | 2026-08-06 |
 | **V3** | botmux-go v3 Session↔Worker 解耦与自愈 | https://bytedance.larkoffice.com/wiki/I30SwgAlFi8eS5kKfgIcLOHznlc | 2026-08-12 |
 | **V4** | botmux-go v4 HTTP Dashboard + REST API | （待创建后填入） | — |
-| **V5** | botmux-go v5 真实 Agent CLI 接入 | （待创建后填入） | — |
-| **V6** | botmux-go v6 飞书 Channel 接入 | （待创建后填入） | — |
+| **V5** | botmux-go v5 Aiden CLI 基础闭环与可靠性 | （待创建后填入） | 2026-08-31 |
+| **V6** | botmux-go v6 Aiden 会话恢复 | （待创建后填入） | — |
 
 ---
 
@@ -96,4 +99,4 @@ rm -rf $BOTMUX_SESSIONS_DIR && mkdir -p $BOTMUX_SESSIONS_DIR
 
 ---
 
-最后更新：2026-08-12（V3 完成 + 双 map 解耦 + Monitor 自愈 + CLI 管理命令 + 6 Case 全回归）
+最后更新：2026-09-01（V5 候选版：真实 Aiden 验收被上游模型权限阻塞）

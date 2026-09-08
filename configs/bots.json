@@ -22,6 +22,16 @@
       "allowed_users": ["*"]
     },
     {
+      "name": "Aiden Agent",
+      "bot_id": "bot-aiden",
+      "cli_type": "aiden",
+      "cli_path": "aiden",
+      "backend_type": "pty",
+      "working_dir": "/Users/bytedance/botmux-go",
+      "model": "gpt-5.5",
+      "allowed_users": ["*"]
+    },
+    {
       "name": "codex-bot",
       "bot_id": "bot-codex",
       "cli_type": "codex",

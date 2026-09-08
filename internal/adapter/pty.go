@@ -11,8 +11,8 @@ import (
 )
 
 func init() {
-	RegisterFactory("pty", func(kind, cliPath string) CliAdapter {
-		return NewPtyAdapter(cliPath)
+	RegisterFactory("pty", func(opts AdapterOptions) CliAdapter {
+		return NewPtyAdapter(opts.CliPath)
 	})
 }
 

@@ -13,6 +13,7 @@ type PersistedSession struct {
 	BotID      string    `json:"bot_id"`
 	CliType    string    `json:"cli_type"`
 	CliPath    string    `json:"cli_path,omitempty"`
+	Model      string    `json:"model,omitempty"`
 	WorkingDir string    `json:"working_dir"`
 	WorkerPID  int       `json:"worker_pid"`
 	LastOutput []string  `json:"last_output"`

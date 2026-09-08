@@ -147,6 +147,10 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 	if cliType == "" {
 		cliType = string(bot.CliType)
 	}
+	cliPath := opts.CliPath
+	if cliPath == "" {
+		cliPath = bot.CliPath
+	}
 	workingDir := opts.WorkingDir
 	if workingDir == "" {
 		workingDir = bot.WorkingDir
@@ -154,15 +158,17 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 
 	now := time.Now()
 	meta := &SessionMeta{
-		SessionID:  opts.SessionID,
-		BotID:      bot.BotID,
-		CliType:    cliType,
-		CliPath:    opts.CliPath,
-		WorkingDir: workingDir,
-		LastOutput: []string{},
-		CreatedAt:  now,
-		Status:     StatusCreated,
-		lastActive: now,
+		SessionID:      opts.SessionID,
+		BotID:          bot.BotID,
+		CliType:        cliType,
+		CliPath:        cliPath,
+		Model:          bot.Model,
+		WorkingDir:     workingDir,
+		LastOutput:     []string{},
+		CreatedAt:      now,
+		Status:         StatusCreated,
+		lastActive:     now,
+		outputNotifyCh: make(chan struct{}),
 	}
 
 	d.sessionsMu.Lock()
@@ -211,6 +217,7 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 		"BOTMUX_DAEMON_ADDR="+d.cfg.ListenAddr,
 		"BOTMUX_CLI_TYPE="+meta.CliType,
 		"BOTMUX_CLI_PATH="+meta.CliPath,
+		"BOTMUX_MODEL="+meta.Model,
 		"BOTMUX_WORKING_DIR="+meta.WorkingDir,
 		"BOTMUX_STORE_DIR="+d.cfg.SessionsDir,
 	)
@@ -259,19 +266,26 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 func (d *Daemon) monitorReady(handle *WorkerHandle, meta *SessionMeta) {
 	select {
 	case <-handle.Ready:
-		d.sessionsMu.Lock()
-		if !meta.Closed {
-			meta.Status = StatusReady
-		}
-		d.sessionsMu.Unlock()
-		log.Printf("[daemon] session %s -> READY", safeShort(meta.SessionID))
+		return
 	case <-time.After(10 * time.Second):
+		if !d.isCurrentWorker(handle) {
+			return
+		}
 		d.sessionsMu.Lock()
+		failed := false
 		if !meta.Closed && meta.Status != StatusReady {
 			meta.Status = StatusRecovering
+			failed = true
 		}
 		d.sessionsMu.Unlock()
-		log.Printf("[daemon] session %s: worker ready timeout, status=RECOVERING", safeShort(meta.SessionID))
+		if failed {
+			failCount := 0
+			if handle.markStartupFailure() {
+				failCount = d.recordSpawnFailure(meta.SessionID)
+			}
+			log.Printf("[daemon] session %s: worker ready timeout, status=RECOVERING, fail_count=%d",
+				safeShort(meta.SessionID), failCount)
+		}
 	case <-d.ctx.Done():
 	}
 }
@@ -306,17 +320,25 @@ func (d *Daemon) waitWorkerExit(handle *WorkerHandle) {
 
 	d.workersMu.Lock()
 	h, exists := d.workers[handle.SessionID]
-	if exists && h == handle {
+	isCurrent := exists && h == handle
+	if isCurrent {
 		delete(d.workers, handle.SessionID)
 	}
 	d.workersMu.Unlock()
 
 	d.sessionsMu.Lock()
 	meta, ok := d.sessions[handle.SessionID]
-	if ok && !meta.Closed {
+	shouldRecover := isCurrent && ok && !meta.Closed
+	if shouldRecover {
 		meta.Status = StatusRecovering
 	}
 	d.sessionsMu.Unlock()
+
+	if isCurrent && shouldRecover && handle.markStartupFailure() {
+		failCount := d.recordSpawnFailure(handle.SessionID)
+		log.Printf("[daemon] session %s: worker exited before READY (fail_count=%d)",
+			safeShort(handle.SessionID), failCount)
+	}
 
 	handle.CloseConn()
 
@@ -547,8 +569,6 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		_ = oldConn.Close()
 	}
 
-	h.markReady()
-
 	d.connMapMu.Lock()
 	d.connToSess[conn] = sessionID
 	d.connMapMu.Unlock()
@@ -772,6 +792,7 @@ func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message
 		return
 	}
 
+	cursor, outputCh := meta.OutputSubscription()
 	if msg.Type == protocol.MsgUserInput {
 		inCopy := *msg
 		if err := h.Send(&inCopy); err != nil {
@@ -786,29 +807,36 @@ func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message
 	meta.AddOnClose(func() { closeOnce(stop) })
 
 	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		seen := 0
-		deadline := time.After(8 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 130*time.Second)
+		defer cancel()
+
+		go func() {
+			buf := make([]byte, 1)
+			_, _ = clientConn.Read(buf)
+			cancel()
+		}()
+
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-stop:
 				return
-			case <-deadline:
-				return
-			case <-ticker.C:
+			case <-outputCh:
+				outs, next, nextOutputCh := meta.SnapshotOutputSince(cursor)
+				cursor = next
+				outputCh = nextOutputCh
+				for _, out := range outs {
+					m := protocol.NewMessage(protocol.MsgOutput, meta.SessionID, out)
+					connMu.Lock()
+					_, err := m.WriteTo(clientConn)
+					connMu.Unlock()
+					if err != nil {
+						log.Printf("[daemon] forward output write err: %v", err)
+						return
+					}
+				}
 			}
-			outs := meta.SnapshotOutput()
-			if len(outs) <= seen {
-				continue
-			}
-			for i := seen; i < len(outs); i++ {
-				m := protocol.NewMessage(protocol.MsgOutput, meta.SessionID, outs[i])
-				connMu.Lock()
-				_, _ = m.WriteTo(clientConn)
-				connMu.Unlock()
-			}
-			seen = len(outs)
 		}
 	}()
 }
@@ -854,6 +882,16 @@ func isClosedChan(ch chan struct{}) bool {
 func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *WorkerHandle) {
 	switch msg.Type {
 	case protocol.MsgReady:
+		if !d.isCurrentWorker(h) {
+			return
+		}
+		h.markReady()
+		d.sessionsMu.Lock()
+		if !meta.Closed {
+			meta.Status = StatusReady
+		}
+		d.sessionsMu.Unlock()
+		d.clearSpawnFailure(meta.SessionID)
 		log.Printf("[daemon] session %s -> READY", safeShort(meta.SessionID))
 		meta.touchActive()
 		_ = d.store.UpdateLastActive(meta.SessionID)

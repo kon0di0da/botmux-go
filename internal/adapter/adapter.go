@@ -4,12 +4,14 @@ import (
 	"context"
 	"io"
 	"sync"
+	"time"
 )
 
 type CliStartResult struct {
-	Input  io.WriteCloser
-	Output io.ReadCloser
-	ErrCh  <-chan error
+	Input      io.WriteCloser
+	Output     io.ReadCloser
+	ErrCh      <-chan error
+	ReadyDelay time.Duration
 }
 
 type CliAdapter interface {
@@ -19,10 +21,20 @@ type CliAdapter interface {
 	Name() string
 }
 
-type AdapterFactory func(configType string, cliPath string) CliAdapter
+type CliOutputObserver interface {
+	NotifyOutput()
+}
+
+type AdapterOptions struct {
+	CliType string
+	CliPath string
+	Model   string
+}
+
+type AdapterFactory func(opts AdapterOptions) CliAdapter
 
 var (
-	factoryMu       sync.RWMutex
+	factoryMu        sync.RWMutex
 	adapterFactories = make(map[string]AdapterFactory)
 )
 
@@ -32,11 +44,12 @@ func RegisterFactory(kind string, factory AdapterFactory) {
 	adapterFactories[kind] = factory
 }
 
-func Create(kind string, cliPath string) CliAdapter {
+func Create(opts AdapterOptions) CliAdapter {
 	factoryMu.RLock()
 	defer factoryMu.RUnlock()
+	kind := opts.CliType
 	if f, ok := adapterFactories[kind]; ok {
-		return f(kind, cliPath)
+		return f(opts)
 	}
 	return nil
 }

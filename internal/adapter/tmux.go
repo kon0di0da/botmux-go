@@ -11,10 +11,10 @@ import (
 )
 
 func init() {
-	RegisterFactory("tmux", func(_ string, cliPath string) CliAdapter {
+	RegisterFactory("tmux", func(opts AdapterOptions) CliAdapter {
 		return &TmuxAdapter{
 			sessionName: "botmux-go",
-			cliCmd:      cliPath,
+			cliCmd:      opts.CliPath,
 		}
 	})
 }

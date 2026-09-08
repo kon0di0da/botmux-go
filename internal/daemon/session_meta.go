@@ -15,20 +15,33 @@ const (
 	StatusClosed     SessionStatus = "CLOSED"
 )
 
+func NewSessionMeta(sid, botID string) *SessionMeta {
+	return &SessionMeta{
+		SessionID:      sid,
+		BotID:          botID,
+		CreatedAt:      time.Now(),
+		Status:         StatusCreated,
+		outputNotifyCh: make(chan struct{}),
+	}
+}
+
 type SessionMeta struct {
 	SessionID  string
 	BotID      string
 	CliType    string
 	CliPath    string
+	Model      string
 	WorkingDir string
 	LastOutput []string
 	CreatedAt  time.Time
 	Closed     bool
 	Status     SessionStatus
 
-	mu         sync.Mutex
-	lastActive time.Time
-	onClose    []func()
+	mu             sync.Mutex
+	lastActive     time.Time
+	onClose        []func()
+	outputSeq      uint64
+	outputNotifyCh chan struct{}
 }
 
 func (m *SessionMeta) touchActive() {
@@ -48,10 +61,15 @@ const maxMemoryOutputLines = 2000
 func (m *SessionMeta) AddOutput(line string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.ensureOutputStateLocked()
 	m.LastOutput = append(m.LastOutput, line)
+	m.outputSeq++
 	if len(m.LastOutput) > maxMemoryOutputLines {
 		m.LastOutput = m.LastOutput[len(m.LastOutput)-maxMemoryOutputLines:]
 	}
+	notifyCh := m.outputNotifyCh
+	m.outputNotifyCh = make(chan struct{})
+	close(notifyCh)
 }
 
 func (m *SessionMeta) SnapshotOutput() []string {
@@ -60,6 +78,48 @@ func (m *SessionMeta) SnapshotOutput() []string {
 	out := make([]string, len(m.LastOutput))
 	copy(out, m.LastOutput)
 	return out
+}
+
+func (m *SessionMeta) OutputCursor() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureOutputStateLocked()
+	return m.outputSeq
+}
+
+func (m *SessionMeta) OutputSubscription() (uint64, <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureOutputStateLocked()
+	return m.outputSeq, m.outputNotifyCh
+}
+
+func (m *SessionMeta) SnapshotOutputSince(cursor uint64) ([]string, uint64, <-chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureOutputStateLocked()
+
+	next := m.outputSeq
+	base := next - uint64(len(m.LastOutput))
+	if cursor < base {
+		cursor = base
+	}
+	if cursor > next {
+		cursor = next
+	}
+	start := int(cursor - base)
+	out := make([]string, len(m.LastOutput)-start)
+	copy(out, m.LastOutput[start:])
+	return out, next, m.outputNotifyCh
+}
+
+func (m *SessionMeta) ensureOutputStateLocked() {
+	if m.outputNotifyCh == nil {
+		m.outputNotifyCh = make(chan struct{})
+	}
+	if minimum := uint64(len(m.LastOutput)); m.outputSeq < minimum {
+		m.outputSeq = minimum
+	}
 }
 
 func (m *SessionMeta) AddOnClose(fn func()) {
@@ -111,15 +171,18 @@ func SessionMetaFromPersisted(ps *PersistedSession) *SessionMeta {
 		createdAt = time.Now()
 	}
 	return &SessionMeta{
-		SessionID:  ps.SessionID,
-		BotID:      ps.BotID,
-		CliType:    ps.CliType,
-		CliPath:    ps.CliPath,
-		WorkingDir: ps.WorkingDir,
-		LastOutput: lastOutput,
-		CreatedAt:  createdAt,
-		Closed:     ps.Closed,
-		Status:     status,
-		lastActive: lastActive,
+		SessionID:      ps.SessionID,
+		BotID:          ps.BotID,
+		CliType:        ps.CliType,
+		CliPath:        ps.CliPath,
+		Model:          ps.Model,
+		WorkingDir:     ps.WorkingDir,
+		LastOutput:     lastOutput,
+		CreatedAt:      createdAt,
+		Closed:         ps.Closed,
+		Status:         status,
+		lastActive:     lastActive,
+		outputSeq:      uint64(len(lastOutput)),
+		outputNotifyCh: make(chan struct{}),
 	}
 }

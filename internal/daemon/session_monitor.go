@@ -10,13 +10,45 @@ const (
 	monitorInterval     = 1 * time.Second
 	workerAliveTimeout  = 30 * time.Second
 	maxSpawnRetries     = 5
+	spawnRetryCooldown  = 1 * time.Minute
 	monitorStartDelay   = 3 * time.Second
 	maxConcurrentSpawns = 5
 )
 
 type spawnFailure struct {
-	count     int
-	lastRetry time.Time
+	count           int
+	lastRetry       time.Time
+	exhaustedLogged bool
+}
+
+func (d *Daemon) recordSpawnFailure(sessionID string) int {
+	d.monitorMu.Lock()
+	defer d.monitorMu.Unlock()
+	if d.spawnFailures == nil {
+		d.spawnFailures = make(map[string]*spawnFailure)
+	}
+	sf := d.spawnFailures[sessionID]
+	if sf == nil {
+		sf = &spawnFailure{}
+		d.spawnFailures[sessionID] = sf
+	}
+	sf.count++
+	sf.lastRetry = time.Now()
+	sf.exhaustedLogged = false
+	return sf.count
+}
+
+func (d *Daemon) clearSpawnFailure(sessionID string) {
+	d.monitorMu.Lock()
+	delete(d.spawnFailures, sessionID)
+	d.monitorMu.Unlock()
+}
+
+func (d *Daemon) isCurrentWorker(handle *WorkerHandle) bool {
+	d.workersMu.RLock()
+	current := d.workers[handle.SessionID]
+	d.workersMu.RUnlock()
+	return current == handle
 }
 
 func (d *Daemon) startSessionMonitor() {
@@ -85,25 +117,30 @@ func (d *Daemon) reconcileSessions() {
 			needsSpawn = true
 		}
 		if needsSpawn {
+			now := time.Now()
 			d.monitorMu.Lock()
 			sf, ok := d.spawnFailures[meta.SessionID]
 			if !ok {
 				sf = &spawnFailure{}
 				d.spawnFailures[meta.SessionID] = sf
 			}
-			if sf.count >= maxSpawnRetries && time.Since(sf.lastRetry) < 1*time.Minute {
+			if sf.count >= maxSpawnRetries && now.Sub(sf.lastRetry) < spawnRetryCooldown {
+				shouldLog := !sf.exhaustedLogged
+				sf.exhaustedLogged = true
+				count := sf.count
 				d.monitorMu.Unlock()
-				if sf.count == maxSpawnRetries {
-					log.Printf("[daemon-monitor] session %s: spawn retries exhausted (%d), will retry later", safeShort(meta.SessionID), maxSpawnRetries)
-					sf.count++
+				if shouldLog {
+					log.Printf("[daemon-monitor] session %s: spawn retries exhausted (%d), cooling down for %v",
+						safeShort(meta.SessionID), count, spawnRetryCooldown)
 				}
 				continue
 			}
-			sf.lastRetry = time.Now()
+			sf.lastRetry = now
+			sf.exhaustedLogged = false
 			d.monitorMu.Unlock()
 
 			wg.Add(1)
-			go func(m *SessionMeta, failures *spawnFailure) {
+			go func(m *SessionMeta) {
 				defer wg.Done()
 				select {
 				case d.spawnSem <- struct{}{}:
@@ -114,17 +151,11 @@ func (d *Daemon) reconcileSessions() {
 
 				err := d.spawnWorkerForSession(m)
 				if err != nil {
-					d.monitorMu.Lock()
-					failures.count++
-					d.monitorMu.Unlock()
+					failCount := d.recordSpawnFailure(m.SessionID)
 					log.Printf("[daemon-monitor] session %s: auto-spawn failed (err=%v, fail_count=%d)",
-						safeShort(m.SessionID), err, failures.count)
-				} else {
-					d.monitorMu.Lock()
-					failures.count = 0
-					d.monitorMu.Unlock()
+						safeShort(m.SessionID), err, failCount)
 				}
-			}(meta, sf)
+			}(meta)
 		}
 	}
 	wg.Wait()
