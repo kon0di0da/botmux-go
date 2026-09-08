@@ -351,6 +351,7 @@ func (w *Worker) readDaemonMessages() {
 			}
 		case protocol.MsgClose:
 			log.Printf("[worker:%s] close requested by daemon", safeShortID(w.sessionID))
+			w.cleanup()
 			return
 		case protocol.MsgHeartbeat:
 		case protocol.MsgAck:
