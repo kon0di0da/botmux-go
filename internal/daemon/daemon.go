@@ -447,6 +447,13 @@ func (d *Daemon) CloseSession(id, reason string) {
 	meta.Status = StatusClosed
 	d.sessionsMu.Unlock()
 
+	// Persist the terminal state before asking the worker to exit. Worker
+	// shutdown is asynchronous and must not decide whether this session can be
+	// restored after a daemon restart.
+	if err := d.store.MarkClosed(id); err != nil {
+		log.Printf("[daemon] session %s persist closed state: %v", safeShort(id), err)
+	}
+
 	d.workersMu.RLock()
 	h := d.workers[id]
 	d.workersMu.RUnlock()
@@ -454,17 +461,12 @@ func (d *Daemon) CloseSession(id, reason string) {
 	if h != nil {
 		msg := protocol.NewMessage(protocol.MsgClose, id, reason)
 		_ = h.Send(msg)
-		timeout := time.AfterFunc(2*time.Second, func() {
+		time.AfterFunc(2*time.Second, func() {
 			if h.Cmd != nil && h.Cmd.Process != nil {
 				_ = h.Cmd.Process.Kill()
 			}
 		})
-		defer timeout.Stop()
-		if h.Cmd != nil && h.Cmd.Process != nil {
-			_ = h.Cmd.Wait()
-		}
 	}
-	d.removeSession(id)
 	log.Printf("[daemon] session %s closed (reason=%s)", safeShort(id), reason)
 }
 
