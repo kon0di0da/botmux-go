@@ -54,10 +54,13 @@ type Worker struct {
 
 	daemonDisconnectedCh chan struct{}
 
-	deduper            *LineDeduper
-	outputIdleObserver *cliOutputIdleObserver
-	turnMu             sync.Mutex
-	turnInFlight       bool
+	deduper              *LineDeduper
+	outputIdleObserver   *cliOutputIdleObserver
+	turnMu               sync.Mutex
+	turnInFlight         bool
+	turnID               uint64
+	turnCancelRequested  bool
+	turnInterruptPending bool
 }
 
 type Options struct {
@@ -280,10 +283,6 @@ func (w *Worker) sendMessage(typ protocol.MessageType, payload string) error {
 func (w *Worker) readDaemonMessages() {
 	defer w.wg.Done()
 	defer w.Cancel()
-	type frame struct {
-		msg *protocol.Message
-		err error
-	}
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -297,27 +296,23 @@ func (w *Worker) readDaemonMessages() {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		ch := make(chan frame, 1)
-		go func() {
-			m, e := reader.Read()
-			ch <- frame{msg: m, err: e}
-		}()
-		var f frame
-		select {
-		case <-w.ctx.Done():
-			return
-		case f = <-ch:
-		}
-		if f.err != nil {
-			if !errors.Is(f.err, io.EOF) && !errors.Is(f.err, net.ErrClosed) {
-				log.Printf("[worker:%s] read daemon error: %v", safeShortID(w.sessionID), f.err)
+		msg, err := reader.Read()
+		if err != nil {
+			if w.ctx.Err() != nil {
+				return
+			}
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				log.Printf("[worker:%s] read daemon error: %v", safeShortID(w.sessionID), err)
 			}
 			w.setConnected(false)
 			go w.reconnectToDaemon()
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
 			continue
 		}
-		msg := f.msg
 		switch msg.Type {
 		case protocol.MsgUserInput, protocol.MsgNewSession:
 			select {
@@ -326,33 +321,18 @@ func (w *Worker) readDaemonMessages() {
 				return
 			}
 			w.deduper.Reset()
-			if !w.beginTurn() {
+			turnID, ok := w.beginTurnWithID()
+			if !ok {
 				w.sendError("codex_turn_in_progress")
 				continue
 			}
-			log.Printf("[worker:%s] sending to cli: %q", safeShortID(w.sessionID), msg.Payload)
 			w.outputIdleObserver.BeginInput(time.Now())
-			result, err := w.cliAdapter.Send(w.ctx, msg.Payload)
-			if err != nil {
-				w.finishTurn()
-				w.outputIdleObserver.CancelInput()
-				log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
-				w.sendTurnTerminal(protocol.TurnTerminal{
-					Status:      protocol.TurnFailed,
-					ErrorCode:   "codex_submit_failed",
-					ErrorDetail: err.Error(),
-				})
-				continue
-			}
-			if result.CliSessionID != "" {
-				if err := w.sendMessage(protocol.MsgCliSessionBound, result.CliSessionID); err != nil {
-					log.Printf("[worker:%s] persist CLI session ID: %v", safeShortID(w.sessionID), err)
-				}
-			}
+			w.wg.Add(1)
+			go w.handleInput(turnID, msg.Payload)
 		case protocol.MsgCancelTurn:
-			if err := w.interruptTurn(); err != nil {
-				log.Printf("[worker:%s] interrupt turn: %v", safeShortID(w.sessionID), err)
-				w.failCurrentTurn("codex_cancel_failed", err)
+			if turnID, ok := w.requestTurnInterrupt(); ok {
+				w.wg.Add(1)
+				go w.interruptTurn(turnID)
 			}
 		case protocol.MsgRestartWorker:
 			log.Printf("[worker:%s] restart requested by daemon", safeShortID(w.sessionID))
@@ -367,6 +347,27 @@ func (w *Worker) readDaemonMessages() {
 		default:
 			log.Printf("[worker:%s] unknown msg type: %s", safeShortID(w.sessionID), msg.Type)
 		}
+	}
+}
+
+func (w *Worker) handleInput(turnID uint64, input string) {
+	defer w.wg.Done()
+
+	log.Printf("[worker:%s] sending to cli: %q", safeShortID(w.sessionID), input)
+	result, err := w.cliAdapter.Send(w.ctx, input)
+	if err != nil {
+		if w.ctx.Err() != nil || w.isTurnCancellationRequested(turnID) {
+			return
+		}
+		log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
+		w.failCurrentTurn(turnID, "codex_submit_failed", err)
+		return
+	}
+	if w.ctx.Err() != nil || result.CliSessionID == "" {
+		return
+	}
+	if err := w.sendMessage(protocol.MsgCliSessionBound, result.CliSessionID); err != nil {
+		log.Printf("[worker:%s] persist CLI session ID: %v", safeShortID(w.sessionID), err)
 	}
 }
 
@@ -478,9 +479,7 @@ func (w *Worker) readAdapterEvents() {
 					log.Printf("[worker:%s] send structured output: %v", safeShortID(w.sessionID), err)
 				}
 			case adapter.AdapterTurnTerminal:
-				w.finishTurn()
-				w.outputIdleObserver.CancelInput()
-				w.sendTurnTerminal(protocol.TurnTerminal{
+				w.completeTurn(0, protocol.TurnTerminal{
 					Status:      protocol.TurnStatus(event.Status),
 					ErrorCode:   event.ErrorCode,
 					ErrorDetail: event.ErrorDetail,
@@ -502,45 +501,122 @@ func (w *Worker) sendTurnTerminal(terminal protocol.TurnTerminal) {
 }
 
 func (w *Worker) beginTurn() bool {
+	_, ok := w.beginTurnWithID()
+	return ok
+}
+
+func (w *Worker) beginTurnWithID() (uint64, bool) {
+	if w.cliType != "codex" {
+		return 0, true
+	}
+	w.turnMu.Lock()
+	defer w.turnMu.Unlock()
+	if w.turnInFlight || w.turnInterruptPending {
+		return 0, false
+	}
+	w.turnInFlight = true
+	w.turnID++
+	w.turnCancelRequested = false
+	return w.turnID, true
+}
+
+func (w *Worker) requestTurnInterrupt() (uint64, bool) {
+	if w.cliType != "codex" {
+		return 0, false
+	}
+	w.turnMu.Lock()
+	defer w.turnMu.Unlock()
+	if !w.turnInFlight || w.turnCancelRequested {
+		return 0, false
+	}
+	w.turnCancelRequested = true
+	w.turnInterruptPending = true
+	return w.turnID, true
+}
+
+func (w *Worker) isTurnCancellationRequested(turnID uint64) bool {
+	if w.cliType != "codex" {
+		return false
+	}
+	w.turnMu.Lock()
+	defer w.turnMu.Unlock()
+	return w.turnInFlight && w.turnID == turnID && w.turnCancelRequested
+}
+
+func (w *Worker) shouldInterruptTurn(turnID uint64) bool {
+	if w.cliType != "codex" {
+		return false
+	}
+	w.turnMu.Lock()
+	defer w.turnMu.Unlock()
+	return w.turnInFlight &&
+		w.turnID == turnID &&
+		w.turnCancelRequested &&
+		w.turnInterruptPending
+}
+
+func (w *Worker) finishTurnInterrupt(turnID uint64) {
+	if w.cliType != "codex" {
+		return
+	}
+	w.turnMu.Lock()
+	defer w.turnMu.Unlock()
+	if w.turnID == turnID {
+		w.turnInterruptPending = false
+	}
+}
+
+func (w *Worker) finishTurn() {
+	w.finishTurnWithID(0)
+}
+
+func (w *Worker) finishTurnWithID(turnID uint64) bool {
 	if w.cliType != "codex" {
 		return true
 	}
 	w.turnMu.Lock()
 	defer w.turnMu.Unlock()
-	if w.turnInFlight {
+	if !w.turnInFlight || (turnID != 0 && turnID != w.turnID) {
 		return false
 	}
-	w.turnInFlight = true
+	w.turnInFlight = false
+	w.turnCancelRequested = false
 	return true
 }
 
-func (w *Worker) finishTurn() {
-	if w.cliType != "codex" {
+func (w *Worker) interruptTurn(turnID uint64) {
+	defer w.wg.Done()
+	defer w.finishTurnInterrupt(turnID)
+
+	if !w.shouldInterruptTurn(turnID) {
 		return
 	}
-	w.turnMu.Lock()
-	w.turnInFlight = false
-	w.turnMu.Unlock()
-}
 
-func (w *Worker) interruptTurn() error {
-	w.turnMu.Lock()
-	turnInFlight := w.turnInFlight
-	w.turnMu.Unlock()
-	if !turnInFlight {
-		return errors.New("no Codex turn in progress")
-	}
 	interrupter, ok := w.cliAdapter.(adapter.CliTurnInterrupter)
 	if !ok {
-		return errors.New("adapter does not support turn interruption")
+		w.failCurrentTurn(turnID, "codex_cancel_failed", errors.New("adapter does not support turn interruption"))
+		return
 	}
-	return interrupter.Interrupt(w.ctx)
+	if err := interrupter.Interrupt(w.ctx); err != nil {
+		if w.ctx.Err() != nil {
+			return
+		}
+		log.Printf("[worker:%s] interrupt turn: %v", safeShortID(w.sessionID), err)
+		w.failCurrentTurn(turnID, "codex_cancel_failed", err)
+	}
 }
 
-func (w *Worker) failCurrentTurn(code string, err error) {
-	w.finishTurn()
+func (w *Worker) completeTurn(turnID uint64, terminal protocol.TurnTerminal) bool {
+	if !w.finishTurnWithID(turnID) {
+		return false
+	}
 	w.outputIdleObserver.CancelInput()
-	w.sendTurnTerminal(protocol.TurnTerminal{
+	w.sendTurnTerminal(terminal)
+	return true
+}
+
+func (w *Worker) failCurrentTurn(turnID uint64, code string, err error) {
+	w.completeTurn(turnID, protocol.TurnTerminal{
 		Status:      protocol.TurnFailed,
 		ErrorCode:   code,
 		ErrorDetail: err.Error(),
@@ -571,12 +647,18 @@ func (w *Worker) sendHeartbeats() {
 
 func (w *Worker) Cancel() {
 	w.closeMu.Lock()
-	defer w.closeMu.Unlock()
 	if w.closed {
+		w.closeMu.Unlock()
 		return
 	}
 	w.closed = true
+	w.closeMu.Unlock()
 	w.cancel()
+	w.connMu.Lock()
+	if w.conn != nil {
+		_ = w.conn.Close()
+	}
+	w.connMu.Unlock()
 }
 
 func (w *Worker) isClosed() bool {

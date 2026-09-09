@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,8 +18,11 @@ import (
 )
 
 type interruptTestAdapter struct {
-	interrupts   atomic.Int32
-	interruptErr error
+	interrupts        atomic.Int32
+	interruptErr      error
+	interruptStarted  chan struct{}
+	interruptRelease  <-chan struct{}
+	interruptReturned chan struct{}
 }
 
 func (a *interruptTestAdapter) Name() string {
@@ -39,7 +43,45 @@ func (a *interruptTestAdapter) Close() error {
 
 func (a *interruptTestAdapter) Interrupt(context.Context) error {
 	a.interrupts.Add(1)
+	if a.interruptStarted != nil {
+		close(a.interruptStarted)
+	}
+	if a.interruptRelease != nil {
+		<-a.interruptRelease
+	}
+	if a.interruptReturned != nil {
+		close(a.interruptReturned)
+	}
 	return a.interruptErr
+}
+
+type blockingSendTestAdapter struct {
+	sendStarted      chan struct{}
+	sendRelease      <-chan struct{}
+	interruptStarted chan struct{}
+}
+
+func (a *blockingSendTestAdapter) Name() string {
+	return "blocking-send-test"
+}
+
+func (a *blockingSendTestAdapter) Start(context.Context, string) (*adapter.CliStartResult, error) {
+	return nil, errors.New("Start must not be called")
+}
+
+func (a *blockingSendTestAdapter) Send(context.Context, string) (adapter.SendResult, error) {
+	close(a.sendStarted)
+	<-a.sendRelease
+	return adapter.SendResult{}, errors.New("history confirmation interrupted")
+}
+
+func (a *blockingSendTestAdapter) Close() error {
+	return nil
+}
+
+func (a *blockingSendTestAdapter) Interrupt(context.Context) error {
+	close(a.interruptStarted)
+	return nil
 }
 
 func newDaemonMessageWorker(cli adapter.CliAdapter) (*Worker, net.Conn, net.Conn) {
@@ -49,6 +91,32 @@ func newDaemonMessageWorker(cli adapter.CliAdapter) (*Worker, net.Conn, net.Conn
 	w.conn = workerConn
 	w.msgReader = protocol.NewMessageReader(workerConn)
 	return w, daemonConn, workerConn
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, action string) {
+	t.Helper()
+
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", action)
+	}
+}
+
+func readWorkerMessages(conn net.Conn) <-chan *protocol.Message {
+	messages := make(chan *protocol.Message, 4)
+	go func() {
+		defer close(messages)
+		reader := protocol.NewMessageReader(conn)
+		for {
+			msg, err := reader.Read()
+			if err != nil {
+				return
+			}
+			messages <- msg
+		}
+	}()
+	return messages
 }
 
 func waitFor(t *testing.T, condition func() bool) {
@@ -147,6 +215,181 @@ func TestWorkerCancelFailurePublishesFailedTerminal(t *testing.T) {
 
 	w.Cancel()
 	w.wg.Wait()
+}
+
+func TestWorkerCancelFailureAfterNormalTerminalDoesNotPublishSecondTerminal(t *testing.T) {
+	interruptRelease := make(chan struct{})
+	cli := &interruptTestAdapter{
+		interruptErr:      errors.New("Esc write failed"),
+		interruptStarted:  make(chan struct{}),
+		interruptRelease:  interruptRelease,
+		interruptReturned: make(chan struct{}),
+	}
+	w, daemonConn, workerConn := newDaemonMessageWorker(cli)
+	t.Cleanup(func() {
+		_ = daemonConn.Close()
+		_ = workerConn.Close()
+		w.Cancel()
+	})
+
+	events := make(chan adapter.AdapterEvent, 1)
+	w.startResult = &adapter.CliStartResult{Events: events}
+	close(w.readyCh)
+	if !w.beginTurn() {
+		t.Fatal("begin turn")
+	}
+	messages := readWorkerMessages(daemonConn)
+	w.wg.Add(2)
+	go w.readDaemonMessages()
+	go w.readAdapterEvents()
+
+	if _, err := protocol.NewMessage(protocol.MsgCancelTurn, w.sessionID, "").WriteTo(daemonConn); err != nil {
+		t.Fatalf("send cancel turn: %v", err)
+	}
+	waitForSignal(t, cli.interruptStarted, "adapter interrupt")
+
+	events <- adapter.AdapterEvent{Kind: adapter.AdapterTurnTerminal, Status: adapter.TurnCompleted}
+	normal, ok := <-messages
+	if !ok {
+		t.Fatal("worker connection closed before normal terminal")
+	}
+	if normal.Type != protocol.MsgTurnCompleted {
+		t.Fatalf("worker message type = %s, want %s", normal.Type, protocol.MsgTurnCompleted)
+	}
+
+	close(interruptRelease)
+	waitForSignal(t, cli.interruptReturned, "failed adapter interrupt return")
+
+	if _, err := protocol.NewMessage(protocol.MsgClose, w.sessionID, "").WriteTo(daemonConn); err != nil {
+		t.Fatalf("send close: %v", err)
+	}
+	w.wg.Wait()
+
+	terminals := []*protocol.Message{normal}
+	for msg := range messages {
+		if msg.Type == protocol.MsgTurnCompleted {
+			terminals = append(terminals, msg)
+		}
+	}
+	if len(terminals) != 1 {
+		t.Fatalf("turn terminal count = %d, want 1", len(terminals))
+	}
+
+	var terminal protocol.TurnTerminal
+	if err := json.Unmarshal([]byte(terminals[0].Payload), &terminal); err != nil {
+		t.Fatalf("decode turn terminal: %v", err)
+	}
+	if terminal.Status != protocol.TurnCompleted {
+		t.Fatalf("terminal status = %s, want %s", terminal.Status, protocol.TurnCompleted)
+	}
+	if terminal.ErrorCode == "codex_cancel_failed" {
+		t.Fatal("normal terminal was followed by codex_cancel_failed")
+	}
+}
+
+func TestWorkerQueuedInterruptDoesNotTargetNextTurn(t *testing.T) {
+	cli := &interruptTestAdapter{}
+	w := New(Options{SessionID: "worker-cancel-test", CliType: "codex"})
+	w.cliAdapter = cli
+	t.Cleanup(w.Cancel)
+
+	firstTurnID, ok := w.beginTurnWithID()
+	if !ok {
+		t.Fatal("begin first turn")
+	}
+	if _, ok := w.requestTurnInterrupt(); !ok {
+		t.Fatal("request first turn interrupt")
+	}
+	if !w.completeTurn(firstTurnID, protocol.TurnTerminal{Status: protocol.TurnCompleted}) {
+		t.Fatal("complete first turn")
+	}
+	if _, ok := w.beginTurnWithID(); ok {
+		t.Fatal("accepted next turn before queued interrupt completed")
+	}
+
+	w.wg.Add(1)
+	go w.interruptTurn(firstTurnID)
+	w.wg.Wait()
+
+	if got := cli.interrupts.Load(); got != 0 {
+		t.Fatalf("adapter interrupts = %d, want 0 for completed turn", got)
+	}
+	if _, ok := w.beginTurnWithID(); !ok {
+		t.Fatal("begin next turn after queued interrupt completed")
+	}
+}
+
+func TestWorkerProcessesCancelWhileCodexSendBlocks(t *testing.T) {
+	sendRelease := make(chan struct{})
+	var releaseSendOnce sync.Once
+	releaseSend := func() {
+		releaseSendOnce.Do(func() {
+			close(sendRelease)
+		})
+	}
+	cli := &blockingSendTestAdapter{
+		sendStarted:      make(chan struct{}),
+		sendRelease:      sendRelease,
+		interruptStarted: make(chan struct{}),
+	}
+	w, daemonConn, workerConn := newDaemonMessageWorker(cli)
+	t.Cleanup(func() {
+		releaseSend()
+		_ = daemonConn.Close()
+		_ = workerConn.Close()
+		w.Cancel()
+		w.wg.Wait()
+	})
+
+	close(w.readyCh)
+	messages := readWorkerMessages(daemonConn)
+	w.wg.Add(1)
+	go w.readDaemonMessages()
+
+	if _, err := protocol.NewMessage(protocol.MsgUserInput, w.sessionID, "hello").WriteTo(daemonConn); err != nil {
+		t.Fatalf("send user input: %v", err)
+	}
+	waitForSignal(t, cli.sendStarted, "adapter Send")
+
+	cancelWrite := make(chan error, 1)
+	go func() {
+		_, err := protocol.NewMessage(protocol.MsgCancelTurn, w.sessionID, "").WriteTo(daemonConn)
+		cancelWrite <- err
+	}()
+	waitForSignal(t, cli.interruptStarted, "adapter Interrupt before Send release")
+
+	releaseSend()
+	select {
+	case err := <-cancelWrite:
+		if err != nil {
+			t.Fatalf("send cancel turn: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel turn write did not complete")
+	}
+	select {
+	case msg := <-messages:
+		if msg == nil {
+			t.Fatal("worker connection closed before Send returned")
+		}
+		if msg.Type != protocol.MsgTurnCompleted {
+			t.Fatalf("worker message type = %s, want no terminal", msg.Type)
+		}
+		var terminal protocol.TurnTerminal
+		if err := json.Unmarshal([]byte(msg.Payload), &terminal); err != nil {
+			t.Fatalf("decode turn terminal: %v", err)
+		}
+		t.Fatalf("old Send published terminal after cancel: %#v", terminal)
+	case <-time.After(200 * time.Millisecond):
+	}
+	w.Cancel()
+	w.wg.Wait()
+
+	for msg := range messages {
+		if msg.Type == protocol.MsgTurnCompleted {
+			t.Fatalf("old Send published terminal while worker was closing: %s", msg.Payload)
+		}
+	}
 }
 
 func TestWorkerRestartDoesNotMarkSessionClosed(t *testing.T) {
