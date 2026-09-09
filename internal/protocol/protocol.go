@@ -12,6 +12,8 @@ type MessageType string
 const (
 	MsgNewSession      MessageType = "new_session"
 	MsgUserInput       MessageType = "user_input"
+	MsgCancelTurn      MessageType = "cancel_turn"
+	MsgRestartWorker   MessageType = "restart_worker"
 	MsgClose           MessageType = "close"
 	MsgOutput          MessageType = "output"
 	MsgReady           MessageType = "ready"

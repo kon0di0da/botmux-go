@@ -48,6 +48,8 @@ type SessionMeta struct {
 	outputSeq        uint64
 	outputNotifyCh   chan struct{}
 	turnActive       bool
+	turnCancelling   bool
+	turnToken        uint64
 	terminalSeq      uint64
 	terminals        []protocol.TurnTerminal
 	terminalNotifyCh chan struct{}
@@ -133,25 +135,91 @@ func (m *SessionMeta) ensureOutputStateLocked() {
 
 const maxMemoryTerminals = 16
 
+type TurnSnapshot struct {
+	Active     bool
+	Cancelling bool
+	Token      uint64
+	Latest     *protocol.TurnTerminal
+}
+
 func (m *SessionMeta) BeginTurn() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.turnActive {
 		return false
 	}
+	m.turnToken++
 	m.turnActive = true
+	m.turnCancelling = false
 	return true
+}
+
+func (m *SessionMeta) BeginTurnCancel() (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.turnActive || m.turnCancelling {
+		return 0, false
+	}
+	m.turnCancelling = true
+	return m.turnToken, true
+}
+
+func (m *SessionMeta) CompleteTurn(terminal protocol.TurnTerminal) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.turnActive {
+		return false
+	}
+	m.finishTurnLocked(terminal)
+	return true
+}
+
+func (m *SessionMeta) FailCancellingTurn(token uint64, terminal protocol.TurnTerminal) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.turnActive || !m.turnCancelling || m.turnToken != token {
+		return false
+	}
+	m.finishTurnLocked(terminal)
+	return true
+}
+
+func (m *SessionMeta) TurnSnapshot() TurnSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	snapshot := TurnSnapshot{
+		Active:     m.turnActive,
+		Cancelling: m.turnCancelling,
+		Token:      m.turnToken,
+	}
+	if len(m.terminals) > 0 {
+		latest := m.terminals[len(m.terminals)-1]
+		snapshot.Latest = &latest
+	}
+	return snapshot
 }
 
 func (m *SessionMeta) FinishTurn() {
 	m.mu.Lock()
 	m.turnActive = false
+	m.turnCancelling = false
 	m.mu.Unlock()
 }
 
 func (m *SessionMeta) PublishTerminal(terminal protocol.TurnTerminal) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.publishTerminalLocked(terminal)
+}
+
+func (m *SessionMeta) finishTurnLocked(terminal protocol.TurnTerminal) {
+	m.turnActive = false
+	m.turnCancelling = false
+	m.publishTerminalLocked(terminal)
+}
+
+func (m *SessionMeta) publishTerminalLocked(terminal protocol.TurnTerminal) {
 	m.ensureTerminalStateLocked()
 	m.terminals = append(m.terminals, terminal)
 	m.terminalSeq++
