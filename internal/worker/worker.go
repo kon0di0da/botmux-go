@@ -59,6 +59,8 @@ type Worker struct {
 	turnMu               sync.Mutex
 	turnInFlight         bool
 	turnID               uint64
+	turnCtx              context.Context
+	turnCancel           context.CancelFunc
 	turnCancelRequested  bool
 	turnInterruptPending bool
 }
@@ -353,17 +355,21 @@ func (w *Worker) readDaemonMessages() {
 func (w *Worker) handleInput(turnID uint64, input string) {
 	defer w.wg.Done()
 
+	turnCtx, ok := w.turnContextForID(turnID)
+	if !ok {
+		return
+	}
 	log.Printf("[worker:%s] sending to cli: %q", safeShortID(w.sessionID), input)
-	result, err := w.cliAdapter.Send(w.ctx, input)
+	result, err := w.cliAdapter.Send(turnCtx, input)
 	if err != nil {
-		if w.ctx.Err() != nil || w.isTurnCancellationRequested(turnID) {
+		if w.ctx.Err() != nil || turnCtx.Err() != nil || w.isTurnCancellationRequested(turnID) {
 			return
 		}
 		log.Printf("[worker:%s] send to cli: %v", safeShortID(w.sessionID), err)
 		w.failCurrentTurn(turnID, "codex_submit_failed", err)
 		return
 	}
-	if w.ctx.Err() != nil || result.CliSessionID == "" {
+	if w.ctx.Err() != nil || turnCtx.Err() != nil || result.CliSessionID == "" {
 		return
 	}
 	if err := w.sendMessage(protocol.MsgCliSessionBound, result.CliSessionID); err != nil {
@@ -516,8 +522,21 @@ func (w *Worker) beginTurnWithID() (uint64, bool) {
 	}
 	w.turnInFlight = true
 	w.turnID++
+	w.turnCtx, w.turnCancel = context.WithCancel(w.ctx)
 	w.turnCancelRequested = false
 	return w.turnID, true
+}
+
+func (w *Worker) turnContextForID(turnID uint64) (context.Context, bool) {
+	if w.cliType != "codex" {
+		return w.ctx, true
+	}
+	w.turnMu.Lock()
+	defer w.turnMu.Unlock()
+	if !w.turnInFlight || w.turnID != turnID || w.turnCtx == nil {
+		return nil, false
+	}
+	return w.turnCtx, true
 }
 
 func (w *Worker) requestTurnInterrupt() (uint64, bool) {
@@ -530,6 +549,9 @@ func (w *Worker) requestTurnInterrupt() (uint64, bool) {
 		return 0, false
 	}
 	w.turnCancelRequested = true
+	if w.turnCancel != nil {
+		w.turnCancel()
+	}
 	w.turnInterruptPending = true
 	return w.turnID, true
 }
@@ -580,8 +602,26 @@ func (w *Worker) finishTurnWithID(turnID uint64) bool {
 		return false
 	}
 	w.turnInFlight = false
+	w.cancelTurnLocked()
 	w.turnCancelRequested = false
 	return true
+}
+
+func (w *Worker) cancelTurnLocked() {
+	if w.turnCancel != nil {
+		w.turnCancel()
+		w.turnCancel = nil
+	}
+	w.turnCtx = nil
+}
+
+func (w *Worker) cancelActiveTurn() {
+	if w.cliType != "codex" {
+		return
+	}
+	w.turnMu.Lock()
+	w.cancelTurnLocked()
+	w.turnMu.Unlock()
 }
 
 func (w *Worker) interruptTurn(turnID uint64) {
@@ -653,6 +693,7 @@ func (w *Worker) Cancel() {
 	}
 	w.closed = true
 	w.closeMu.Unlock()
+	w.cancelActiveTurn()
 	w.cancel()
 	w.connMu.Lock()
 	if w.conn != nil {
@@ -672,6 +713,7 @@ func (w *Worker) cleanup(markClosed bool) {
 	alreadyClosed := w.closed
 	w.closed = true
 	w.closeMu.Unlock()
+	w.cancelActiveTurn()
 	if !alreadyClosed {
 		w.cancel()
 	}

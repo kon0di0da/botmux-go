@@ -61,6 +61,36 @@ type blockingSendTestAdapter struct {
 	interruptStarted chan struct{}
 }
 
+type preCanceledSendTestAdapter struct {
+	sendContextErr error
+	submitted      bool
+}
+
+func (a *preCanceledSendTestAdapter) Name() string {
+	return "pre-canceled-send-test"
+}
+
+func (a *preCanceledSendTestAdapter) Start(context.Context, string) (*adapter.CliStartResult, error) {
+	return nil, errors.New("Start must not be called")
+}
+
+func (a *preCanceledSendTestAdapter) Send(ctx context.Context, _ string) (adapter.SendResult, error) {
+	a.sendContextErr = ctx.Err()
+	if a.sendContextErr != nil {
+		return adapter.SendResult{}, a.sendContextErr
+	}
+	a.submitted = true
+	return adapter.SendResult{}, nil
+}
+
+func (a *preCanceledSendTestAdapter) Close() error {
+	return nil
+}
+
+func (a *preCanceledSendTestAdapter) Interrupt(context.Context) error {
+	return nil
+}
+
 func (a *blockingSendTestAdapter) Name() string {
 	return "blocking-send-test"
 }
@@ -316,6 +346,31 @@ func TestWorkerQueuedInterruptDoesNotTargetNextTurn(t *testing.T) {
 	}
 	if _, ok := w.beginTurnWithID(); !ok {
 		t.Fatal("begin next turn after queued interrupt completed")
+	}
+}
+
+func TestWorkerCancelBeforeSendStartsPreventsSubmission(t *testing.T) {
+	cli := &preCanceledSendTestAdapter{}
+	w := New(Options{SessionID: "worker-cancel-test", CliType: "codex"})
+	w.cliAdapter = cli
+	t.Cleanup(w.Cancel)
+
+	turnID, ok := w.beginTurnWithID()
+	if !ok {
+		t.Fatal("begin turn")
+	}
+	if _, ok := w.requestTurnInterrupt(); !ok {
+		t.Fatal("request turn interrupt")
+	}
+
+	w.wg.Add(1)
+	w.handleInput(turnID, "hello")
+
+	if !errors.Is(cli.sendContextErr, context.Canceled) {
+		t.Fatalf("Send context error = %v, want %v", cli.sendContextErr, context.Canceled)
+	}
+	if cli.submitted {
+		t.Fatal("Send submitted a canceled turn")
 	}
 }
 
