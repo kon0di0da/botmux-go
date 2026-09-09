@@ -475,6 +475,14 @@ func (w *Worker) readAdapterEvents() {
 			if !ok {
 				return
 			}
+			if w.cliType == "codex" {
+				if event.TurnID == 0 {
+					continue
+				}
+				if _, ok := w.turnContextForID(event.TurnID); !ok {
+					continue
+				}
+			}
 			switch event.Kind {
 			case adapter.AdapterOutput:
 				if event.Output == "" {
@@ -485,7 +493,11 @@ func (w *Worker) readAdapterEvents() {
 					log.Printf("[worker:%s] send structured output: %v", safeShortID(w.sessionID), err)
 				}
 			case adapter.AdapterTurnTerminal:
-				w.completeTurn(0, protocol.TurnTerminal{
+				turnID := uint64(0)
+				if w.cliType == "codex" {
+					turnID = event.TurnID
+				}
+				w.completeTurn(turnID, protocol.TurnTerminal{
 					Status:      protocol.TurnStatus(event.Status),
 					ErrorCode:   event.ErrorCode,
 					ErrorDetail: event.ErrorDetail,
@@ -522,7 +534,7 @@ func (w *Worker) beginTurnWithID() (uint64, bool) {
 	}
 	w.turnInFlight = true
 	w.turnID++
-	w.turnCtx, w.turnCancel = context.WithCancel(w.ctx)
+	w.turnCtx, w.turnCancel = context.WithCancel(adapter.WithTurnID(w.ctx, w.turnID))
 	w.turnCancelRequested = false
 	return w.turnID, true
 }

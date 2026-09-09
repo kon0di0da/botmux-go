@@ -310,3 +310,142 @@ func TestCodexSendUsesBracketedPasteAndReturnsConfirmedSession(t *testing.T) {
 		t.Fatal("timed out waiting for Codex input")
 	}
 }
+
+func TestCodexSendWatcherEventsCarryTurnID(t *testing.T) {
+	const (
+		sessionID = "owned"
+		turnID    = uint64(42)
+	)
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	historyPath := filepath.Join(home, "history.jsonl")
+	if err := os.WriteFile(historyPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rolloutDir := filepath.Join(home, "sessions", "2026", "09", "09")
+	if err := os.MkdirAll(rolloutDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(rolloutDir, "rollout-2026-09-09T00-00-00-"+sessionID+".jsonl")
+	rollout := "" +
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"world"}}` + "\n"
+	if err := os.WriteFile(rolloutPath, []byte(rollout), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+
+	a := NewCodexAdapter(AdapterOptions{CliType: "codex"})
+	a.ptmx = writer
+	a.cmd = &exec.Cmd{Process: &os.Process{Pid: 42}}
+	a.ctx = context.Background()
+	a.started = true
+	a.deps.ownedRollouts = func(pid int) (map[string]struct{}, error) {
+		if pid != 42 {
+			t.Fatalf("pid = %d, want 42", pid)
+		}
+		return map[string]struct{}{sessionID: {}}, nil
+	}
+
+	inputWritten := make(chan error, 1)
+	go func() {
+		data := make([]byte, len("\x1b[200~hello\x1b[201~\r"))
+		if _, err := io.ReadFull(reader, data); err != nil {
+			inputWritten <- err
+			return
+		}
+		inputWritten <- os.WriteFile(
+			historyPath,
+			[]byte(`{"session_id":"owned","text":"hello"}`+"\n"),
+			0o600,
+		)
+	}()
+
+	if _, err := a.Send(WithTurnID(context.Background(), turnID), "hello"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	select {
+	case err := <-inputWritten:
+		if err != nil {
+			t.Fatalf("write history: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Codex input")
+	}
+
+	var events []AdapterEvent
+	for len(events) < 2 {
+		select {
+		case event := <-a.events:
+			events = append(events, event)
+		case <-time.After(time.Second):
+			t.Fatalf("events = %#v, want output and terminal", events)
+		}
+	}
+	for _, event := range events {
+		if event.TurnID != turnID {
+			t.Fatalf("event TurnID = %d, want %d: %#v", event.TurnID, turnID, event)
+		}
+	}
+	if events[0].Kind != AdapterOutput || events[0].Output != "world" {
+		t.Fatalf("output event = %#v", events[0])
+	}
+	if events[1].Kind != AdapterTurnTerminal || events[1].Status != TurnCompleted {
+		t.Fatalf("terminal event = %#v", events[1])
+	}
+}
+
+func TestCodexCloseReturnsWhileSendMutexIsHeld(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+
+	a := NewCodexAdapter(AdapterOptions{CliType: "codex"})
+	a.ptmx = writer
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- a.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Close waited for send mutex")
+	}
+
+	a.mu.Lock()
+	closed := a.closed
+	a.mu.Unlock()
+	if !closed {
+		t.Fatal("Close did not mark adapter closed")
+	}
+
+	secondCloseDone := make(chan error, 1)
+	go func() {
+		secondCloseDone <- a.Close()
+	}()
+	select {
+	case err := <-secondCloseDone:
+		if err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("idempotent Close waited for send mutex")
+	}
+}

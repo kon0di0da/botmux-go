@@ -23,11 +23,31 @@ const (
 )
 
 type AdapterEvent struct {
+	TurnID      uint64
 	Kind        AdapterEventKind
 	Output      string
 	Status      TurnStatus
 	ErrorCode   string
 	ErrorDetail string
+}
+
+type turnIDContextKey struct{}
+
+// WithTurnID associates a worker turn with an adapter call context.
+func WithTurnID(ctx context.Context, turnID uint64) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, turnIDContextKey{}, turnID)
+}
+
+// TurnIDFromContext returns the non-zero worker turn associated with ctx.
+func TurnIDFromContext(ctx context.Context) (uint64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	turnID, ok := ctx.Value(turnIDContextKey{}).(uint64)
+	return turnID, ok && turnID != 0
 }
 
 type SendResult struct {

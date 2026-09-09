@@ -174,6 +174,7 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 	a.sendTurnMu.Lock()
 	defer a.sendTurnMu.Unlock()
 
+	turnID, _ := TurnIDFromContext(ctx)
 	normalized := normalizeCodexInput(input)
 	a.mu.Lock()
 	closed := a.closed
@@ -235,7 +236,7 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 		)
 		if err == nil {
 			if started {
-				go a.watchTranscript(baseCtx, sessionID, normalized, rolloutOffset)
+				go a.watchTranscript(baseCtx, turnID, sessionID, normalized, rolloutOffset)
 			}
 			return SendResult{CliSessionID: sessionID}, nil
 		}
@@ -273,8 +274,6 @@ func (a *CodexAdapter) Interrupt(ctx context.Context) error {
 }
 
 func (a *CodexAdapter) Close() error {
-	a.sendMu.Lock()
-	defer a.sendMu.Unlock()
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
@@ -481,7 +480,7 @@ func (a *CodexAdapter) ownsSession(sessionID string) bool {
 	return ok
 }
 
-func (a *CodexAdapter) watchTranscript(ctx context.Context, sessionID, input string, offset int64) {
+func (a *CodexAdapter) watchTranscript(ctx context.Context, turnID uint64, sessionID, input string, offset int64) {
 	const discoveryTimeout = 10 * time.Second
 	const pollInterval = 100 * time.Millisecond
 
@@ -501,6 +500,7 @@ func (a *CodexAdapter) watchTranscript(ctx context.Context, sessionID, input str
 			return
 		case <-deadline.C:
 			a.publishAdapterEvent(ctx, AdapterEvent{
+				TurnID:      turnID,
 				Kind:        AdapterTurnTerminal,
 				Status:      TurnFailed,
 				ErrorCode:   "codex_rollout_missing",
@@ -515,6 +515,7 @@ func (a *CodexAdapter) watchTranscript(ctx context.Context, sessionID, input str
 		events, err := cursor.ReadNew()
 		if err != nil {
 			a.publishAdapterEvent(ctx, AdapterEvent{
+				TurnID:      turnID,
 				Kind:        AdapterTurnTerminal,
 				Status:      TurnFailed,
 				ErrorCode:   "codex_rollout_read_error",
@@ -523,6 +524,7 @@ func (a *CodexAdapter) watchTranscript(ctx context.Context, sessionID, input str
 			return
 		}
 		for _, event := range events {
+			event.TurnID = turnID
 			a.publishAdapterEvent(ctx, event)
 			if event.Kind == AdapterTurnTerminal {
 				return

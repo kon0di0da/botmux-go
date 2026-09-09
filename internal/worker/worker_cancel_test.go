@@ -265,7 +265,8 @@ func TestWorkerCancelFailureAfterNormalTerminalDoesNotPublishSecondTerminal(t *t
 	events := make(chan adapter.AdapterEvent, 1)
 	w.startResult = &adapter.CliStartResult{Events: events}
 	close(w.readyCh)
-	if !w.beginTurn() {
+	turnID, ok := w.beginTurnWithID()
+	if !ok {
 		t.Fatal("begin turn")
 	}
 	messages := readWorkerMessages(daemonConn)
@@ -278,7 +279,11 @@ func TestWorkerCancelFailureAfterNormalTerminalDoesNotPublishSecondTerminal(t *t
 	}
 	waitForSignal(t, cli.interruptStarted, "adapter interrupt")
 
-	events <- adapter.AdapterEvent{Kind: adapter.AdapterTurnTerminal, Status: adapter.TurnCompleted}
+	events <- adapter.AdapterEvent{
+		Kind:   adapter.AdapterTurnTerminal,
+		TurnID: turnID,
+		Status: adapter.TurnCompleted,
+	}
 	normal, ok := <-messages
 	if !ok {
 		t.Fatal("worker connection closed before normal terminal")
@@ -314,6 +319,88 @@ func TestWorkerCancelFailureAfterNormalTerminalDoesNotPublishSecondTerminal(t *t
 	}
 	if terminal.ErrorCode == "codex_cancel_failed" {
 		t.Fatal("normal terminal was followed by codex_cancel_failed")
+	}
+}
+
+func TestWorkerCodexIgnoresStaleTurnEvents(t *testing.T) {
+	w := New(Options{SessionID: "worker-stale-events", CliType: "codex"})
+	conn, peer := net.Pipe()
+	w.conn = conn
+	events := make(chan adapter.AdapterEvent)
+	w.startResult = &adapter.CliStartResult{Events: events, StructuredOutput: true}
+	messages := readWorkerMessages(peer)
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = peer.Close()
+		w.wg.Wait()
+	})
+
+	w.wg.Add(1)
+	go w.readAdapterEvents()
+
+	firstTurnID, ok := w.beginTurnWithID()
+	if !ok {
+		t.Fatal("begin first turn")
+	}
+	if !w.completeTurn(firstTurnID, protocol.TurnTerminal{
+		Status:    protocol.TurnFailed,
+		ErrorCode: "codex_cancel_failed",
+	}) {
+		t.Fatal("complete first turn")
+	}
+	firstTerminal, ok := <-messages
+	if !ok {
+		t.Fatal("worker connection closed before first terminal")
+	}
+	if firstTerminal.Type != protocol.MsgTurnCompleted {
+		t.Fatalf("first message type = %s, want %s", firstTerminal.Type, protocol.MsgTurnCompleted)
+	}
+
+	secondTurnID, ok := w.beginTurnWithID()
+	if !ok {
+		t.Fatal("begin second turn")
+	}
+	events <- adapter.AdapterEvent{
+		Kind:   adapter.AdapterOutput,
+		TurnID: firstTurnID,
+		Output: "stale output",
+	}
+	events <- adapter.AdapterEvent{
+		Kind:   adapter.AdapterTurnTerminal,
+		TurnID: firstTurnID,
+		Status: adapter.TurnCompleted,
+	}
+	events <- adapter.AdapterEvent{Kind: adapter.AdapterEventKind("barrier")}
+
+	if _, ok := w.turnContextForID(secondTurnID); !ok {
+		t.Fatal("stale terminal completed the second turn")
+	}
+
+	events <- adapter.AdapterEvent{
+		Kind:   adapter.AdapterTurnTerminal,
+		TurnID: secondTurnID,
+		Status: adapter.TurnCompleted,
+	}
+	events <- adapter.AdapterEvent{Kind: adapter.AdapterEventKind("barrier")}
+
+	message, ok := <-messages
+	if !ok {
+		t.Fatal("worker connection closed before second terminal")
+	}
+	if message.Type != protocol.MsgTurnCompleted {
+		t.Fatalf("stale event emitted %s message: %s", message.Type, message.Payload)
+	}
+	var terminal protocol.TurnTerminal
+	if err := json.Unmarshal([]byte(message.Payload), &terminal); err != nil {
+		t.Fatalf("decode second terminal: %v", err)
+	}
+	if terminal.Status != protocol.TurnCompleted {
+		t.Fatalf("terminal status = %s, want %s", terminal.Status, protocol.TurnCompleted)
+	}
+	select {
+	case unexpected := <-messages:
+		t.Fatalf("stale event emitted an extra message: %s %s", unexpected.Type, unexpected.Payload)
+	default:
 	}
 }
 
