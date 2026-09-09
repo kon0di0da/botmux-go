@@ -15,6 +15,7 @@ type WorkerHandle struct {
 	Cmd       *exec.Cmd
 	Conn      net.Conn
 	Ready     chan struct{}
+	ExitDone  chan struct{}
 	Pid       int
 
 	mu                     sync.Mutex
@@ -28,6 +29,7 @@ func NewWorkerHandle(sessionID string) *WorkerHandle {
 	return &WorkerHandle{
 		SessionID: sessionID,
 		Ready:     make(chan struct{}),
+		ExitDone:  make(chan struct{}),
 		hbSeen:    time.Now(),
 	}
 }

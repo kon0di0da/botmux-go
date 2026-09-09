@@ -1,10 +1,94 @@
 package daemon
 
 import (
+	"context"
 	"os/exec"
 	"testing"
 	"time"
 )
+
+func TestStopWaitsForWorkerExitBeforeCancelingDaemonContext(t *testing.T) {
+	meta := NewSessionMeta("daemon-stop-waits-for-worker", "bot-test")
+	handle := NewWorkerHandle(meta.SessionID)
+	handle.Cmd = exec.Command("/bin/sh", "-c", "sleep 0.15")
+	if err := handle.Cmd.Start(); err != nil {
+		t.Fatalf("start worker fixture: %v", err)
+	}
+	handle.Pid = handle.Cmd.Process.Pid
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &Daemon{
+		ctx:           ctx,
+		cancel:        cancel,
+		sessions:      map[string]*SessionMeta{meta.SessionID: meta},
+		workers:       map[string]*WorkerHandle{meta.SessionID: handle},
+		store:         NewSessionStore(t.TempDir()),
+		spawnFailures: make(map[string]*spawnFailure),
+	}
+	if err := d.store.save(meta.ToPersisted()); err != nil {
+		t.Fatalf("persist session fixture: %v", err)
+	}
+	go d.waitWorkerExit(handle)
+
+	contextCanceledAfterWorkerExit := make(chan bool, 1)
+	go func() {
+		<-ctx.Done()
+		select {
+		case <-handle.ExitDone:
+			contextCanceledAfterWorkerExit <- true
+		default:
+			contextCanceledAfterWorkerExit <- false
+		}
+	}()
+
+	started := time.Now()
+	if err := d.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond {
+		t.Fatalf("Stop returned before the worker exited: %v", elapsed)
+	}
+	if canceledAfterExit := <-contextCanceledAfterWorkerExit; !canceledAfterExit {
+		t.Fatal("daemon context was canceled before the worker exit was reaped")
+	}
+}
+
+func TestStopKillsWorkerThatMissesGracePeriod(t *testing.T) {
+	meta := NewSessionMeta("daemon-stop-kills-stuck-worker", "bot-test")
+	handle := NewWorkerHandle(meta.SessionID)
+	handle.Cmd = exec.Command("/bin/sh", "-c", "sleep 10")
+	if err := handle.Cmd.Start(); err != nil {
+		t.Fatalf("start worker fixture: %v", err)
+	}
+	handle.Pid = handle.Cmd.Process.Pid
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &Daemon{
+		ctx:           ctx,
+		cancel:        cancel,
+		sessions:      map[string]*SessionMeta{meta.SessionID: meta},
+		workers:       map[string]*WorkerHandle{meta.SessionID: handle},
+		store:         NewSessionStore(t.TempDir()),
+		spawnFailures: make(map[string]*spawnFailure),
+	}
+	if err := d.store.save(meta.ToPersisted()); err != nil {
+		t.Fatalf("persist session fixture: %v", err)
+	}
+	go d.waitWorkerExit(handle)
+
+	started := time.Now()
+	if err := d.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("Stop exceeded grace period: %v", elapsed)
+	}
+	select {
+	case <-handle.ExitDone:
+	default:
+		t.Fatal("stuck worker was not reaped after shutdown grace period")
+	}
+}
 
 func TestCloseSessionPersistsBeforeWorkerExit(t *testing.T) {
 	meta := NewSessionMeta("session-close-persisted-first", "bot-test")

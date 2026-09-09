@@ -100,7 +100,6 @@ func (d *Daemon) Stop() error {
 	}
 	d.closed = true
 	d.closeMu.Unlock()
-	d.cancel()
 	d.stopSessionMonitor()
 	if d.httpListener != nil {
 		_ = d.httpListener.Close()
@@ -117,6 +116,8 @@ func (d *Daemon) Stop() error {
 	for _, id := range ids {
 		d.CloseSession(id, "daemon shutdown")
 	}
+	d.waitForWorkersExit()
+	d.cancel()
 	return nil
 }
 
@@ -228,7 +229,9 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 	handle := NewWorkerHandle(meta.SessionID)
 
-	cmd := exec.CommandContext(d.ctx, d.selfExe)
+	// Worker lifetime is controlled by its IPC close handshake, not the daemon
+	// service context. Stop waits for that handshake before canceling d.ctx.
+	cmd := exec.Command(d.selfExe)
 	cmd.Env = append(os.Environ(),
 		"BOTMUX_ROLE=worker",
 		"BOTMUX_SESSION_ID="+meta.SessionID,
@@ -330,6 +333,7 @@ func (d *Daemon) restoreSessions() {
 }
 
 func (d *Daemon) waitWorkerExit(handle *WorkerHandle) {
+	defer close(handle.ExitDone)
 	err := handle.Cmd.Wait()
 	exitMsg := fmt.Sprintf("worker exit (pid=%d):", handle.Pid)
 	if err != nil {
@@ -368,6 +372,29 @@ func (d *Daemon) waitWorkerExit(handle *WorkerHandle) {
 				defer func() { _ = recover() }()
 				fn()
 			}()
+		}
+	}
+}
+
+func (d *Daemon) waitForWorkersExit() {
+	d.workersMu.RLock()
+	handles := make([]*WorkerHandle, 0, len(d.workers))
+	for _, handle := range d.workers {
+		handles = append(handles, handle)
+	}
+	d.workersMu.RUnlock()
+
+	const shutdownGracePeriod = 3 * time.Second
+	deadline := time.NewTimer(shutdownGracePeriod)
+	defer deadline.Stop()
+	for _, handle := range handles {
+		select {
+		case <-handle.ExitDone:
+		case <-deadline.C:
+			if handle.Cmd != nil && handle.Cmd.Process != nil {
+				_ = handle.Cmd.Process.Kill()
+			}
+			<-handle.ExitDone
 		}
 	}
 }
