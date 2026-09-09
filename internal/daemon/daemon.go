@@ -17,6 +17,11 @@ import (
 	"botmux-go/internal/protocol"
 )
 
+const (
+	defaultCancelTurnTimeout  = 10 * time.Second
+	defaultRestartWorkerGrace = 2 * time.Second
+)
+
 type Daemon struct {
 	cfg          *config.DaemonConfig
 	listener     net.Listener
@@ -46,6 +51,9 @@ type Daemon struct {
 	monitorStop   chan struct{}
 	spawnFailures map[string]*spawnFailure
 	spawnSem      chan struct{}
+
+	turnCancelTimeout  time.Duration
+	restartWorkerGrace time.Duration
 }
 
 func New(cfg *config.DaemonConfig) (*Daemon, error) {
@@ -537,6 +545,115 @@ func (d *Daemon) SendInput(id, input string) error {
 	return nil
 }
 
+func (d *Daemon) CancelTurn(id string) error {
+	d.sessionsMu.RLock()
+	meta, ok := d.sessions[id]
+	if !ok {
+		d.sessionsMu.RUnlock()
+		return fmt.Errorf("session %s not found", id)
+	}
+	if meta.Closed {
+		d.sessionsMu.RUnlock()
+		return fmt.Errorf("session %s is closed", id)
+	}
+	if meta.CliType != string(config.CliCodex) {
+		d.sessionsMu.RUnlock()
+		return fmt.Errorf("session %s does not use Codex", id)
+	}
+	d.sessionsMu.RUnlock()
+
+	d.workersMu.RLock()
+	handle := d.workers[id]
+	d.workersMu.RUnlock()
+	if handle == nil || !handle.IsReady() || !d.isCurrentWorker(handle) {
+		return fmt.Errorf("session %s has no ready worker", id)
+	}
+
+	token, ok := meta.BeginTurnCancel()
+	if !ok {
+		return fmt.Errorf("session %s has no cancellable active turn", id)
+	}
+	if err := handle.Send(protocol.NewMessage(protocol.MsgCancelTurn, id, "")); err != nil {
+		d.finishCancelWithFailure(meta, token, "codex_cancel_failed", err.Error())
+		return fmt.Errorf("cancel Codex turn for session %s: %w", id, err)
+	}
+	go d.watchCancelledTurn(meta, token, handle)
+	return nil
+}
+
+func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64, handle *WorkerHandle) {
+	timer := time.NewTimer(d.cancelTurnTimeout())
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-d.ctx.Done():
+		return
+	}
+
+	if !d.finishCancelWithFailure(meta, token, "codex_cancel_timeout",
+		"Codex did not report turn_aborted after cancellation") {
+		return
+	}
+
+	d.sessionsMu.Lock()
+	if !meta.Closed {
+		meta.Status = StatusRecovering
+	}
+	d.sessionsMu.Unlock()
+	d.restartWorker(handle)
+}
+
+func (d *Daemon) finishCancelWithFailure(meta *SessionMeta, token uint64, errorCode, errorDetail string) bool {
+	return meta.FailCancellingTurn(token, protocol.TurnTerminal{
+		Status:      protocol.TurnFailed,
+		ErrorCode:   errorCode,
+		ErrorDetail: errorDetail,
+	})
+}
+
+func (d *Daemon) restartWorker(handle *WorkerHandle) {
+	if handle == nil || !d.isCurrentWorker(handle) {
+		return
+	}
+	if err := handle.Send(protocol.NewMessage(protocol.MsgRestartWorker, handle.SessionID, "")); err != nil {
+		log.Printf("[daemon] session %s restart worker: %v", safeShort(handle.SessionID), err)
+	}
+
+	go func() {
+		timer := time.NewTimer(d.workerRestartGrace())
+		defer timer.Stop()
+		select {
+		case <-handle.ExitDone:
+			return
+		case <-d.ctx.Done():
+			return
+		case <-timer.C:
+			if handle.Cmd != nil && handle.Cmd.Process != nil {
+				if err := handle.Cmd.Process.Kill(); err != nil {
+					if !errors.Is(err, os.ErrProcessDone) {
+						log.Printf("[daemon] session %s kill restarting worker: %v", safeShort(handle.SessionID), err)
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (d *Daemon) cancelTurnTimeout() time.Duration {
+	if d.turnCancelTimeout != 0 {
+		return d.turnCancelTimeout
+	}
+	return defaultCancelTurnTimeout
+}
+
+func (d *Daemon) workerRestartGrace() time.Duration {
+	if d.restartWorkerGrace != 0 {
+		return d.restartWorkerGrace
+	}
+	return defaultRestartWorkerGrace
+}
+
 func (d *Daemon) Sessions() map[string]*SessionMeta {
 	d.sessionsMu.RLock()
 	defer d.sessionsMu.RUnlock()
@@ -965,11 +1082,13 @@ func isClosedChan(ch chan struct{}) bool {
 }
 
 func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *WorkerHandle) {
+	if h != nil && !d.isCurrentWorker(h) {
+		log.Printf("[daemon] session %s ignored message from stale worker", safeShort(meta.SessionID))
+		return
+	}
+
 	switch msg.Type {
 	case protocol.MsgReady:
-		if !d.isCurrentWorker(h) {
-			return
-		}
 		h.markReady()
 		d.sessionsMu.Lock()
 		if !meta.Closed {
@@ -1008,8 +1127,9 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 				ErrorDetail: err.Error(),
 			}
 		}
-		meta.PublishTerminal(terminal)
-		meta.FinishTurn()
+		if !meta.CompleteTurn(terminal) {
+			log.Printf("[daemon] session %s ignored late turn terminal", safeShort(meta.SessionID))
+		}
 	case protocol.MsgClose:
 		log.Printf("[daemon] session %s closed by worker", safeShort(meta.SessionID))
 		d.removeSession(meta.SessionID)
