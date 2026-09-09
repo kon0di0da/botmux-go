@@ -3,11 +3,13 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -112,6 +114,133 @@ func TestCodexInterruptWritesEsc(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for Codex interrupt byte")
+	}
+}
+
+func TestCodexInterruptPreemptsBlockedHistoryConfirmation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "history.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendCtx, cancelSend := context.WithCancel(context.Background())
+	sendDone := make(chan error, 1)
+	interruptDone := make(chan error, 1)
+	var goroutines sync.WaitGroup
+	t.Cleanup(func() {
+		cancelSend()
+		_ = writer.Close()
+		_ = reader.Close()
+
+		goroutinesDone := make(chan struct{})
+		go func() {
+			goroutines.Wait()
+			close(goroutinesDone)
+		}()
+		select {
+		case <-goroutinesDone:
+		case <-time.After(time.Second):
+			t.Error("test goroutines did not return during cleanup")
+		}
+	})
+
+	a := NewCodexAdapter(AdapterOptions{CliType: "codex"})
+	a.ptmx = writer
+
+	goroutines.Add(1)
+	go func() {
+		defer goroutines.Done()
+		_, err := a.Send(sendCtx, "first")
+		sendDone <- err
+	}()
+
+	wantInput := []byte("\x1b[200~first\x1b[201~\r")
+	gotInput := make(chan []byte, 1)
+	readInputErr := make(chan error, 1)
+	goroutines.Add(1)
+	go func() {
+		defer goroutines.Done()
+		got := make([]byte, len(wantInput))
+		if _, err := io.ReadFull(reader, got); err != nil {
+			readInputErr <- err
+			return
+		}
+		gotInput <- got
+	}()
+
+	select {
+	case got := <-gotInput:
+		if !bytes.Equal(got, wantInput) {
+			t.Fatalf("initial input = %q, want %q", got, wantInput)
+		}
+	case err := <-readInputErr:
+		t.Fatalf("read initial input: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial Codex input")
+	}
+
+	goroutines.Add(1)
+	go func() {
+		defer goroutines.Done()
+		interruptDone <- a.Interrupt(context.Background())
+	}()
+
+	gotEsc := make(chan []byte, 1)
+	readEscErr := make(chan error, 1)
+	goroutines.Add(1)
+	go func() {
+		defer goroutines.Done()
+		got := make([]byte, 1)
+		if _, err := io.ReadFull(reader, got); err != nil {
+			readEscErr <- err
+			return
+		}
+		gotEsc <- got
+	}()
+
+	select {
+	case got := <-gotEsc:
+		if !bytes.Equal(got, []byte{0x1b}) {
+			t.Fatalf("interrupt byte = %#v, want Esc", got)
+		}
+	case err := <-readEscErr:
+		t.Fatalf("read interrupt byte: %v", err)
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Interrupt did not preempt blocked history confirmation")
+	}
+
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatalf("Interrupt: %v", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Interrupt did not return after writing Esc")
+	}
+
+	select {
+	case err := <-sendDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Send error = %v, want context cancellation", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Send did not return after interrupt")
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("writes after Esc = %#v, want none", remaining)
 	}
 }
 

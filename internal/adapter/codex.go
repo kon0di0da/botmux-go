@@ -25,20 +25,22 @@ func init() {
 }
 
 type CodexAdapter struct {
-	mu       sync.Mutex
-	sendMu   sync.Mutex
-	cmdPath  string
-	model    string
-	profile  string
-	resumeID string
+	mu         sync.Mutex
+	sendMu     sync.Mutex
+	sendTurnMu sync.Mutex
+	cmdPath    string
+	model      string
+	profile    string
+	resumeID   string
 
-	cmd     *exec.Cmd
-	ptmx    *os.File
-	outputR *io.PipeReader
-	outputW *io.PipeWriter
-	errCh   chan error
-	ready   chan error
-	events  chan AdapterEvent
+	cmd        *exec.Cmd
+	ptmx       *os.File
+	outputR    *io.PipeReader
+	outputW    *io.PipeWriter
+	errCh      chan error
+	ready      chan error
+	events     chan AdapterEvent
+	activeSend *codexActiveSend
 
 	readyOnce sync.Once
 	closed    bool
@@ -46,6 +48,10 @@ type CodexAdapter struct {
 	screen    string
 	deps      codexDependencies
 	ctx       context.Context
+}
+
+type codexActiveSend struct {
+	cancel context.CancelFunc
 }
 
 type codexDependencies struct {
@@ -165,28 +171,36 @@ func (a *CodexAdapter) Start(ctx context.Context, workingDir string) (*CliStartR
 }
 
 func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, error) {
-	a.sendMu.Lock()
-	defer a.sendMu.Unlock()
+	a.sendTurnMu.Lock()
+	defer a.sendTurnMu.Unlock()
 
+	normalized := normalizeCodexInput(input)
 	a.mu.Lock()
 	closed := a.closed
-	ptmx := a.ptmx
-	a.mu.Unlock()
 	if closed {
+		a.mu.Unlock()
 		return SendResult{}, fmt.Errorf("codex adapter is closed")
 	}
-	if ptmx == nil {
-		return SendResult{}, fmt.Errorf("codex adapter not started")
-	}
-	normalized := normalizeCodexInput(input)
 	if strings.TrimSpace(normalized) == "" {
+		a.mu.Unlock()
 		return SendResult{}, nil
 	}
-	a.mu.Lock()
 	resumeID := a.resumeID
 	baseCtx := a.ctx
 	started := a.started
+	sendCtx, cancelSend := context.WithCancel(ctx)
+	activeSend := &codexActiveSend{cancel: cancelSend}
+	a.activeSend = activeSend
 	a.mu.Unlock()
+	defer func() {
+		cancelSend()
+		a.mu.Lock()
+		if a.activeSend == activeSend {
+			a.activeSend = nil
+		}
+		a.mu.Unlock()
+	}()
+
 	if baseCtx == nil {
 		baseCtx = ctx
 	}
@@ -199,18 +213,21 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 	historyPath := codexHistoryPath()
 	baseline := currentFileSize(historyPath)
 	body := "\x1b[200~" + normalized + "\x1b[201~"
-	if err := writeAll(ctx, ptmx, []byte(body)); err != nil {
+	if err := a.writeCodexInput(sendCtx, []byte(body)); err != nil {
 		return SendResult{}, fmt.Errorf("codex paste input: %w", err)
 	}
-	if err := waitContext(ctx, 200*time.Millisecond); err != nil {
+	if err := waitContext(sendCtx, 200*time.Millisecond); err != nil {
 		return SendResult{}, err
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		if err := writeAll(ctx, ptmx, []byte{'\r'}); err != nil {
+		if err := sendCtx.Err(); err != nil {
+			return SendResult{}, err
+		}
+		if err := a.writeCodexInput(sendCtx, []byte{'\r'}); err != nil {
 			return SendResult{}, fmt.Errorf("codex submit input: %w", err)
 		}
 		sessionID, err := waitForCodexHistory(
-			ctx,
+			sendCtx,
 			historyPath,
 			baseline,
 			normalized,
@@ -221,6 +238,9 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 				go a.watchTranscript(baseCtx, sessionID, normalized, rolloutOffset)
 			}
 			return SendResult{CliSessionID: sessionID}, nil
+		}
+		if err := sendCtx.Err(); err != nil {
+			return SendResult{}, err
 		}
 	}
 	return SendResult{}, fmt.Errorf("codex submit not confirmed after 3 Enter attempts")
@@ -243,6 +263,12 @@ func (a *CodexAdapter) Interrupt(ctx context.Context) error {
 	if err := writeAll(ctx, ptmx, []byte{0x1b}); err != nil {
 		return fmt.Errorf("codex interrupt: %w", err)
 	}
+	a.mu.Lock()
+	activeSend := a.activeSend
+	a.mu.Unlock()
+	if activeSend != nil {
+		activeSend.cancel()
+	}
 	return nil
 }
 
@@ -250,24 +276,51 @@ func (a *CodexAdapter) Close() error {
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.closed {
+		a.mu.Unlock()
 		return nil
 	}
 	a.closed = true
-	if a.ptmx != nil {
-		_ = a.ptmx.Close()
+	activeSend := a.activeSend
+	ptmx := a.ptmx
+	outputW := a.outputW
+	outputR := a.outputR
+	cmd := a.cmd
+	a.mu.Unlock()
+
+	if activeSend != nil {
+		activeSend.cancel()
 	}
-	if a.outputW != nil {
-		_ = a.outputW.Close()
+	if ptmx != nil {
+		_ = ptmx.Close()
 	}
-	if a.outputR != nil {
-		_ = a.outputR.Close()
+	if outputW != nil {
+		_ = outputW.Close()
 	}
-	if a.cmd != nil && a.cmd.Process != nil {
-		_ = a.cmd.Process.Kill()
+	if outputR != nil {
+		_ = outputR.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
 	}
 	return nil
+}
+
+func (a *CodexAdapter) writeCodexInput(ctx context.Context, data []byte) error {
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+
+	a.mu.Lock()
+	closed := a.closed
+	ptmx := a.ptmx
+	a.mu.Unlock()
+	if closed {
+		return fmt.Errorf("codex adapter is closed")
+	}
+	if ptmx == nil {
+		return fmt.Errorf("codex adapter not started")
+	}
+	return writeAll(ctx, ptmx, data)
 }
 
 func (a *CodexAdapter) pumpOutput() {
