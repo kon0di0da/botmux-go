@@ -51,6 +51,10 @@ type CliAdapter interface {
 	Name() string
 }
 
+type CliTurnInterrupter interface {
+	Interrupt(ctx context.Context) error
+}
+
 type CliOutputObserver interface {
 	NotifyOutput()
 }

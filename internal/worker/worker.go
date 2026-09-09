@@ -349,9 +349,18 @@ func (w *Worker) readDaemonMessages() {
 					log.Printf("[worker:%s] persist CLI session ID: %v", safeShortID(w.sessionID), err)
 				}
 			}
+		case protocol.MsgCancelTurn:
+			if err := w.interruptTurn(); err != nil {
+				log.Printf("[worker:%s] interrupt turn: %v", safeShortID(w.sessionID), err)
+				w.failCurrentTurn("codex_cancel_failed", err)
+			}
+		case protocol.MsgRestartWorker:
+			log.Printf("[worker:%s] restart requested by daemon", safeShortID(w.sessionID))
+			w.cleanup(false)
+			return
 		case protocol.MsgClose:
 			log.Printf("[worker:%s] close requested by daemon", safeShortID(w.sessionID))
-			w.cleanup()
+			w.cleanup(true)
 			return
 		case protocol.MsgHeartbeat:
 		case protocol.MsgAck:
@@ -514,6 +523,30 @@ func (w *Worker) finishTurn() {
 	w.turnMu.Unlock()
 }
 
+func (w *Worker) interruptTurn() error {
+	w.turnMu.Lock()
+	turnInFlight := w.turnInFlight
+	w.turnMu.Unlock()
+	if !turnInFlight {
+		return errors.New("no Codex turn in progress")
+	}
+	interrupter, ok := w.cliAdapter.(adapter.CliTurnInterrupter)
+	if !ok {
+		return errors.New("adapter does not support turn interruption")
+	}
+	return interrupter.Interrupt(w.ctx)
+}
+
+func (w *Worker) failCurrentTurn(code string, err error) {
+	w.finishTurn()
+	w.outputIdleObserver.CancelInput()
+	w.sendTurnTerminal(protocol.TurnTerminal{
+		Status:      protocol.TurnFailed,
+		ErrorCode:   code,
+		ErrorDetail: err.Error(),
+	})
+}
+
 type readResult struct {
 	data string
 	err  error
@@ -552,7 +585,7 @@ func (w *Worker) isClosed() bool {
 	return w.closed
 }
 
-func (w *Worker) cleanup() {
+func (w *Worker) cleanup(markClosed bool) {
 	w.closeMu.Lock()
 	alreadyClosed := w.closed
 	w.closed = true
@@ -577,7 +610,7 @@ func (w *Worker) cleanup() {
 		w.conn = nil
 	}
 	w.connMu.Unlock()
-	if w.storeDir != "" {
+	if markClosed && w.storeDir != "" {
 		store := daemon.NewSessionStore(w.storeDir)
 		_ = store.MarkClosed(w.sessionID)
 	}

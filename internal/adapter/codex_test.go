@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +77,41 @@ func TestCodexComposerReadyAcceptsLoadedComposer(t *testing.T) {
 	screen := "model: gpt-5.5\n› Ask Codex to do anything"
 	if !codexComposerReady(screen) {
 		t.Fatal("loaded composer was not treated as READY")
+	}
+}
+
+func TestCodexInterruptWritesEsc(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+
+	a := NewCodexAdapter(AdapterOptions{CliType: "codex"})
+	a.ptmx = writer
+
+	gotCh := make(chan []byte, 1)
+	go func() {
+		got := make([]byte, 1)
+		if _, err := io.ReadFull(reader, got); err != nil {
+			t.Errorf("read interrupt byte: %v", err)
+			return
+		}
+		gotCh <- got
+	}()
+
+	if err := a.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt: %v", err)
+	}
+	select {
+	case got := <-gotCh:
+		want := []byte{0x1b}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("interrupt bytes = %#v, want %#v", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Codex interrupt byte")
 	}
 }
 

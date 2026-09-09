@@ -226,6 +226,26 @@ func (a *CodexAdapter) Send(ctx context.Context, input string) (SendResult, erro
 	return SendResult{}, fmt.Errorf("codex submit not confirmed after 3 Enter attempts")
 }
 
+func (a *CodexAdapter) Interrupt(ctx context.Context) error {
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+
+	a.mu.Lock()
+	closed := a.closed
+	ptmx := a.ptmx
+	a.mu.Unlock()
+	if closed {
+		return fmt.Errorf("codex adapter is closed")
+	}
+	if ptmx == nil {
+		return fmt.Errorf("codex adapter not started")
+	}
+	if err := writeAll(ctx, ptmx, []byte{0x1b}); err != nil {
+		return fmt.Errorf("codex interrupt: %w", err)
+	}
+	return nil
+}
+
 func (a *CodexAdapter) Close() error {
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
