@@ -121,16 +121,8 @@ func (w *Worker) Run() error {
 		return err
 	}
 
-	goroutines := 2
-	if w.startResult.Events != nil {
-		goroutines++
-	}
-	w.wg.Add(goroutines)
-	if w.startResult.Events != nil {
-		go w.readAdapterEvents()
-	}
+	w.wg.Add(1)
 	go w.readDaemonMessages()
-	go w.readCliOutput()
 
 	if err := w.waitForCLIReady(); err != nil {
 		w.sendError("cli_ready: " + err.Error())
@@ -143,7 +135,15 @@ func (w *Worker) Run() error {
 		return err
 	}
 
-	w.wg.Add(1)
+	goroutines := 2
+	if w.startResult.Events != nil {
+		goroutines++
+	}
+	w.wg.Add(goroutines)
+	if w.startResult.Events != nil {
+		go w.readAdapterEvents()
+	}
+	go w.readCliOutput()
 	go w.sendHeartbeats()
 
 	w.wg.Wait()
