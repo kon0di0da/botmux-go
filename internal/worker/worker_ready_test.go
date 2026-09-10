@@ -3,9 +3,12 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,6 +28,38 @@ func TestWaitForCLIReadyUsesAuthoritativeResult(t *testing.T) {
 	}
 	if err := w.waitForCLIReady(); err != nil {
 		t.Fatalf("waitForCLIReady: %v", err)
+	}
+}
+
+func TestWorkerStartFailureCleansUpAdapter(t *testing.T) {
+	startErr := errors.New("adapter start failed")
+	daemonConn, workerConn := net.Pipe()
+	t.Cleanup(func() { _ = daemonConn.Close() })
+
+	cli := newCleanupTrackingTestAdapter(startErr)
+	w := New(Options{
+		SessionID:  "worker-start-failure",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	w.cliAdapter = cli
+	w.dial = func(string, string) (net.Conn, error) {
+		return workerConn, nil
+	}
+
+	err := w.Run()
+	if !errors.Is(err, startErr) {
+		t.Fatalf("Run error = %v, want %v", err, startErr)
+	}
+	if w.startResult != nil {
+		t.Fatal("worker retained a start result after Start returned an error")
+	}
+	waitForSignal(t, cli.closed, "adapter Close after startup failure")
+	if got := cli.closeCalls.Load(); got != 1 {
+		t.Fatalf("adapter Close calls = %d, want 1", got)
+	}
+	if w.ctx.Err() == nil {
+		t.Fatal("worker context was not canceled after startup failure")
 	}
 }
 
@@ -665,6 +700,107 @@ func TestWorkerReconnectDoesNotPublishRejectedReady(t *testing.T) {
 	}
 }
 
+func TestWorkerReconnectRejectionCleansUpAdapter(t *testing.T) {
+	oldDaemonConn, oldWorkerConn := net.Pipe()
+	newDaemonConn, newWorkerConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = oldDaemonConn.Close()
+		_ = newDaemonConn.Close()
+	})
+
+	storeDir := t.TempDir()
+	sessionID := "worker-reconnect-cleanup"
+	sessionPath := filepath.Join(storeDir, sessionID+".json")
+	if err := os.WriteFile(sessionPath, []byte(`{"session_id":"worker-reconnect-cleanup","closed":false}`), 0o644); err != nil {
+		t.Fatalf("write persisted session: %v", err)
+	}
+
+	cli := newCleanupTrackingTestAdapter(nil)
+	input := &closeTrackingWriteCloser{}
+	output := &closeTrackingReadCloser{}
+	w := New(Options{
+		SessionID:        sessionID,
+		WorkerInstanceID: "nonce-reconnect-cleanup",
+		DaemonAddr:       "daemon-test",
+		StoreDir:         storeDir,
+		CliType:          "mock",
+	})
+	w.cliAdapter = cli
+	w.startResult = &adapter.CliStartResult{
+		Input:  input,
+		Output: output,
+		ErrCh:  make(chan error),
+	}
+	w.conn = oldWorkerConn
+	w.msgReader = protocol.NewMessageReader(oldWorkerConn)
+	w.reconnectSleep = func(time.Duration) {}
+
+	var dialCalls atomic.Int32
+	w.dial = func(string, string) (net.Conn, error) {
+		if dialCalls.Add(1) != 1 {
+			return nil, errors.New("unexpected reconnect dial")
+		}
+		return newWorkerConn, nil
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(newDaemonConn).Read()
+		if err != nil {
+			serverDone <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			serverDone <- fmt.Errorf("first message = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		_, err = protocol.NewMessage(protocol.MsgError, w.sessionID, "worker instance mismatch").WriteTo(newDaemonConn)
+		serverDone <- err
+	}()
+
+	reconnectDone := make(chan struct{})
+	go func() {
+		w.reconnectToDaemon()
+		close(reconnectDone)
+	}()
+	waitForSignal(t, reconnectDone, "reconnect cleanup after ready rejection")
+	waitForSignal(t, cli.closed, "adapter Close after reconnect rejection")
+
+	if got := cli.closeCalls.Load(); got != 1 {
+		t.Fatalf("adapter Close calls = %d, want 1", got)
+	}
+	if got := input.closeCalls.Load(); got != 1 {
+		t.Fatalf("started input Close calls = %d, want 1", got)
+	}
+	if got := output.closeCalls.Load(); got != 1 {
+		t.Fatalf("started output Close calls = %d, want 1", got)
+	}
+	if w.ctx.Err() == nil {
+		t.Fatal("worker context was not canceled after reconnect rejection")
+	}
+	if !w.isClosed() {
+		t.Fatal("worker was not closed after reconnect rejection")
+	}
+	if got := dialCalls.Load(); got != 1 {
+		t.Fatalf("dial calls = %d, want 1", got)
+	}
+	data, err := os.ReadFile(sessionPath)
+	if err != nil {
+		t.Fatalf("read persisted session: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"closed":false`)) {
+		t.Fatalf("reconnect rejection marked persisted session closed: %s", data)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("send ready rejection: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not finish sending ready rejection")
+	}
+}
+
 func TestWorkerReconnectIsSingleFlight(t *testing.T) {
 	daemonConn, workerConn := net.Pipe()
 	firstDialEntered := make(chan struct{})
@@ -888,6 +1024,67 @@ type initialHandshakeRejectTestAdapter struct {
 	closed     chan struct{}
 	closeCalls atomic.Int32
 	closeOnce  sync.Once
+}
+
+type cleanupTrackingTestAdapter struct {
+	startErr   error
+	closed     chan struct{}
+	closeCalls atomic.Int32
+	closeOnce  sync.Once
+}
+
+func newCleanupTrackingTestAdapter(startErr error) *cleanupTrackingTestAdapter {
+	return &cleanupTrackingTestAdapter{
+		startErr: startErr,
+		closed:   make(chan struct{}),
+	}
+}
+
+func (a *cleanupTrackingTestAdapter) Name() string {
+	return "cleanup-tracking-test"
+}
+
+func (a *cleanupTrackingTestAdapter) Start(context.Context, string) (*adapter.CliStartResult, error) {
+	if a.startErr != nil {
+		return nil, a.startErr
+	}
+	return nil, errors.New("Start must not be called")
+}
+
+func (a *cleanupTrackingTestAdapter) Send(context.Context, string) (adapter.SendResult, error) {
+	return adapter.SendResult{}, nil
+}
+
+func (a *cleanupTrackingTestAdapter) Close() error {
+	a.closeCalls.Add(1)
+	a.closeOnce.Do(func() { close(a.closed) })
+	return nil
+}
+
+type closeTrackingReadCloser struct {
+	closeCalls atomic.Int32
+}
+
+func (r *closeTrackingReadCloser) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (r *closeTrackingReadCloser) Close() error {
+	r.closeCalls.Add(1)
+	return nil
+}
+
+type closeTrackingWriteCloser struct {
+	closeCalls atomic.Int32
+}
+
+func (w *closeTrackingWriteCloser) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (w *closeTrackingWriteCloser) Close() error {
+	w.closeCalls.Add(1)
+	return nil
 }
 
 func newInitialHandshakeRejectTestAdapter() *initialHandshakeRejectTestAdapter {

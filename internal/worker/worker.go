@@ -137,7 +137,8 @@ func (w *Worker) Run() error {
 
 	if err := w.startCli(); err != nil {
 		_ = conn.Close()
-		return err
+		w.cleanup(false)
+		return fmt.Errorf("start cli: %w", err)
 	}
 	cleanupInitialFailure := true
 	defer func() {
@@ -273,7 +274,7 @@ func (w *Worker) reconnectToDaemon() {
 			var rejected *workerHandshakeRejectedError
 			if errors.As(err, &rejected) {
 				log.Printf("[worker:%s] reconnect rejected: %s", safeShortID(w.sessionID), rejected.payload)
-				w.Cancel()
+				w.cleanup(false)
 				return
 			}
 			log.Printf("[worker:%s] reconnect ready: %v", safeShortID(w.sessionID), err)
