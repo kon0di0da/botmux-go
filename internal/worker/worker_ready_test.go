@@ -312,6 +312,181 @@ func TestWorkerHandshakeRejectsMalformedAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestWorkerHandshakeRejectsInvalidJSONAcknowledgement(t *testing.T) {
+	const sessionID = "worker-invalid-json-ack"
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "plain text", raw: "not-json\n"},
+		{name: "malformed object", raw: "{bad}\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			daemonConn, workerConn := net.Pipe()
+			handshakeWorker := New(Options{
+				SessionID:  sessionID,
+				DaemonAddr: "daemon-test",
+				CliType:    "mock",
+			})
+			handshakePeerDone := make(chan error, 1)
+			go func() {
+				defer daemonConn.Close()
+				msg, err := protocol.NewMessageReader(daemonConn).Read()
+				if err != nil {
+					handshakePeerDone <- fmt.Errorf("read ready: %w", err)
+					return
+				}
+				if msg.Type != protocol.MsgReady {
+					handshakePeerDone <- fmt.Errorf("message type = %s, want %s", msg.Type, protocol.MsgReady)
+					return
+				}
+				_, err = io.WriteString(daemonConn, tt.raw)
+				handshakePeerDone <- err
+			}()
+
+			_, err := handshakeWorker.readyHandshake(workerConn)
+			_ = workerConn.Close()
+			var rejected *workerHandshakeRejectedError
+			if !errors.As(err, &rejected) {
+				t.Errorf("readyHandshake error = %T (%v), want workerHandshakeRejectedError", err, err)
+			}
+			select {
+			case err := <-handshakePeerDone:
+				if err != nil {
+					t.Fatalf("send invalid JSON acknowledgement: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("handshake peer did not finish")
+			}
+
+			oldDaemonConn, oldWorkerConn := net.Pipe()
+			newDaemonConn, newWorkerConn := net.Pipe()
+			reconnectWorker := New(Options{
+				SessionID:  sessionID,
+				DaemonAddr: "daemon-test",
+				CliType:    "mock",
+			})
+			reconnectWorker.conn = oldWorkerConn
+			reconnectWorker.msgReader = protocol.NewMessageReader(oldWorkerConn)
+			reconnectWorker.reconnectSleep = func(time.Duration) {}
+
+			var dialCalls atomic.Int32
+			secondDial := make(chan struct{}, 1)
+			reconnectWorker.dial = func(string, string) (net.Conn, error) {
+				if dialCalls.Add(1) == 1 {
+					return newWorkerConn, nil
+				}
+				select {
+				case secondDial <- struct{}{}:
+				default:
+				}
+				<-reconnectWorker.ctx.Done()
+				return nil, reconnectWorker.ctx.Err()
+			}
+			t.Cleanup(func() {
+				reconnectWorker.Cancel()
+				_ = oldDaemonConn.Close()
+				_ = newDaemonConn.Close()
+			})
+
+			reconnectPeerDone := make(chan error, 1)
+			go func() {
+				defer newDaemonConn.Close()
+				msg, err := protocol.NewMessageReader(newDaemonConn).Read()
+				if err != nil {
+					reconnectPeerDone <- fmt.Errorf("read reconnect ready: %w", err)
+					return
+				}
+				if msg.Type != protocol.MsgReady {
+					reconnectPeerDone <- fmt.Errorf("reconnect message type = %s, want %s", msg.Type, protocol.MsgReady)
+					return
+				}
+				_, err = io.WriteString(newDaemonConn, tt.raw)
+				reconnectPeerDone <- err
+			}()
+
+			reconnectDone := make(chan struct{})
+			go func() {
+				reconnectWorker.reconnectToDaemon()
+				close(reconnectDone)
+			}()
+
+			select {
+			case <-reconnectDone:
+			case <-secondDial:
+				t.Fatal("reconnect retried after invalid JSON acknowledgement")
+			case <-time.After(time.Second):
+				t.Fatal("reconnect did not stop after invalid JSON acknowledgement")
+			}
+			if got := dialCalls.Load(); got != 1 {
+				t.Errorf("dial calls = %d, want 1", got)
+			}
+			if !reconnectWorker.isClosed() {
+				t.Error("worker was not cleaned up after invalid JSON acknowledgement")
+			}
+			reconnectWorker.connMu.Lock()
+			publishedConn := reconnectWorker.conn
+			reconnectWorker.connMu.Unlock()
+			if publishedConn != nil {
+				t.Error("worker retained a connection after invalid JSON acknowledgement")
+			}
+			select {
+			case err := <-reconnectPeerDone:
+				if err != nil {
+					t.Fatalf("send reconnect invalid JSON acknowledgement: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("reconnect peer did not finish")
+			}
+		})
+	}
+}
+
+func TestWorkerHandshakeKeepsConnectionCloseTemporary(t *testing.T) {
+	daemonConn, workerConn := net.Pipe()
+	t.Cleanup(func() { _ = workerConn.Close() })
+
+	w := New(Options{
+		SessionID:  "worker-closed-ack",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	peerDone := make(chan error, 1)
+	go func() {
+		defer daemonConn.Close()
+		msg, err := protocol.NewMessageReader(daemonConn).Read()
+		if err != nil {
+			peerDone <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			peerDone <- fmt.Errorf("message type = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		peerDone <- nil
+	}()
+
+	_, err := w.readyHandshake(workerConn)
+	var rejected *workerHandshakeRejectedError
+	if errors.As(err, &rejected) {
+		t.Fatalf("readyHandshake error = %T (%v), want temporary connection error", err, err)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("readyHandshake error = %v, want EOF", err)
+	}
+	select {
+	case err := <-peerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handshake peer did not finish")
+	}
+}
+
 func TestWorkerReadyIncludesInstanceID(t *testing.T) {
 	daemonConn, workerConn := net.Pipe()
 	defer daemonConn.Close()

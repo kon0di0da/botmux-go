@@ -348,7 +348,13 @@ func (w *Worker) readyHandshake(conn net.Conn) (*protocol.MessageReader, error) 
 	reader := protocol.NewMessageReader(conn)
 	msg, err := reader.Read()
 	if err != nil {
-		return nil, fmt.Errorf("read ready acknowledgment: %w", err)
+		var netErr net.Error
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) || errors.As(err, &netErr) {
+			return nil, fmt.Errorf("read ready acknowledgment: %w", err)
+		}
+		return nil, &workerHandshakeRejectedError{
+			payload: fmt.Sprintf("invalid ready acknowledgment: %v", err),
+		}
 	}
 	if msg.Type == protocol.MsgError {
 		return nil, &workerHandshakeRejectedError{payload: msg.Payload}
