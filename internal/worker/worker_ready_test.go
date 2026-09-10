@@ -1,9 +1,11 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -218,6 +220,195 @@ func TestWorkerSendsReadyBeforeOutputEvents(t *testing.T) {
 	}
 }
 
+func TestWorkerDoesNotProcessInputBeforeReadySendSucceeds(t *testing.T) {
+	daemonConn, workerConn := net.Pipe()
+	blockingConn := newBlockingWriteConn(workerConn)
+	cli := newReadyBarrierTestAdapter()
+	w := New(Options{
+		SessionID:  "worker-ready-input-barrier",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	w.cliAdapter = cli
+	w.dial = func(string, string) (net.Conn, error) {
+		return blockingConn, nil
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run() }()
+	runExited := false
+	t.Cleanup(func() {
+		blockingConn.releaseWrite()
+		w.Cancel()
+		_ = cli.Close()
+		_ = daemonConn.Close()
+		if !runExited {
+			select {
+			case <-runDone:
+			case <-time.After(time.Second):
+				t.Error("worker did not exit during cleanup")
+			}
+		}
+	})
+
+	waitForSignal(t, blockingConn.writeStarted, "ready write to start")
+
+	inputWrite := make(chan error, 1)
+	go func() {
+		_, err := protocol.NewMessage(protocol.MsgUserInput, w.sessionID, "hello").WriteTo(daemonConn)
+		inputWrite <- err
+	}()
+	select {
+	case err := <-inputWrite:
+		if err != nil {
+			t.Fatalf("send user input: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("user input write did not complete")
+	}
+
+	select {
+	case <-w.readyCh:
+		t.Fatal("ready barrier opened before ready send completed")
+	default:
+	}
+	select {
+	case <-cli.sendStarted:
+		t.Fatal("adapter Send started before ready send completed")
+	default:
+	}
+
+	readyMsg := make(chan *protocol.Message, 1)
+	readyErr := make(chan error, 1)
+	go func() {
+		msg, err := protocol.DecodeMessage(daemonConn)
+		if err != nil {
+			readyErr <- err
+			return
+		}
+		readyMsg <- msg
+	}()
+	blockingConn.releaseWrite()
+
+	select {
+	case err := <-readyErr:
+		t.Fatalf("read ready message: %v", err)
+	case msg := <-readyMsg:
+		if msg.Type != protocol.MsgReady {
+			t.Fatalf("first worker message = %s, want %s", msg.Type, protocol.MsgReady)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ready send did not complete")
+	}
+	waitForSignal(t, cli.sendStarted, "adapter Send after ready")
+
+	if _, err := protocol.NewMessage(protocol.MsgClose, w.sessionID, "").WriteTo(daemonConn); err != nil {
+		t.Fatalf("send close: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		runExited = true
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not exit after MsgClose")
+	}
+}
+
+func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
+	oldDaemonConn, oldWorkerConn := net.Pipe()
+	newDaemonConn, newWorkerConn := net.Pipe()
+	blockingConn := newBlockingWriteConn(newWorkerConn)
+	w := New(Options{
+		SessionID:        "worker-reconnect-ready",
+		WorkerInstanceID: "nonce-reconnect-123",
+		DaemonAddr:       "daemon-test",
+		CliType:          "mock",
+	})
+	w.conn = oldWorkerConn
+	w.msgReader = protocol.NewMessageReader(oldWorkerConn)
+	w.dial = func(string, string) (net.Conn, error) {
+		return blockingConn, nil
+	}
+	w.reconnectSleep = func(time.Duration) {}
+	t.Cleanup(func() {
+		blockingConn.releaseWrite()
+		w.Cancel()
+		_ = oldDaemonConn.Close()
+		_ = newDaemonConn.Close()
+	})
+
+	oldConnClosed := make(chan struct{})
+	go func() {
+		var buf [1]byte
+		_, _ = oldDaemonConn.Read(buf[:])
+		close(oldConnClosed)
+	}()
+
+	go w.reconnectToDaemon()
+	waitForSignal(t, blockingConn.writeStarted, "reconnect ready write to start")
+
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != oldWorkerConn {
+		t.Fatal("reconnect published the new connection before READY completed")
+	}
+	if w.isConnected() {
+		t.Fatal("reconnect marked worker connected before READY completed")
+	}
+
+	readyMsg := make(chan *protocol.Message, 1)
+	readyErr := make(chan error, 1)
+	go func() {
+		msg, err := protocol.DecodeMessage(newDaemonConn)
+		if err != nil {
+			readyErr <- err
+			return
+		}
+		readyMsg <- msg
+	}()
+	blockingConn.releaseWrite()
+
+	select {
+	case err := <-readyErr:
+		t.Fatalf("read reconnect ready message: %v", err)
+	case msg := <-readyMsg:
+		if msg.Type != protocol.MsgReady {
+			t.Fatalf("first reconnect message = %s, want %s", msg.Type, protocol.MsgReady)
+		}
+		if msg.WorkerInstanceID != "nonce-reconnect-123" {
+			t.Fatalf("reconnect worker instance ID = %q, want %q", msg.WorkerInstanceID, "nonce-reconnect-123")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconnect ready send did not complete")
+	}
+
+	waitForSignal(t, oldConnClosed, "old connection to close after reconnect")
+	w.connMu.Lock()
+	publishedConn = w.conn
+	w.connMu.Unlock()
+	if publishedConn != blockingConn {
+		t.Fatal("reconnect did not publish the ready connection")
+	}
+	if !w.isConnected() {
+		t.Fatal("reconnect did not mark worker connected after READY")
+	}
+
+	writes := blockingConn.writes()
+	if len(writes) == 0 {
+		t.Fatal("reconnect did not write to the new connection")
+	}
+	first, err := protocol.DecodeMessage(bytes.NewReader(writes[0]))
+	if err != nil {
+		t.Fatalf("decode first reconnect write: %v", err)
+	}
+	if first.Type != protocol.MsgReady {
+		t.Fatalf("first reconnect write = %s, want %s", first.Type, protocol.MsgReady)
+	}
+}
+
 type delayedReadyTestAdapter struct {
 	ready   <-chan error
 	outputR *io.PipeReader
@@ -308,4 +499,85 @@ func (a *readyOutputTestAdapter) Close() error {
 	}
 	_ = a.outputR.Close()
 	return a.outputW.Close()
+}
+
+type readyBarrierTestAdapter struct {
+	sendStarted chan struct{}
+	outputR     *io.PipeReader
+	outputW     *io.PipeWriter
+}
+
+func newReadyBarrierTestAdapter() *readyBarrierTestAdapter {
+	outputR, outputW := io.Pipe()
+	return &readyBarrierTestAdapter{
+		sendStarted: make(chan struct{}),
+		outputR:     outputR,
+		outputW:     outputW,
+	}
+}
+
+func (a *readyBarrierTestAdapter) Name() string {
+	return "ready-barrier-test"
+}
+
+func (a *readyBarrierTestAdapter) Start(context.Context, string) (*adapter.CliStartResult, error) {
+	return &adapter.CliStartResult{
+		Output: a.outputR,
+		ErrCh:  make(chan error),
+	}, nil
+}
+
+func (a *readyBarrierTestAdapter) Send(context.Context, string) (adapter.SendResult, error) {
+	close(a.sendStarted)
+	return adapter.SendResult{}, nil
+}
+
+func (a *readyBarrierTestAdapter) Close() error {
+	_ = a.outputR.Close()
+	return a.outputW.Close()
+}
+
+type blockingWriteConn struct {
+	net.Conn
+
+	writeStarted chan struct{}
+	release      chan struct{}
+
+	startOnce    sync.Once
+	releaseOnce  sync.Once
+	writesMu     sync.Mutex
+	writeRecords [][]byte
+}
+
+func newBlockingWriteConn(conn net.Conn) *blockingWriteConn {
+	return &blockingWriteConn{
+		Conn:         conn,
+		writeStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+}
+
+func (c *blockingWriteConn) Write(data []byte) (int, error) {
+	copied := append([]byte(nil), data...)
+	c.writesMu.Lock()
+	c.writeRecords = append(c.writeRecords, copied)
+	c.writesMu.Unlock()
+	c.startOnce.Do(func() { close(c.writeStarted) })
+	<-c.release
+	return c.Conn.Write(data)
+}
+
+func (c *blockingWriteConn) releaseWrite() {
+	c.releaseOnce.Do(func() { close(c.release) })
+}
+
+func (c *blockingWriteConn) writes() [][]byte {
+	c.writesMu.Lock()
+	defer c.writesMu.Unlock()
+
+	writes := make([][]byte, len(c.writeRecords))
+	for i, data := range c.writeRecords {
+		writes[i] = append([]byte(nil), data...)
+	}
+	return writes
 }

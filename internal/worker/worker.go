@@ -45,6 +45,8 @@ type Worker struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	heartbeatInterval time.Duration
+	dial              func(network, address string) (net.Conn, error)
+	reconnectSleep    func(time.Duration)
 
 	wg      sync.WaitGroup
 	readyCh chan struct{}
@@ -96,6 +98,8 @@ func New(opts Options) *Worker {
 		ctx:                  ctx,
 		cancel:               cancel,
 		heartbeatInterval:    5 * time.Second,
+		dial:                 net.Dial,
+		reconnectSleep:       time.Sleep,
 		readyCh:              make(chan struct{}),
 		daemonDisconnectedCh: make(chan struct{}, 1),
 		deduper:              NewLineDeduper(400),
@@ -129,11 +133,10 @@ func (w *Worker) Run() error {
 		return err
 	}
 
-	close(w.readyCh)
-
 	if err := w.sendReady(); err != nil {
 		return err
 	}
+	close(w.readyCh)
 
 	goroutines := 2
 	if w.startResult.Events != nil {
@@ -188,7 +191,7 @@ func (w *Worker) connectToDaemon() error {
 	var err error
 	backoff := 100 * time.Millisecond
 	for attempt := 0; attempt < 20; attempt++ {
-		conn, err = net.Dial("tcp", w.daemonAddr)
+		conn, err = w.dial("tcp", w.daemonAddr)
 		if err == nil {
 			break
 		}
@@ -224,23 +227,27 @@ func (w *Worker) reconnectToDaemon() {
 			}
 		}
 		log.Printf("[worker:%s] reconnect attempt %d (backoff=%v)...", safeShortID(w.sessionID), attempt+1, backoff)
-		time.Sleep(backoff)
+		w.reconnectSleep(backoff)
 
-		conn, err := net.Dial("tcp", w.daemonAddr)
+		conn, err := w.dial("tcp", w.daemonAddr)
 		if err != nil {
 			continue
 		}
-		w.setConnected(true)
+		if err := w.sendReadyTo(conn); err != nil {
+			_ = conn.Close()
+			log.Printf("[worker:%s] reconnect ready: %v", safeShortID(w.sessionID), err)
+			continue
+		}
 		w.connMu.Lock()
 		oldConn := w.conn
 		w.conn = conn
 		w.msgReader = protocol.NewMessageReader(conn)
 		w.connMu.Unlock()
+		w.setConnected(true)
 		if oldConn != nil {
 			_ = oldConn.Close()
 		}
 
-		_ = w.sendReady()
 		log.Printf("[worker:%s] reconnected to daemon (attempt %d)", safeShortID(w.sessionID), attempt+1)
 		return
 	}
@@ -271,7 +278,20 @@ func (w *Worker) startCli() error {
 }
 
 func (w *Worker) sendReady() error {
-	return w.sendMessage(protocol.MsgReady, "ready")
+	w.connMu.Lock()
+	conn := w.conn
+	w.connMu.Unlock()
+	return w.sendReadyTo(conn)
+}
+
+func (w *Worker) sendReadyTo(conn net.Conn) error {
+	if conn == nil {
+		return errors.New("connection closed")
+	}
+	m := protocol.NewMessage(protocol.MsgReady, w.sessionID, "ready")
+	m.WorkerInstanceID = w.workerInstanceID
+	_, err := m.WriteTo(conn)
+	return err
 }
 
 func (w *Worker) sendError(msg string) {
