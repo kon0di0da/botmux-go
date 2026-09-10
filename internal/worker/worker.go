@@ -38,6 +38,7 @@ type Worker struct {
 
 	conn      net.Conn
 	connMu    sync.Mutex
+	sendMu    sync.Mutex
 	msgReader *protocol.MessageReader
 
 	startResult *adapter.CliStartResult
@@ -45,6 +46,7 @@ type Worker struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	heartbeatInterval time.Duration
+	heartbeatTicks    <-chan time.Time
 	dial              func(network, address string) (net.Conn, error)
 	reconnectSleep    func(time.Duration)
 
@@ -204,9 +206,11 @@ func (w *Worker) connectToDaemon() error {
 	if err != nil {
 		return fmt.Errorf("connect daemon %s: %w", w.daemonAddr, err)
 	}
-	w.setConnected(true)
+	w.connMu.Lock()
 	w.conn = conn
 	w.msgReader = protocol.NewMessageReader(conn)
+	w.connMu.Unlock()
+	w.setConnected(true)
 	log.Printf("[worker:%s] connected to daemon %s", safeShortID(w.sessionID), w.daemonAddr)
 	return nil
 }
@@ -299,14 +303,17 @@ func (w *Worker) sendError(msg string) {
 }
 
 func (w *Worker) sendMessage(typ protocol.MessageType, payload string) error {
+	w.sendMu.Lock()
+	defer w.sendMu.Unlock()
 	w.connMu.Lock()
-	defer w.connMu.Unlock()
-	if w.conn == nil {
+	conn := w.conn
+	w.connMu.Unlock()
+	if conn == nil {
 		return errors.New("connection closed")
 	}
 	m := protocol.NewMessage(typ, w.sessionID, payload)
 	m.WorkerInstanceID = w.workerInstanceID
-	_, err := m.WriteTo(w.conn)
+	_, err := m.WriteTo(conn)
 	return err
 }
 
@@ -710,13 +717,18 @@ type readResult struct {
 
 func (w *Worker) sendHeartbeats() {
 	defer w.wg.Done()
-	ticker := time.NewTicker(w.heartbeatInterval)
-	defer ticker.Stop()
+	ticks := w.heartbeatTicks
+	var ticker *time.Ticker
+	if ticks == nil {
+		ticker = time.NewTicker(w.heartbeatInterval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
 	for {
 		select {
 		case <-w.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			if err := w.sendMessage(protocol.MsgHeartbeat, ""); err != nil {
 				w.setConnected(false)
 				go w.reconnectToDaemon()
@@ -736,10 +748,13 @@ func (w *Worker) Cancel() {
 	w.cancelActiveTurn()
 	w.cancel()
 	w.connMu.Lock()
-	if w.conn != nil {
-		_ = w.conn.Close()
-	}
+	conn := w.conn
+	w.conn = nil
+	w.msgReader = nil
 	w.connMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 func (w *Worker) isClosed() bool {
@@ -769,11 +784,13 @@ func (w *Worker) cleanup(markClosed bool) {
 		_ = w.cliAdapter.Close()
 	}
 	w.connMu.Lock()
-	if w.conn != nil {
-		w.conn.Close()
-		w.conn = nil
-	}
+	conn := w.conn
+	w.conn = nil
+	w.msgReader = nil
 	w.connMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 	if markClosed && w.storeDir != "" {
 		store := daemon.NewSessionStore(w.storeDir)
 		_ = store.MarkClosed(w.sessionID)

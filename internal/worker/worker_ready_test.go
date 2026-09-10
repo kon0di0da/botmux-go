@@ -70,14 +70,16 @@ func TestWorkerSendsReadyBeforeHeartbeats(t *testing.T) {
 	t.Cleanup(func() { _ = listener.Close() })
 
 	ready := make(chan error, 1)
+	ticks := make(chan time.Time, 1)
 	cli := newDelayedReadyTestAdapter(ready)
 	w := New(Options{
-		SessionID:  "worker-ready-order",
-		DaemonAddr: listener.Addr().String(),
-		CliType:    "mock",
+		SessionID:        "worker-ready-order",
+		WorkerInstanceID: "nonce-heartbeat-123",
+		DaemonAddr:       listener.Addr().String(),
+		CliType:          "mock",
 	})
 	w.cliAdapter = cli
-	w.heartbeatInterval = 20 * time.Millisecond
+	w.heartbeatTicks = ticks
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- w.Run() }()
@@ -100,16 +102,46 @@ func TestWorkerSendsReadyBeforeHeartbeats(t *testing.T) {
 		}
 	})
 
-	time.AfterFunc(6*w.heartbeatInterval, func() { ready <- nil })
-	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
+	reader := protocol.NewMessageReader(conn)
+	ticks <- time.Now()
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("set pre-ready read deadline: %v", err)
 	}
-	first, readErr := protocol.NewMessageReader(conn).Read()
-	if readErr != nil {
-		t.Fatalf("read first worker message: %v", readErr)
+	if msg, err := reader.Read(); err == nil {
+		t.Fatalf("worker sent %s before ready: %#v", msg.Type, msg)
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("read before ready: %v, want timeout", err)
+	}
+	if len(ticks) != 1 {
+		t.Fatalf("queued heartbeat tick was consumed before ready")
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear pre-ready read deadline: %v", err)
+	}
+
+	ready <- nil
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set post-ready read deadline: %v", err)
+	}
+	first, err := reader.Read()
+	if err != nil {
+		t.Fatalf("read ready message: %v", err)
 	}
 	if first.Type != protocol.MsgReady {
 		t.Fatalf("first worker message = %s, want %s", first.Type, protocol.MsgReady)
+	}
+	if first.WorkerInstanceID != "nonce-heartbeat-123" {
+		t.Fatalf("ready worker instance ID = %q, want %q", first.WorkerInstanceID, "nonce-heartbeat-123")
+	}
+	heartbeat, err := reader.Read()
+	if err != nil {
+		t.Fatalf("read queued heartbeat: %v", err)
+	}
+	if heartbeat.Type != protocol.MsgHeartbeat {
+		t.Fatalf("post-ready message = %s, want %s", heartbeat.Type, protocol.MsgHeartbeat)
+	}
+	if heartbeat.WorkerInstanceID != "nonce-heartbeat-123" {
+		t.Fatalf("heartbeat worker instance ID = %q, want %q", heartbeat.WorkerInstanceID, "nonce-heartbeat-123")
 	}
 
 	if _, err := protocol.NewMessage(protocol.MsgClose, w.sessionID, "").WriteTo(conn); err != nil {
@@ -409,6 +441,83 @@ func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
 	}
 }
 
+func TestWorkerReconnectPublishesConnectionDespiteBlockedOldWrite(t *testing.T) {
+	oldDaemonConn, oldWorkerConn := net.Pipe()
+	blockedOldConn := newCloseBlockingWriteConn(oldWorkerConn)
+	newConn := &recordingConn{}
+	w := New(Options{
+		SessionID:        "worker-reconnect-blocked-write",
+		WorkerInstanceID: "nonce-blocked-write-123",
+		DaemonAddr:       "daemon-test",
+		CliType:          "mock",
+	})
+	w.conn = blockedOldConn
+	w.msgReader = protocol.NewMessageReader(blockedOldConn)
+	w.dial = func(string, string) (net.Conn, error) {
+		return newConn, nil
+	}
+	w.reconnectSleep = func(time.Duration) {}
+
+	sendDone := make(chan error, 1)
+	senderExited := make(chan struct{})
+	reconnectDone := make(chan struct{})
+	t.Cleanup(func() {
+		_ = blockedOldConn.Close()
+		w.Cancel()
+		_ = oldDaemonConn.Close()
+		_ = newConn.Close()
+		select {
+		case <-senderExited:
+		case <-time.After(time.Second):
+			t.Error("blocked send did not exit during cleanup")
+		}
+	})
+
+	go func() {
+		defer close(senderExited)
+		sendDone <- w.sendMessage(protocol.MsgOutput, "blocked")
+	}()
+	waitForSignal(t, blockedOldConn.writeStarted, "old write to start")
+
+	go func() {
+		w.reconnectToDaemon()
+		close(reconnectDone)
+	}()
+
+	waitForSignal(t, reconnectDone, "reconnect to publish a ready connection")
+
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != newConn {
+		t.Fatal("reconnect did not publish the replacement connection")
+	}
+
+	writes := newConn.writes()
+	if len(writes) != 1 {
+		t.Fatalf("new connection writes = %d, want 1", len(writes))
+	}
+	ready, err := protocol.DecodeMessage(bytes.NewReader(writes[0]))
+	if err != nil {
+		t.Fatalf("decode reconnect ready: %v", err)
+	}
+	if ready.Type != protocol.MsgReady {
+		t.Fatalf("reconnect message type = %s, want %s", ready.Type, protocol.MsgReady)
+	}
+	if ready.WorkerInstanceID != "nonce-blocked-write-123" {
+		t.Fatalf("reconnect worker instance ID = %q, want %q", ready.WorkerInstanceID, "nonce-blocked-write-123")
+	}
+
+	select {
+	case err := <-sendDone:
+		if err == nil {
+			t.Fatal("old write unexpectedly succeeded after the stale connection closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closing the stale connection did not unblock the old write")
+	}
+}
+
 type delayedReadyTestAdapter struct {
 	ready   <-chan error
 	outputR *io.PipeReader
@@ -580,4 +689,100 @@ func (c *blockingWriteConn) writes() [][]byte {
 		writes[i] = append([]byte(nil), data...)
 	}
 	return writes
+}
+
+type closeBlockingWriteConn struct {
+	net.Conn
+
+	writeStarted chan struct{}
+	closed       chan struct{}
+	startOnce    sync.Once
+	closeOnce    sync.Once
+}
+
+func newCloseBlockingWriteConn(conn net.Conn) *closeBlockingWriteConn {
+	return &closeBlockingWriteConn{
+		Conn:         conn,
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (c *closeBlockingWriteConn) Write([]byte) (int, error) {
+	c.startOnce.Do(func() { close(c.writeStarted) })
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *closeBlockingWriteConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+type recordingConn struct {
+	writesMu sync.Mutex
+	writesV  [][]byte
+	closed   bool
+}
+
+func (c *recordingConn) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (c *recordingConn) Write(data []byte) (int, error) {
+	c.writesMu.Lock()
+	defer c.writesMu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	c.writesV = append(c.writesV, append([]byte(nil), data...))
+	return len(data), nil
+}
+
+func (c *recordingConn) Close() error {
+	c.writesMu.Lock()
+	c.closed = true
+	c.writesMu.Unlock()
+	return nil
+}
+
+func (c *recordingConn) LocalAddr() net.Addr {
+	return testAddr("local")
+}
+
+func (c *recordingConn) RemoteAddr() net.Addr {
+	return testAddr("remote")
+}
+
+func (c *recordingConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *recordingConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *recordingConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (c *recordingConn) writes() [][]byte {
+	c.writesMu.Lock()
+	defer c.writesMu.Unlock()
+
+	writes := make([][]byte, len(c.writesV))
+	for i, data := range c.writesV {
+		writes[i] = append([]byte(nil), data...)
+	}
+	return writes
+}
+
+type testAddr string
+
+func (a testAddr) Network() string {
+	return "test"
+}
+
+func (a testAddr) String() string {
+	return string(a)
 }
