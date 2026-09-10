@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"botmux-go/internal/config"
 	"botmux-go/internal/protocol"
 )
 
@@ -366,5 +367,175 @@ func TestPersistCurrentSessionSkipsStaleMeta(t *testing.T) {
 	}
 	if len(got.LastOutput) != 1 || got.LastOutput[0] != "replacement output" {
 		t.Fatalf("replacement LastOutput = %#v, want unchanged output", got.LastOutput)
+	}
+}
+
+func TestPurgeSessionDoesNotHoldGlobalMapsDuringFileRemove(t *testing.T) {
+	const sessionID = "slow-purge"
+
+	meta := NewSessionMeta(sessionID, "bot-test")
+	d := &Daemon{
+		sessions: map[string]*SessionMeta{sessionID: meta},
+		workers:  make(map[string]*WorkerHandle),
+		store:    NewSessionStore(t.TempDir()),
+	}
+	if err := d.store.save(meta.ToPersisted()); err != nil {
+		t.Fatalf("persist session fixture: %v", err)
+	}
+
+	removeStarted := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseRemove)
+		}
+	}()
+	d.store.beforeRemove = func() {
+		close(removeStarted)
+		<-releaseRemove
+	}
+
+	purgeDone := make(chan struct{})
+	go func() {
+		d.PurgeSession(sessionID)
+		close(purgeDone)
+	}()
+
+	select {
+	case <-removeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("PurgeSession did not reach file removal")
+	}
+
+	mapReadDone := make(chan struct{})
+	go func() {
+		d.sessionsMu.RLock()
+		d.sessionsMu.RUnlock()
+		close(mapReadDone)
+	}()
+	select {
+	case <-mapReadDone:
+	case <-time.After(time.Second):
+		t.Fatal("sessionsMu remained locked while session file removal was blocked")
+	}
+
+	close(releaseRemove)
+	released = true
+	select {
+	case <-purgeDone:
+	case <-time.After(time.Second):
+		t.Fatal("PurgeSession did not finish after file removal was released")
+	}
+}
+
+func TestPurgeAndNewSameSessionIDSerializeFileLifecycle(t *testing.T) {
+	const sessionID = "purge-recreate"
+
+	cfg := config.DefaultConfig()
+	cfg.SessionsDir = t.TempDir()
+	cfg.Bots[0].BotID = "bot-replacement"
+	oldMeta := NewSessionMeta(sessionID, "bot-old")
+	d := &Daemon{
+		cfg:      cfg,
+		selfExe:  "",
+		sessions: map[string]*SessionMeta{sessionID: oldMeta},
+		workers:  make(map[string]*WorkerHandle),
+		store:    NewSessionStore(cfg.SessionsDir),
+	}
+	if err := d.store.save(oldMeta.ToPersisted()); err != nil {
+		t.Fatalf("persist old session fixture: %v", err)
+	}
+
+	removeStarted := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseRemove)
+		}
+	}()
+	replacementSaved := make(chan struct{})
+	d.store.beforeRemove = func() {
+		close(removeStarted)
+		<-releaseRemove
+	}
+	d.store.beforeSave = func(ps *PersistedSession) {
+		if ps.SessionID == sessionID && ps.BotID == "bot-replacement" {
+			close(replacementSaved)
+		}
+	}
+
+	purgeDone := make(chan struct{})
+	go func() {
+		d.PurgeSession(sessionID)
+		close(purgeDone)
+	}()
+	select {
+	case <-removeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("PurgeSession did not reach file removal")
+	}
+
+	newStarted := make(chan struct{})
+	newDone := make(chan error, 1)
+	go func() {
+		close(newStarted)
+		_, err := d.NewSession(NewSessionOpts{
+			SessionID: sessionID,
+			BotID:     "bot-replacement",
+		})
+		newDone <- err
+	}()
+	<-newStarted
+
+	replacementFileLockAcquired := make(chan struct{})
+	go func() {
+		unlock := d.lockSessionFile(sessionID)
+		close(replacementFileLockAcquired)
+		unlock()
+	}()
+
+	select {
+	case <-replacementSaved:
+		t.Fatal("replacement session persisted before old file removal was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case <-replacementFileLockAcquired:
+		t.Fatal("same-ID file lock was available while old file removal was blocked")
+	case <-time.After(time.Second):
+	}
+
+	close(releaseRemove)
+	released = true
+	select {
+	case <-purgeDone:
+	case <-time.After(time.Second):
+		t.Fatal("PurgeSession did not finish after file removal was released")
+	}
+	select {
+	case <-replacementFileLockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("same-ID file lock was not released after purge")
+	}
+	if err := <-newDone; err == nil {
+		t.Fatal("NewSession unexpectedly spawned a worker with an empty executable")
+	}
+	select {
+	case <-replacementSaved:
+	case <-time.After(time.Second):
+		t.Fatal("replacement session was not persisted after old file removal completed")
+	}
+
+	persisted, err := d.store.load(sessionID)
+	if err != nil {
+		t.Fatalf("load replacement session: %v", err)
+	}
+	if persisted.BotID != "bot-replacement" {
+		t.Fatalf("persisted BotID = %q, want replacement", persisted.BotID)
+	}
+	if persisted.Closed {
+		t.Fatal("replacement session persisted as closed")
 	}
 }

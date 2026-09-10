@@ -28,8 +28,9 @@ type PersistedSession struct {
 type SessionStore struct {
 	mu  sync.Mutex
 	dir string
-	// beforeSave is a test hook. Production stores leave it nil.
-	beforeSave func(*PersistedSession)
+	// beforeSave and beforeRemove are test hooks. Production stores leave them nil.
+	beforeSave   func(*PersistedSession)
+	beforeRemove func()
 }
 
 func NewSessionStore(dir string) *SessionStore {
@@ -117,6 +118,9 @@ func (s *SessionStore) remove(sessionID string) error {
 }
 
 func (s *SessionStore) removeLocked(sessionID string) error {
+	if s.beforeRemove != nil {
+		s.beforeRemove()
+	}
 	path := filepath.Join(s.dir, sessionID+".json")
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err

@@ -48,6 +48,9 @@ type Daemon struct {
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*SessionMeta
+	// sessionFileLocks serializes lifecycle filesystem operations by session ID.
+	sessionFileLocksMu sync.Mutex
+	sessionFileLocks   map[string]*sync.Mutex
 	// pendingRestart identifies the worker generation that must not reopen a
 	// recovering session with a late READY.
 	pendingRestart map[*SessionMeta]*WorkerHandle
@@ -82,17 +85,36 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Daemon{
-		cfg:            cfg,
-		selfExe:        exe,
-		store:          NewSessionStore(cfg.SessionsDir),
-		ctx:            ctx,
-		cancel:         cancel,
-		sessions:       make(map[string]*SessionMeta),
-		workers:        make(map[string]*WorkerHandle),
-		workerOwners:   make(map[*WorkerHandle]*SessionMeta),
-		connToSess:     make(map[net.Conn]string),
-		pendingRestart: make(map[*SessionMeta]*WorkerHandle),
+		cfg:              cfg,
+		selfExe:          exe,
+		store:            NewSessionStore(cfg.SessionsDir),
+		ctx:              ctx,
+		cancel:           cancel,
+		sessions:         make(map[string]*SessionMeta),
+		sessionFileLocks: make(map[string]*sync.Mutex),
+		workers:          make(map[string]*WorkerHandle),
+		workerOwners:     make(map[*WorkerHandle]*SessionMeta),
+		connToSess:       make(map[net.Conn]string),
+		pendingRestart:   make(map[*SessionMeta]*WorkerHandle),
 	}, nil
+}
+
+// lockSessionFile must be acquired before workersMu or sessionsMu for a
+// session lifecycle operation that changes the session's persisted file.
+func (d *Daemon) lockSessionFile(sessionID string) func() {
+	d.sessionFileLocksMu.Lock()
+	if d.sessionFileLocks == nil {
+		d.sessionFileLocks = make(map[string]*sync.Mutex)
+	}
+	lock := d.sessionFileLocks[sessionID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		d.sessionFileLocks[sessionID] = lock
+	}
+	d.sessionFileLocksMu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (d *Daemon) Start() error {
@@ -219,19 +241,20 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 		outputNotifyCh: make(chan struct{}),
 	}
 
+	unlockFile := d.lockSessionFile(opts.SessionID)
 	d.sessionsMu.Lock()
 	if _, exists := d.sessions[opts.SessionID]; exists {
 		d.sessionsMu.Unlock()
+		unlockFile()
 		return nil, fmt.Errorf("session %s already exists", opts.SessionID)
 	}
 	d.sessions[opts.SessionID] = meta
 	d.sessionsMu.Unlock()
 
-	if err := d.persistCurrentSession(meta, func() error {
-		return d.store.save(meta.ToPersisted())
-	}); err != nil {
+	if err := d.store.save(meta.ToPersisted()); err != nil {
 		log.Printf("[daemon] warn: persist session %s failed: %v", safeShort(opts.SessionID), err)
 	}
+	unlockFile()
 
 	if err := d.spawnWorkerForSession(meta); err != nil {
 		return nil, err
@@ -474,22 +497,18 @@ func (d *Daemon) markSessionMetaClosed(meta *SessionMeta, removeWorker bool) (*W
 		return nil, false
 	}
 
+	unlockFile := d.lockSessionFile(meta.SessionID)
 	d.workersMu.Lock()
 	d.sessionsMu.Lock()
 	if !d.isCurrentSessionLocked(meta) {
 		d.sessionsMu.Unlock()
 		d.workersMu.Unlock()
+		unlockFile()
 		return nil, false
 	}
 
 	meta.Closed = true
 	meta.Status = StatusClosed
-	// Keep the ID's current meta locked through persistence so a purge and
-	// recreate cannot make this close affect the replacement session.
-	if err := d.store.MarkClosed(meta.SessionID); err != nil {
-		log.Printf("[daemon] session %s persist closed state: %v", safeShort(meta.SessionID), err)
-	}
-
 	h := d.workers[meta.SessionID]
 	if h == nil || !d.workerOwnedByMetaLocked(h, meta) {
 		h = nil
@@ -499,10 +518,16 @@ func (d *Daemon) markSessionMetaClosed(meta *SessionMeta, removeWorker bool) (*W
 	d.sessionsMu.Unlock()
 	d.workersMu.Unlock()
 
+	if err := d.store.MarkClosed(meta.SessionID); err != nil {
+		log.Printf("[daemon] session %s persist closed state: %v", safeShort(meta.SessionID), err)
+	}
+	unlockFile()
+
 	return h, true
 }
 
 func (d *Daemon) PurgeSession(id string) {
+	unlockFile := d.lockSessionFile(id)
 	d.workersMu.Lock()
 	d.sessionsMu.Lock()
 	h, hasHandle := d.workers[id]
@@ -510,9 +535,11 @@ func (d *Daemon) PurgeSession(id string) {
 		d.deleteWorkerIfCurrentLocked(id, h)
 	}
 	delete(d.sessions, id)
-	_ = d.store.remove(id)
 	d.sessionsMu.Unlock()
 	d.workersMu.Unlock()
+
+	_ = d.store.remove(id)
+	unlockFile()
 
 	if hasHandle && h != nil {
 		h.CloseConn()
@@ -781,14 +808,15 @@ func (d *Daemon) persistCurrentSession(meta *SessionMeta, fn func() error) error
 	if meta == nil || fn == nil {
 		return nil
 	}
+	unlockFile := d.lockSessionFile(meta.SessionID)
+	defer unlockFile()
+
 	d.sessionsMu.RLock()
-	defer d.sessionsMu.RUnlock()
 	// A zero-value Daemon has no session registry and is only used by direct
 	// store tests. Running daemons initialize sessions in New.
-	if d.sessions == nil {
-		return fn()
-	}
-	if d.sessions[meta.SessionID] != meta || meta.Closed {
+	current := d.sessions == nil || (d.sessions[meta.SessionID] == meta && !meta.Closed)
+	d.sessionsMu.RUnlock()
+	if !current {
 		return nil
 	}
 	return fn()

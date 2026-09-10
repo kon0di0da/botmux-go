@@ -155,6 +155,40 @@ func TestSessionStoreMarkClosedAndRemove(t *testing.T) {
 	}
 }
 
+func TestSessionStoreBeforeRemoveRunsBeforeDelete(t *testing.T) {
+	store := NewSessionStore(t.TempDir())
+	sessionID := "session-before-remove"
+	if err := store.save(&PersistedSession{SessionID: sessionID, BotID: "bot-1"}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	removeStarted := make(chan struct{})
+	releaseRemove := make(chan struct{})
+	store.beforeRemove = func() {
+		close(removeStarted)
+		<-releaseRemove
+	}
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- store.remove(sessionID)
+	}()
+	<-removeStarted
+
+	path := filepath.Join(store.dir, sessionID+".json")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("session file missing before remove was released: %v", err)
+	}
+
+	close(releaseRemove)
+	if err := <-removeDone; err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("session file still exists after remove: %v", err)
+	}
+}
+
 func TestSessionStoreClosedSessionRejectsUpdates(t *testing.T) {
 	store := NewSessionStore(t.TempDir())
 	sessionID := "session-terminal"
