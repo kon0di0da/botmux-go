@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"net"
 	"os/exec"
 	"testing"
 	"time"
+
+	"botmux-go/internal/protocol"
 )
 
 func TestStopWaitsForWorkerExitBeforeCancelingDaemonContext(t *testing.T) {
@@ -93,6 +96,8 @@ func TestStopKillsWorkerThatMissesGracePeriod(t *testing.T) {
 func TestCloseSessionPersistsBeforeWorkerExit(t *testing.T) {
 	meta := NewSessionMeta("session-close-persisted-first", "bot-test")
 	handle := NewWorkerHandle(meta.SessionID)
+	daemonConn, workerConn := net.Pipe()
+	handle.Conn = daemonConn
 	handle.Cmd = exec.Command("/bin/sh", "-c", "sleep 10")
 	if err := handle.Cmd.Start(); err != nil {
 		t.Fatalf("start worker fixture: %v", err)
@@ -115,6 +120,8 @@ func TestCloseSessionPersistsBeforeWorkerExit(t *testing.T) {
 		close(workerExited)
 	}()
 	t.Cleanup(func() {
+		_ = daemonConn.Close()
+		_ = workerConn.Close()
 		if handle.Cmd.Process != nil {
 			_ = handle.Cmd.Process.Kill()
 		}
@@ -124,6 +131,17 @@ func TestCloseSessionPersistsBeforeWorkerExit(t *testing.T) {
 			t.Error("worker fixture was not reaped")
 		}
 	})
+
+	closeMessage := make(chan *protocol.Message, 1)
+	closeReadErr := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(workerConn).Read()
+		if err != nil {
+			closeReadErr <- err
+			return
+		}
+		closeMessage <- msg
+	}()
 
 	closed := make(chan struct{})
 	go func() {
@@ -146,8 +164,163 @@ func TestCloseSessionPersistsBeforeWorkerExit(t *testing.T) {
 	}
 
 	select {
+	case err := <-closeReadErr:
+		t.Fatalf("read close message: %v", err)
+	case msg := <-closeMessage:
+		if msg.Type != protocol.MsgClose || msg.SessionID != meta.SessionID || msg.Payload != "test" {
+			t.Fatalf("close message = %#v, want close for %q with reason %q", msg, meta.SessionID, "test")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive close message")
+	}
+
+	select {
 	case <-workerExited:
 		t.Fatal("worker exited before the test could verify asynchronous cleanup")
+	default:
+	}
+}
+
+func TestCloseSessionMetaDoesNotCloseReusedSession(t *testing.T) {
+	const sessionID = "session-close-reused"
+
+	oldMeta := NewSessionMeta(sessionID, "bot-old")
+	replacementMeta := NewSessionMeta(sessionID, "bot-replacement")
+	oldHandle := NewWorkerHandle(sessionID)
+	replacementHandle := NewWorkerHandle(sessionID)
+	oldDaemonConn, oldWorkerConn := net.Pipe()
+	replacementDaemonConn, replacementWorkerConn := net.Pipe()
+	oldHandle.Conn = oldDaemonConn
+	replacementHandle.Conn = replacementDaemonConn
+	t.Cleanup(func() {
+		_ = oldDaemonConn.Close()
+		_ = oldWorkerConn.Close()
+		_ = replacementDaemonConn.Close()
+		_ = replacementWorkerConn.Close()
+	})
+
+	d := &Daemon{
+		sessions: map[string]*SessionMeta{
+			sessionID: oldMeta,
+		},
+		workers: map[string]*WorkerHandle{
+			sessionID: oldHandle,
+		},
+		workerOwners: map[*WorkerHandle]*SessionMeta{
+			oldHandle: oldMeta,
+		},
+		store: NewSessionStore(t.TempDir()),
+	}
+	if err := d.store.save(oldMeta.ToPersisted()); err != nil {
+		t.Fatalf("persist old session fixture: %v", err)
+	}
+
+	d.sessions[sessionID] = replacementMeta
+	d.workers[sessionID] = replacementHandle
+	d.workerOwners[replacementHandle] = replacementMeta
+	if err := d.store.save(replacementMeta.ToPersisted()); err != nil {
+		t.Fatalf("persist replacement session fixture: %v", err)
+	}
+
+	callbackDrained := make(chan struct{}, 1)
+	oldMeta.AddOnClose(func() {
+		callbackDrained <- struct{}{}
+	})
+
+	replacementWorkerConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	replacementMessage := make(chan *protocol.Message, 1)
+	replacementReadErr := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(replacementWorkerConn).Read()
+		if err != nil {
+			replacementReadErr <- err
+			return
+		}
+		replacementMessage <- msg
+	}()
+
+	d.closeSessionMeta(oldMeta, "stale close")
+
+	if oldMeta.Closed || oldMeta.Status == StatusClosed {
+		t.Fatal("stale close mutated the old session meta")
+	}
+	if replacementMeta.Closed || replacementMeta.Status == StatusClosed {
+		t.Fatal("stale close mutated the replacement session meta")
+	}
+
+	d.sessionsMu.RLock()
+	currentMeta := d.sessions[sessionID]
+	d.sessionsMu.RUnlock()
+	if currentMeta != replacementMeta {
+		t.Fatalf("current session meta = %p, want replacement %p", currentMeta, replacementMeta)
+	}
+	d.workersMu.RLock()
+	currentHandle := d.workers[sessionID]
+	oldOwner := d.workerOwners[oldHandle]
+	replacementOwner := d.workerOwners[replacementHandle]
+	d.workersMu.RUnlock()
+	if currentHandle != replacementHandle {
+		t.Fatalf("current worker = %p, want replacement %p", currentHandle, replacementHandle)
+	}
+	if oldOwner != oldMeta || replacementOwner != replacementMeta {
+		t.Fatalf("worker owners changed: old=%p replacement=%p", oldOwner, replacementOwner)
+	}
+
+	persisted, err := d.store.load(sessionID)
+	if err != nil {
+		t.Fatalf("load replacement session: %v", err)
+	}
+	if persisted.Closed {
+		t.Fatal("stale close persisted the replacement session as closed")
+	}
+
+	select {
+	case msg := <-replacementMessage:
+		t.Fatalf("replacement worker received stale close: %#v", msg)
+	case readErr := <-replacementReadErr:
+		if netErr, ok := readErr.(net.Error); !ok || !netErr.Timeout() {
+			t.Fatalf("read replacement worker: %v", readErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting to confirm replacement worker received no close")
+	}
+
+	select {
+	case <-callbackDrained:
+		t.Fatal("stale close drained old session callbacks")
+	default:
+	}
+
+	d.removeSessionMeta(oldMeta)
+
+	if oldMeta.Closed || oldMeta.Status == StatusClosed {
+		t.Fatal("stale worker close mutated the old session meta")
+	}
+	if replacementMeta.Closed || replacementMeta.Status == StatusClosed {
+		t.Fatal("stale worker close mutated the replacement session meta")
+	}
+	d.sessionsMu.RLock()
+	currentMeta = d.sessions[sessionID]
+	d.sessionsMu.RUnlock()
+	d.workersMu.RLock()
+	currentHandle = d.workers[sessionID]
+	oldOwner = d.workerOwners[oldHandle]
+	replacementOwner = d.workerOwners[replacementHandle]
+	d.workersMu.RUnlock()
+	if currentMeta != replacementMeta || currentHandle != replacementHandle ||
+		oldOwner != oldMeta || replacementOwner != replacementMeta {
+		t.Fatal("stale worker close changed replacement maps")
+	}
+	persisted, err = d.store.load(sessionID)
+	if err != nil {
+		t.Fatalf("reload replacement session: %v", err)
+	}
+	if persisted.Closed {
+		t.Fatal("stale worker close persisted the replacement session as closed")
+	}
+	select {
+	case <-callbackDrained:
+		t.Fatal("stale worker close drained old session callbacks")
 	default:
 	}
 }

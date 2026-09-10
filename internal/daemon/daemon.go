@@ -441,31 +441,21 @@ func (d *Daemon) waitForWorkersExit() {
 }
 
 func (d *Daemon) removeSession(id string) {
-	d.workersMu.Lock()
-	h, hasHandle := d.workers[id]
-	if hasHandle {
-		d.deleteWorkerIfCurrentLocked(id, h)
-	}
-	d.workersMu.Unlock()
+	d.sessionsMu.RLock()
+	meta := d.sessions[id]
+	d.sessionsMu.RUnlock()
+	d.removeSessionMeta(meta)
+}
 
-	d.sessionsMu.Lock()
-	meta, hasMeta := d.sessions[id]
-	if hasMeta {
-		meta.Closed = true
-		meta.Status = StatusClosed
-	}
-	d.sessionsMu.Unlock()
-
-	if !hasMeta {
+func (d *Daemon) removeSessionMeta(meta *SessionMeta) {
+	h, closed := d.markSessionMetaClosed(meta, true)
+	if !closed {
 		return
 	}
 
-	_ = d.store.MarkClosed(id)
-
-	if hasHandle && h != nil {
+	if h != nil {
 		h.CloseConn()
 	}
-
 	for _, fn := range meta.DrainOnClose() {
 		func() {
 			defer func() { _ = recover() }()
@@ -474,9 +464,9 @@ func (d *Daemon) removeSession(id string) {
 	}
 }
 
-func (d *Daemon) removeSessionMeta(meta *SessionMeta) {
+func (d *Daemon) markSessionMetaClosed(meta *SessionMeta, removeWorker bool) (*WorkerHandle, bool) {
 	if meta == nil {
-		return
+		return nil, false
 	}
 
 	d.workersMu.Lock()
@@ -484,29 +474,27 @@ func (d *Daemon) removeSessionMeta(meta *SessionMeta) {
 	if !d.isCurrentSessionLocked(meta) {
 		d.sessionsMu.Unlock()
 		d.workersMu.Unlock()
-		return
+		return nil, false
 	}
 
 	meta.Closed = true
 	meta.Status = StatusClosed
+	// Keep the ID's current meta locked through persistence so a purge and
+	// recreate cannot make this close affect the replacement session.
+	if err := d.store.MarkClosed(meta.SessionID); err != nil {
+		log.Printf("[daemon] session %s persist closed state: %v", safeShort(meta.SessionID), err)
+	}
+
 	h := d.workers[meta.SessionID]
-	hasHandle := h != nil && d.workerOwnedByMetaLocked(h, meta)
-	if hasHandle {
+	if h == nil || !d.workerOwnedByMetaLocked(h, meta) {
+		h = nil
+	} else if removeWorker {
 		d.deleteWorkerIfCurrentLocked(meta.SessionID, h)
 	}
 	d.sessionsMu.Unlock()
 	d.workersMu.Unlock()
 
-	_ = d.store.MarkClosed(meta.SessionID)
-	if hasHandle {
-		h.CloseConn()
-	}
-	for _, fn := range meta.DrainOnClose() {
-		func() {
-			defer func() { _ = recover() }()
-			fn()
-		}()
-	}
+	return h, true
 }
 
 func (d *Daemon) PurgeSession(id string) {
@@ -539,29 +527,23 @@ func (d *Daemon) PurgeSession(id string) {
 }
 
 func (d *Daemon) CloseSession(id, reason string) {
-	d.sessionsMu.Lock()
+	d.sessionsMu.RLock()
 	meta, ok := d.sessions[id]
+	d.sessionsMu.RUnlock()
 	if !ok {
-		d.sessionsMu.Unlock()
 		return
 	}
-	meta.Closed = true
-	meta.Status = StatusClosed
-	d.sessionsMu.Unlock()
+	d.closeSessionMeta(meta, reason)
+}
 
-	// Persist the terminal state before asking the worker to exit. Worker
-	// shutdown is asynchronous and must not decide whether this session can be
-	// restored after a daemon restart.
-	if err := d.store.MarkClosed(id); err != nil {
-		log.Printf("[daemon] session %s persist closed state: %v", safeShort(id), err)
+func (d *Daemon) closeSessionMeta(meta *SessionMeta, reason string) {
+	h, closed := d.markSessionMetaClosed(meta, false)
+	if !closed {
+		return
 	}
 
-	d.workersMu.RLock()
-	h := d.workers[id]
-	d.workersMu.RUnlock()
-
 	if h != nil {
-		msg := protocol.NewMessage(protocol.MsgClose, id, reason)
+		msg := protocol.NewMessage(protocol.MsgClose, meta.SessionID, reason)
 		_ = h.Send(msg)
 		time.AfterFunc(2*time.Second, func() {
 			if h.Cmd != nil && h.Cmd.Process != nil {
@@ -569,7 +551,7 @@ func (d *Daemon) CloseSession(id, reason string) {
 			}
 		})
 	}
-	log.Printf("[daemon] session %s closed (reason=%s)", safeShort(id), reason)
+	log.Printf("[daemon] session %s closed (reason=%s)", safeShort(meta.SessionID), reason)
 }
 
 func (d *Daemon) SendInput(id, input string) error {
