@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"botmux-go/internal/adapter"
-	"botmux-go/internal/daemon"
 	"botmux-go/internal/protocol"
 )
 
@@ -41,7 +40,6 @@ type Worker struct {
 	sessionID        string
 	workerInstanceID string
 	daemonAddr       string
-	storeDir         string
 	cliAdapter       adapter.CliAdapter
 	workingDir       string
 	cliType          string
@@ -103,7 +101,6 @@ func New(opts Options) *Worker {
 		sessionID:        opts.SessionID,
 		workerInstanceID: opts.WorkerInstanceID,
 		daemonAddr:       opts.DaemonAddr,
-		storeDir:         opts.StoreDir,
 		cliAdapter: adapter.Create(adapter.AdapterOptions{
 			CliType: opts.CliType, CliPath: opts.CliPath, Model: opts.Model, Profile: opts.CodexProfile,
 			ResumeSessionID: opts.ResumeSessionID,
@@ -139,7 +136,7 @@ func (w *Worker) Run() error {
 
 	if err := w.startCli(); err != nil {
 		_ = conn.Close()
-		w.cleanup(false)
+		w.cleanup()
 		return fmt.Errorf("start cli: %w", err)
 	}
 	w.wg.Add(1)
@@ -148,7 +145,7 @@ func (w *Worker) Run() error {
 	defer func() {
 		if cleanupInitialFailure {
 			_ = conn.Close()
-			w.cleanup(false)
+			w.cleanup()
 		}
 	}()
 
@@ -287,7 +284,7 @@ func (w *Worker) reconnectToDaemon() {
 			var rejected *workerHandshakeRejectedError
 			if errors.As(err, &rejected) {
 				log.Printf("[worker:%s] reconnect rejected: %s", safeShortID(w.sessionID), rejected.payload)
-				w.cleanup(false)
+				w.cleanup()
 				return
 			}
 			log.Printf("[worker:%s] reconnect ready: %v", safeShortID(w.sessionID), err)
@@ -527,11 +524,11 @@ func (w *Worker) readDaemonMessages() {
 			}
 		case protocol.MsgRestartWorker:
 			log.Printf("[worker:%s] restart requested by daemon", safeShortID(w.sessionID))
-			w.cleanup(false)
+			w.cleanup()
 			return
 		case protocol.MsgClose:
 			log.Printf("[worker:%s] close requested by daemon", safeShortID(w.sessionID))
-			w.cleanup(true)
+			w.cleanup()
 			return
 		case protocol.MsgHeartbeat:
 		case protocol.MsgAck:
@@ -922,7 +919,7 @@ func (w *Worker) isClosed() bool {
 	return w.closed
 }
 
-func (w *Worker) cleanup(markClosed bool) {
+func (w *Worker) cleanup() {
 	w.closeMu.Lock()
 	alreadyClosed := w.closed
 	w.closed = true
@@ -950,10 +947,6 @@ func (w *Worker) cleanup(markClosed bool) {
 	w.connMu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
-	}
-	if markClosed && w.storeDir != "" {
-		store := daemon.NewSessionStore(w.storeDir)
-		_ = store.MarkClosed(w.sessionID)
 	}
 	log.Printf("[worker:%s] worker exited", safeShortID(w.sessionID))
 }

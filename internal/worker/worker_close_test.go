@@ -12,10 +12,12 @@ import (
 	"botmux-go/internal/protocol"
 )
 
-func TestRunCleansUpAfterDaemonClose(t *testing.T) {
+func TestRunCleansUpAfterDaemonCloseDoesNotPersistSessionClosed(t *testing.T) {
 	const sessionID = "worker-close-cleanup"
 	storeDir := t.TempDir()
 	sessionPath := filepath.Join(storeDir, sessionID+".json")
+	// The daemon persists closure before sending MsgClose. A worker-only
+	// close must never modify the session file.
 	fixture, err := json.Marshal(&daemon.PersistedSession{SessionID: sessionID, BotID: "bot-test"})
 	if err != nil {
 		t.Fatalf("marshal session fixture: %v", err)
@@ -80,7 +82,7 @@ func TestRunCleansUpAfterDaemonClose(t *testing.T) {
 	if err := json.Unmarshal(data, &persisted); err != nil {
 		t.Fatalf("decode closed session: %v", err)
 	}
-	if !persisted.Closed {
-		t.Fatal("worker cleanup did not persist the closed session state")
+	if persisted.Closed {
+		t.Fatal("worker cleanup marked the session closed")
 	}
 }

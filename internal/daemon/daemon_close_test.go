@@ -182,6 +182,63 @@ func TestCloseSessionPersistsBeforeWorkerExit(t *testing.T) {
 	}
 }
 
+func TestOldWorkerCloseCannotMarkRecreatedSessionClosed(t *testing.T) {
+	const sessionID = "old-worker-close-recreated"
+
+	oldMeta := NewSessionMeta(sessionID, "bot-old")
+	oldHandle := NewWorkerHandle(sessionID)
+	d := &Daemon{
+		sessions: map[string]*SessionMeta{
+			sessionID: oldMeta,
+		},
+		workers: map[string]*WorkerHandle{
+			sessionID: oldHandle,
+		},
+		workerOwners: map[*WorkerHandle]*SessionMeta{
+			oldHandle: oldMeta,
+		},
+		store: NewSessionStore(t.TempDir()),
+	}
+	if err := d.store.save(oldMeta.ToPersisted()); err != nil {
+		t.Fatalf("persist old session fixture: %v", err)
+	}
+
+	d.CloseSession(sessionID, "test")
+	oldPersisted, err := d.store.load(sessionID)
+	if err != nil {
+		t.Fatalf("load daemon-closed session: %v", err)
+	}
+	if !oldPersisted.Closed {
+		t.Fatal("daemon did not persist the old session as closed")
+	}
+
+	d.PurgeSession(sessionID)
+	replacementMeta := NewSessionMeta(sessionID, "bot-replacement")
+	replacementHandle := NewWorkerHandle(sessionID)
+	d.sessions[sessionID] = replacementMeta
+	d.workers[sessionID] = replacementHandle
+	d.workerOwners[replacementHandle] = replacementMeta
+	if err := d.store.save(replacementMeta.ToPersisted()); err != nil {
+		t.Fatalf("persist replacement session: %v", err)
+	}
+
+	// A delayed old-worker close is routed through daemon identity checks. The
+	// worker itself must not write session storage; worker_close_test covers that
+	// boundary directly.
+	d.routeMessage(protocol.NewMessage(protocol.MsgClose, sessionID, ""), oldMeta, oldHandle)
+
+	persisted, err := d.store.load(sessionID)
+	if err != nil {
+		t.Fatalf("load replacement session: %v", err)
+	}
+	if persisted.Closed {
+		t.Fatal("old worker close marked the replacement session closed")
+	}
+	if persisted.BotID != "bot-replacement" {
+		t.Fatalf("replacement BotID = %q, want %q", persisted.BotID, "bot-replacement")
+	}
+}
+
 func TestCloseSessionMetaDoesNotCloseReusedSession(t *testing.T) {
 	const sessionID = "session-close-reused"
 
