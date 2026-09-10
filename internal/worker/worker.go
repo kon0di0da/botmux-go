@@ -139,20 +139,26 @@ func (w *Worker) Run() error {
 		_ = conn.Close()
 		return err
 	}
+	cleanupInitialFailure := true
+	defer func() {
+		if cleanupInitialFailure {
+			_ = conn.Close()
+			w.cleanup(false)
+		}
+	}()
 
 	if err := w.waitForCLIReady(); err != nil {
-		_ = conn.Close()
 		return err
 	}
 
 	reader, err := w.readyHandshake(conn)
 	if err != nil {
-		_ = conn.Close()
 		return err
 	}
 	w.publishConnection(conn, reader)
 	log.Printf("[worker:%s] connected to daemon %s", safeShortID(w.sessionID), w.daemonAddr)
 	close(w.readyCh)
+	cleanupInitialFailure = false
 
 	w.wg.Add(1)
 	go w.readDaemonMessages()

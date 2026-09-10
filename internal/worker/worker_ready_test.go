@@ -28,6 +28,91 @@ func TestWaitForCLIReadyUsesAuthoritativeResult(t *testing.T) {
 	}
 }
 
+func TestWorkerInitialHandshakeRejectionCleansUpAdapter(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	cli := newInitialHandshakeRejectTestAdapter()
+	w := New(Options{
+		SessionID:        "worker-initial-rejected",
+		WorkerInstanceID: "stale-nonce-123",
+		DaemonAddr:       listener.Addr().String(),
+		CliType:          "mock",
+	})
+	w.cliAdapter = cli
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- fmt.Errorf("accept worker: %w", err)
+			return
+		}
+		defer conn.Close()
+
+		msg, err := protocol.NewMessageReader(conn).Read()
+		if err != nil {
+			serverDone <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			serverDone <- fmt.Errorf("first message = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		if msg.WorkerInstanceID != w.workerInstanceID {
+			serverDone <- fmt.Errorf("worker instance ID = %q, want %q", msg.WorkerInstanceID, w.workerInstanceID)
+			return
+		}
+		if _, err := protocol.NewMessage(protocol.MsgError, w.sessionID, "worker instance mismatch").WriteTo(conn); err != nil {
+			serverDone <- fmt.Errorf("reject ready: %w", err)
+			return
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		var data [1]byte
+		if _, err := conn.Read(data[:]); err != io.EOF {
+			serverDone <- fmt.Errorf("read after rejection = %v, want EOF", err)
+			return
+		}
+		serverDone <- nil
+	}()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run() }()
+
+	select {
+	case err := <-runDone:
+		if err == nil {
+			t.Fatal("Run succeeded after ready rejection")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after ready rejection")
+	}
+
+	select {
+	case <-cli.closed:
+	case <-time.After(time.Second):
+		t.Fatal("adapter Close was not called")
+	}
+	if got := cli.closeCalls.Load(); got != 1 {
+		t.Fatalf("adapter Close calls = %d, want 1", got)
+	}
+	if w.ctx.Err() == nil {
+		t.Fatal("worker context was not canceled")
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not close rejected connection")
+	}
+}
+
 func TestWorkerReadyIncludesInstanceID(t *testing.T) {
 	daemonConn, workerConn := net.Pipe()
 	defer daemonConn.Close()
@@ -794,6 +879,53 @@ type delayedReadyTestAdapter struct {
 	ready   <-chan error
 	outputR *io.PipeReader
 	outputW *io.PipeWriter
+}
+
+type initialHandshakeRejectTestAdapter struct {
+	ready      <-chan error
+	outputR    *io.PipeReader
+	outputW    *io.PipeWriter
+	closed     chan struct{}
+	closeCalls atomic.Int32
+	closeOnce  sync.Once
+}
+
+func newInitialHandshakeRejectTestAdapter() *initialHandshakeRejectTestAdapter {
+	ready := make(chan error, 1)
+	ready <- nil
+	outputR, outputW := io.Pipe()
+	return &initialHandshakeRejectTestAdapter{
+		ready:   ready,
+		outputR: outputR,
+		outputW: outputW,
+		closed:  make(chan struct{}),
+	}
+}
+
+func (a *initialHandshakeRejectTestAdapter) Name() string {
+	return "initial-handshake-reject-test"
+}
+
+func (a *initialHandshakeRejectTestAdapter) Start(context.Context, string) (*adapter.CliStartResult, error) {
+	return &adapter.CliStartResult{
+		Output:      a.outputR,
+		ErrCh:       make(chan error),
+		ReadyResult: a.ready,
+	}, nil
+}
+
+func (a *initialHandshakeRejectTestAdapter) Send(context.Context, string) (adapter.SendResult, error) {
+	return adapter.SendResult{}, nil
+}
+
+func (a *initialHandshakeRejectTestAdapter) Close() error {
+	a.closeCalls.Add(1)
+	a.closeOnce.Do(func() {
+		close(a.closed)
+		_ = a.outputR.Close()
+		_ = a.outputW.Close()
+	})
+	return nil
 }
 
 func newDelayedReadyTestAdapter(ready <-chan error) *delayedReadyTestAdapter {
