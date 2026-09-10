@@ -23,6 +23,15 @@ const (
 	maxCurrentWorkerSendTries = 3
 )
 
+type cancelSendFailureResult uint8
+
+const (
+	cancelSendFailureCommitted cancelSendFailureResult = iota
+	cancelSendFailureRetry
+	cancelSendFailureStaleSession
+	cancelSendFailureNoLongerCancelling
+)
+
 type Daemon struct {
 	cfg          *config.DaemonConfig
 	listener     net.Listener
@@ -567,11 +576,7 @@ func (d *Daemon) CancelTurn(id string) error {
 	if !ok {
 		return fmt.Errorf("session %s has no cancellable active turn", id)
 	}
-	if _, err := d.sendToCurrentWorker(id, protocol.MsgCancelTurn, "", func() bool {
-		snapshot := meta.TurnSnapshot()
-		return snapshot.Active && snapshot.Cancelling && snapshot.Token == token
-	}); err != nil {
-		d.finishCancelWithFailure(meta, token, "codex_cancel_failed", err.Error())
+	if err := d.sendCancelToCurrentWorker(meta, token); err != nil {
 		return fmt.Errorf("cancel Codex turn for session %s: %w", id, err)
 	}
 	go d.watchCancelledTurn(meta, token)
@@ -594,14 +599,22 @@ func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64) {
 	}
 
 	d.sessionsMu.Lock()
-	if !meta.Closed {
+	restart := d.isCurrentSessionLocked(meta) && !meta.Closed
+	if restart {
 		meta.Status = StatusRecovering
 	}
 	d.sessionsMu.Unlock()
-	d.restartWorker(meta.SessionID)
+	if restart {
+		d.restartWorkerForSession(meta)
+	}
 }
 
 func (d *Daemon) finishCancelWithFailure(meta *SessionMeta, token uint64, errorCode, errorDetail string) bool {
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	if !d.isCurrentSessionLocked(meta) {
+		return false
+	}
 	return meta.FailCancellingTurn(token, protocol.TurnTerminal{
 		Status:      protocol.TurnFailed,
 		ErrorCode:   errorCode,
@@ -609,27 +622,148 @@ func (d *Daemon) finishCancelWithFailure(meta *SessionMeta, token uint64, errorC
 	})
 }
 
+func (d *Daemon) sendCancelToCurrentWorker(meta *SessionMeta, token uint64) error {
+	var lastErr error
+	for attempt := 0; attempt < maxCurrentWorkerSendTries; attempt++ {
+		snapshot := meta.TurnSnapshot()
+		if !snapshot.Active || !snapshot.Cancelling || snapshot.Token != token {
+			return fmt.Errorf("session %s cancellation is no longer active", meta.SessionID)
+		}
+
+		handle, current := d.currentWorkerForSession(meta)
+		if !current {
+			return fmt.Errorf("session %s is no longer current", meta.SessionID)
+		}
+		var err error
+		if handle == nil || !handle.IsReady() {
+			err = fmt.Errorf("session %s has no ready worker", meta.SessionID)
+		} else {
+			err = handle.Send(protocol.NewMessage(protocol.MsgCancelTurn, meta.SessionID, ""))
+		}
+		if err != nil {
+			switch d.commitCancelSendFailureIfCurrent(meta, token, handle, err) {
+			case cancelSendFailureCommitted:
+				return err
+			case cancelSendFailureRetry:
+				lastErr = err
+				continue
+			case cancelSendFailureStaleSession:
+				return fmt.Errorf("session %s is no longer current", meta.SessionID)
+			case cancelSendFailureNoLongerCancelling:
+				return fmt.Errorf("session %s cancellation is no longer active", meta.SessionID)
+			}
+		}
+
+		if d.isCurrentWorkerForSession(meta, handle) {
+			return nil
+		}
+		if !d.isCurrentSession(meta) {
+			return fmt.Errorf("session %s is no longer current", meta.SessionID)
+		}
+		lastErr = fmt.Errorf("worker generation changed while sending %s", protocol.MsgCancelTurn)
+	}
+	return fmt.Errorf("session %s worker changed while sending %s after %d attempts: %w",
+		meta.SessionID, protocol.MsgCancelTurn, maxCurrentWorkerSendTries, lastErr)
+}
+
+func (d *Daemon) commitCancelSendFailureIfCurrent(
+	meta *SessionMeta,
+	token uint64,
+	handle *WorkerHandle,
+	err error,
+) cancelSendFailureResult {
+	d.workersMu.Lock()
+	defer d.workersMu.Unlock()
+	if d.workers[meta.SessionID] != handle {
+		return cancelSendFailureRetry
+	}
+
+	d.sessionsMu.RLock()
+	if !d.isCurrentSessionLocked(meta) {
+		d.sessionsMu.RUnlock()
+		return cancelSendFailureStaleSession
+	}
+	committed := meta.FailCancellingTurn(token, protocol.TurnTerminal{
+		Status:      protocol.TurnFailed,
+		ErrorCode:   "codex_cancel_failed",
+		ErrorDetail: err.Error(),
+	})
+	d.sessionsMu.RUnlock()
+	if !committed {
+		return cancelSendFailureNoLongerCancelling
+	}
+	return cancelSendFailureCommitted
+}
+
+func (d *Daemon) isCurrentSession(meta *SessionMeta) bool {
+	if meta == nil {
+		return false
+	}
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	return d.isCurrentSessionLocked(meta)
+}
+
+func (d *Daemon) isCurrentSessionLocked(meta *SessionMeta) bool {
+	return meta != nil && d.sessions[meta.SessionID] == meta
+}
+
+// Worker map checks precede session map checks everywhere both locks are held.
+// No code acquires workersMu while holding sessionsMu, so this order cannot
+// deadlock with the session lifecycle paths.
+func (d *Daemon) currentWorkerForSession(meta *SessionMeta) (*WorkerHandle, bool) {
+	if meta == nil {
+		return nil, false
+	}
+	d.workersMu.RLock()
+	defer d.workersMu.RUnlock()
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	if !d.isCurrentSessionLocked(meta) {
+		return nil, false
+	}
+	return d.workers[meta.SessionID], true
+}
+
+func (d *Daemon) isCurrentWorkerForSession(meta *SessionMeta, handle *WorkerHandle) bool {
+	if meta == nil {
+		return false
+	}
+	d.workersMu.RLock()
+	defer d.workersMu.RUnlock()
+	if d.workers[meta.SessionID] != handle {
+		return false
+	}
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	return d.isCurrentSessionLocked(meta)
+}
+
 func (d *Daemon) sendToCurrentWorker(
-	id string,
+	meta *SessionMeta,
 	msgType protocol.MessageType,
 	payload string,
 	stillRelevant func() bool,
 ) (*WorkerHandle, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxCurrentWorkerSendTries; attempt++ {
+		if !d.isCurrentSession(meta) {
+			return nil, fmt.Errorf("session %s is no longer current", meta.SessionID)
+		}
 		if stillRelevant != nil && !stillRelevant() {
-			return nil, fmt.Errorf("session %s operation is no longer active", id)
+			return nil, fmt.Errorf("session %s operation is no longer active", meta.SessionID)
 		}
 
-		d.workersMu.RLock()
-		handle := d.workers[id]
-		d.workersMu.RUnlock()
+		handle, current := d.currentWorkerForSession(meta)
+		if !current {
+			return nil, fmt.Errorf("session %s is no longer current", meta.SessionID)
+		}
 		if handle == nil || !handle.IsReady() {
-			return nil, fmt.Errorf("session %s has no ready worker", id)
+			return nil, fmt.Errorf("session %s has no ready worker", meta.SessionID)
 		}
 
-		err := handle.Send(protocol.NewMessage(msgType, id, payload))
-		if d.isCurrentWorker(handle) {
+		err := handle.Send(protocol.NewMessage(msgType, meta.SessionID, payload))
+		if d.isCurrentWorkerForSession(meta, handle) {
 			if err != nil {
 				return nil, err
 			}
@@ -642,13 +776,13 @@ func (d *Daemon) sendToCurrentWorker(
 		}
 	}
 	return nil, fmt.Errorf("session %s worker changed while sending %s after %d attempts: %w",
-		id, msgType, maxCurrentWorkerSendTries, lastErr)
+		meta.SessionID, msgType, maxCurrentWorkerSendTries, lastErr)
 }
 
-func (d *Daemon) restartWorker(id string) {
-	handle, err := d.sendToCurrentWorker(id, protocol.MsgRestartWorker, "", nil)
+func (d *Daemon) restartWorkerForSession(meta *SessionMeta) {
+	handle, err := d.sendToCurrentWorker(meta, protocol.MsgRestartWorker, "", nil)
 	if err != nil {
-		log.Printf("[daemon] session %s restart worker: %v", safeShort(id), err)
+		log.Printf("[daemon] session %s restart worker: %v", safeShort(meta.SessionID), err)
 		return
 	}
 
@@ -661,6 +795,9 @@ func (d *Daemon) restartWorker(id string) {
 		case <-d.ctx.Done():
 			return
 		case <-timer.C:
+			if !d.isCurrentWorkerForSession(meta, handle) {
+				return
+			}
 			if handle.Cmd != nil && handle.Cmd.Process != nil {
 				if err := handle.Cmd.Process.Kill(); err != nil {
 					if !errors.Is(err, os.ErrProcessDone) {

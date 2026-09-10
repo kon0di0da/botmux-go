@@ -183,6 +183,109 @@ func TestCancelTimeoutRestartsCurrentReplacementWorker(t *testing.T) {
 	}
 }
 
+func TestCancelWatchdogDoesNotRestartReusedSessionID(t *testing.T) {
+	d, oldMeta, _, oldWorkerConn := newCancelTestDaemon(t)
+	if !oldMeta.BeginTurn() {
+		t.Fatal("begin old turn")
+	}
+	token, ok := oldMeta.BeginTurnCancel()
+	if !ok {
+		t.Fatal("begin old turn cancellation")
+	}
+	sendErr := make(chan error, 1)
+	go func() {
+		_, err := d.sendToCurrentWorker(oldMeta, protocol.MsgCancelTurn, "", nil)
+		sendErr <- err
+	}()
+	if msg := mustReadMessage(t, oldWorkerConn); msg.Type != protocol.MsgCancelTurn {
+		t.Fatalf("old worker message type = %s, want %s", msg.Type, protocol.MsgCancelTurn)
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("send old cancel: %v", err)
+	}
+
+	newMeta := NewSessionMeta(oldMeta.SessionID, "bot-codex")
+	newMeta.CliType = string(config.CliCodex)
+	newMeta.Status = StatusReady
+	newHandle, newWorkerConn := newCancelTestWorker(t, d, oldMeta.SessionID)
+	d.sessionsMu.Lock()
+	d.sessions[oldMeta.SessionID] = newMeta
+	d.sessionsMu.Unlock()
+	d.workersMu.Lock()
+	d.workers[oldMeta.SessionID] = newHandle
+	d.workersMu.Unlock()
+
+	watchDone := make(chan struct{})
+	go func() {
+		d.watchCancelledTurn(oldMeta, token)
+		close(watchDone)
+	}()
+
+	msg, err := readMessageWithDeadline(newWorkerConn, 100*time.Millisecond)
+	if err == nil {
+		t.Fatalf("reused session worker received %s, want no message", msg.Type)
+	}
+	if !isTimeout(err) {
+		t.Fatalf("read reused session worker: %v, want timeout", err)
+	}
+	select {
+	case <-watchDone:
+	case <-time.After(time.Second):
+		t.Fatal("old cancellation watchdog did not return")
+	}
+
+	if terminals, _, _ := oldMeta.SnapshotTerminalsSince(0); len(terminals) != 0 {
+		t.Fatalf("old meta terminals = %#v, want none", terminals)
+	}
+	if terminals, _, _ := newMeta.SnapshotTerminalsSince(0); len(terminals) != 0 {
+		t.Fatalf("new meta terminals = %#v, want none", terminals)
+	}
+	d.sessionsMu.RLock()
+	currentMeta := d.sessions[newMeta.SessionID]
+	status := newMeta.Status
+	d.sessionsMu.RUnlock()
+	if currentMeta != newMeta {
+		t.Fatalf("current meta = %p, want replacement %p", currentMeta, newMeta)
+	}
+	if status != StatusReady {
+		t.Fatalf("new meta status = %s, want %s", status, StatusReady)
+	}
+}
+
+func TestCommitCancelSendFailureRetriesReplacementWorker(t *testing.T) {
+	d, meta, original, _ := newCancelTestDaemon(t)
+	if !meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+	token, ok := meta.BeginTurnCancel()
+	if !ok {
+		t.Fatal("begin turn cancellation")
+	}
+
+	replacement, replacementWorkerConn := newCancelTestWorker(t, d, meta.SessionID)
+	d.workersMu.Lock()
+	d.workers[meta.SessionID] = replacement
+	d.workersMu.Unlock()
+
+	if got := d.commitCancelSendFailureIfCurrent(meta, token, original, errors.New("original worker write failed")); got != cancelSendFailureRetry {
+		t.Fatalf("commit cancel send failure result = %v, want retry", got)
+	}
+	if terminals, _, _ := meta.SnapshotTerminalsSince(0); len(terminals) != 0 {
+		t.Fatalf("terminals = %#v, want none", terminals)
+	}
+
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- d.sendCancelToCurrentWorker(meta, token)
+	}()
+	if msg := mustReadMessage(t, replacementWorkerConn); msg.Type != protocol.MsgCancelTurn {
+		t.Fatalf("replacement message type = %s, want %s", msg.Type, protocol.MsgCancelTurn)
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("send cancellation to replacement worker: %v", err)
+	}
+}
+
 func TestCancelTurnAbortedTerminalKeepsSessionOpen(t *testing.T) {
 	d, meta, handle, workerConn := newCancelTestDaemon(t)
 	d.turnCancelTimeout = time.Second
@@ -342,14 +445,24 @@ func (c *replaceOnFirstWriteConn) Write(p []byte) (int, error) {
 
 func mustReadMessage(t *testing.T, conn net.Conn) *protocol.Message {
 	t.Helper()
-	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-	msg, err := protocol.DecodeMessage(conn)
+	msg, err := readMessageWithDeadline(conn, time.Second)
 	if err != nil {
 		t.Fatalf("read worker message: %v", err)
 	}
 	return msg
+}
+
+func readMessageWithDeadline(conn net.Conn, timeout time.Duration) (*protocol.Message, error) {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+	msg, err := protocol.DecodeMessage(conn)
+	return msg, err
+}
+
+func isTimeout(err error) bool {
+	netErr, ok := err.(net.Error)
+	return ok && netErr.Timeout()
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
