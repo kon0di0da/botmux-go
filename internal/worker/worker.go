@@ -69,8 +69,7 @@ type Worker struct {
 	closed  bool
 	closeMu sync.Mutex
 
-	connectedMu sync.Mutex
-	connected   bool
+	connected bool
 
 	daemonDisconnectedCh chan struct{}
 
@@ -161,7 +160,17 @@ func (w *Worker) Run() error {
 	if err != nil {
 		return err
 	}
-	w.publishConnection(conn, reader)
+	oldConn, published := w.publishConnection(conn, reader)
+	if !published {
+		_ = conn.Close()
+		if err := w.ctx.Err(); err != nil {
+			return err
+		}
+		return errors.New("worker closed before publishing daemon connection")
+	}
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
 	log.Printf("[worker:%s] connected to daemon %s", safeShortID(w.sessionID), w.daemonAddr)
 	close(w.readyCh)
 	cleanupInitialFailure = false
@@ -284,7 +293,11 @@ func (w *Worker) reconnectToDaemon() {
 			log.Printf("[worker:%s] reconnect ready: %v", safeShortID(w.sessionID), err)
 			continue
 		}
-		oldConn := w.publishConnection(conn, reader)
+		oldConn, published := w.publishConnection(conn, reader)
+		if !published {
+			_ = conn.Close()
+			return
+		}
 		if oldConn != nil {
 			_ = oldConn.Close()
 		}
@@ -295,25 +308,30 @@ func (w *Worker) reconnectToDaemon() {
 	log.Printf("[worker:%s] failed to reconnect after 100 attempts, giving up", safeShortID(w.sessionID))
 }
 
-func (w *Worker) publishConnection(conn net.Conn, reader *protocol.MessageReader) net.Conn {
+func (w *Worker) publishConnection(conn net.Conn, reader *protocol.MessageReader) (net.Conn, bool) {
+	w.closeMu.Lock()
+	defer w.closeMu.Unlock()
+	if w.closed || w.ctx.Err() != nil {
+		return nil, false
+	}
 	w.connMu.Lock()
+	defer w.connMu.Unlock()
 	oldConn := w.conn
 	w.conn = conn
 	w.msgReader = reader
-	w.connMu.Unlock()
-	w.setConnected(true)
-	return oldConn
+	w.connected = true
+	return oldConn, true
 }
 
 func (w *Worker) setConnected(v bool) {
-	w.connectedMu.Lock()
+	w.connMu.Lock()
 	w.connected = v
-	w.connectedMu.Unlock()
+	w.connMu.Unlock()
 }
 
 func (w *Worker) isConnected() bool {
-	w.connectedMu.Lock()
-	defer w.connectedMu.Unlock()
+	w.connMu.Lock()
+	defer w.connMu.Unlock()
 	return w.connected
 }
 
@@ -440,16 +458,14 @@ func (w *Worker) sendMessageWithConn(typ protocol.MessageType, payload string) (
 	return conn, err
 }
 
-func (w *Worker) isCurrentConn(conn net.Conn) bool {
+func (w *Worker) markDisconnectedIfCurrent(conn net.Conn, reader *protocol.MessageReader) bool {
 	w.connMu.Lock()
 	defer w.connMu.Unlock()
-	return conn != nil && w.conn == conn
-}
-
-func (w *Worker) isCurrentMessageReader(reader *protocol.MessageReader) bool {
-	w.connMu.Lock()
-	defer w.connMu.Unlock()
-	return reader != nil && w.msgReader == reader
+	if conn == nil || w.conn != conn || (reader != nil && w.msgReader != reader) {
+		return false
+	}
+	w.connected = false
+	return true
 }
 
 func (w *Worker) readDaemonMessages() {
@@ -462,6 +478,7 @@ func (w *Worker) readDaemonMessages() {
 		default:
 		}
 		w.connMu.Lock()
+		conn := w.conn
 		reader := w.msgReader
 		w.connMu.Unlock()
 		if reader == nil {
@@ -473,13 +490,12 @@ func (w *Worker) readDaemonMessages() {
 			if w.ctx.Err() != nil {
 				return
 			}
-			if !w.isCurrentMessageReader(reader) {
+			if !w.markDisconnectedIfCurrent(conn, reader) {
 				continue
 			}
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				log.Printf("[worker:%s] read daemon error: %v", safeShortID(w.sessionID), err)
 			}
-			w.setConnected(false)
 			go w.reconnectToDaemon()
 			select {
 			case <-w.ctx.Done():
@@ -872,8 +888,7 @@ func (w *Worker) sendHeartbeats() {
 			return
 		case <-ticks:
 			conn, err := w.sendMessageWithConn(protocol.MsgHeartbeat, "")
-			if err != nil && w.isCurrentConn(conn) {
-				w.setConnected(false)
+			if err != nil && w.markDisconnectedIfCurrent(conn, nil) {
 				go w.reconnectToDaemon()
 			}
 		}
@@ -894,6 +909,7 @@ func (w *Worker) Cancel() {
 	conn := w.conn
 	w.conn = nil
 	w.msgReader = nil
+	w.connected = false
 	w.connMu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
@@ -930,6 +946,7 @@ func (w *Worker) cleanup(markClosed bool) {
 	conn := w.conn
 	w.conn = nil
 	w.msgReader = nil
+	w.connected = false
 	w.connMu.Unlock()
 	if conn != nil {
 		_ = conn.Close()

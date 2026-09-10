@@ -164,6 +164,117 @@ func TestWorkerInitialHandshakeRejectionCleansUpAdapter(t *testing.T) {
 	}
 }
 
+func TestWorkerInitialHandshakeCancellationAfterAcknowledgmentCleansUpAdapter(t *testing.T) {
+	daemonConn, rawWorkerConn := net.Pipe()
+	workerConn := newBlockingDeadlineClearConn(rawWorkerConn)
+	cli := newInitialHandshakeRejectTestAdapter()
+	w := New(Options{
+		SessionID:  "worker-initial-canceled-after-ack",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	w.cliAdapter = cli
+	w.dial = func(string, string) (net.Conn, error) {
+		return workerConn, nil
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		defer daemonConn.Close()
+		msg, err := protocol.NewMessageReader(daemonConn).Read()
+		if err != nil {
+			serverDone <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			serverDone <- fmt.Errorf("first message = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		if _, err := protocol.NewMessage(protocol.MsgAck, w.sessionID, workerReadyAckPayload).WriteTo(daemonConn); err != nil {
+			serverDone <- fmt.Errorf("acknowledge ready: %w", err)
+			return
+		}
+		var data [1]byte
+		_, err = daemonConn.Read(data[:])
+		serverDone <- err
+	}()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run() }()
+	runExited := false
+	t.Cleanup(func() {
+		workerConn.releaseDeadlineClear()
+		w.Cancel()
+		_ = workerConn.Close()
+		_ = daemonConn.Close()
+		if !runExited {
+			select {
+			case <-runDone:
+			case <-time.After(time.Second):
+				t.Error("Run did not exit during cleanup")
+			}
+		}
+	})
+
+	waitForSignal(t, workerConn.deadlineClearStarted, "successful ready handshake before publish")
+	w.Cancel()
+	workerConn.releaseDeadlineClear()
+
+	select {
+	case err := <-runDone:
+		runExited = true
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after cancellation before publish")
+	}
+	waitForSignal(t, cli.closed, "adapter Close after rejected publication")
+	if got := cli.closeCalls.Load(); got != 1 {
+		t.Fatalf("adapter Close calls = %d, want 1", got)
+	}
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != nil {
+		t.Fatal("Run published a private connection after cancellation")
+	}
+	select {
+	case err := <-serverDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("private connection read after cancellation = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("private connection was not closed after rejected publication")
+	}
+}
+
+func TestWorkerPublishConnectionRejectsClosedWorker(t *testing.T) {
+	w := New(Options{SessionID: "worker-publish-closed", CliType: "mock"})
+	newConn := &recordingConn{}
+	newReader := protocol.NewMessageReader(newConn)
+	t.Cleanup(func() { _ = newConn.Close() })
+
+	w.Cancel()
+	oldConn, published := w.publishConnection(newConn, newReader)
+	if published {
+		t.Fatal("publishConnection accepted a closed worker")
+	}
+	if oldConn != nil {
+		t.Fatalf("publishConnection returned old connection %v, want nil", oldConn)
+	}
+	w.connMu.Lock()
+	publishedConn := w.conn
+	publishedReader := w.msgReader
+	w.connMu.Unlock()
+	if publishedConn == newConn || publishedReader == newReader {
+		t.Fatal("publishConnection installed a connection after cancellation")
+	}
+	if w.isConnected() {
+		t.Fatal("publishConnection marked a closed worker connected")
+	}
+}
+
 func TestWorkerHandshakeRejectsMalformedAcknowledgement(t *testing.T) {
 	const sessionID = "worker-malformed-ack"
 
@@ -1799,9 +1910,15 @@ func TestWorkerHeartbeatDoesNotReconnectAfterStaleWriteFailure(t *testing.T) {
 	ticks <- time.Now()
 	waitForSignal(t, staleConn.writeStarted, "stale heartbeat write to start")
 
-	oldConn := w.publishConnection(newConn, protocol.NewMessageReader(newConn))
+	oldConn, published := w.publishConnection(newConn, protocol.NewMessageReader(newConn))
+	if !published {
+		t.Fatal("replacement connection was rejected")
+	}
 	if oldConn != staleConn {
 		t.Fatal("heartbeat did not write to the stale connection")
+	}
+	if w.markDisconnectedIfCurrent(staleConn, nil) {
+		t.Fatal("stale heartbeat failure marked the replacement connection disconnected")
 	}
 	if err := oldConn.Close(); err != nil {
 		t.Fatalf("close stale connection: %v", err)
@@ -1839,6 +1956,7 @@ func TestWorkerIgnoresStaleDaemonReaderFailureAfterReconnect(t *testing.T) {
 	})
 	w.conn = oldConn
 	w.msgReader = protocol.NewMessageReader(oldConn)
+	oldReader := w.msgReader
 	w.setConnected(true)
 
 	var reconnectCalls atomic.Int32
@@ -1873,9 +1991,15 @@ func TestWorkerIgnoresStaleDaemonReaderFailureAfterReconnect(t *testing.T) {
 	}()
 	waitForSignal(t, oldConn.readStarted, "old daemon reader to start")
 
-	oldPublishedConn := w.publishConnection(newConn, protocol.NewMessageReader(newConn))
+	oldPublishedConn, published := w.publishConnection(newConn, protocol.NewMessageReader(newConn))
+	if !published {
+		t.Fatal("replacement connection was rejected")
+	}
 	if oldPublishedConn != oldConn {
 		t.Fatal("replacement connection did not replace the old connection")
+	}
+	if w.markDisconnectedIfCurrent(oldConn, oldReader) {
+		t.Fatal("stale daemon reader failure marked the replacement connection disconnected")
 	}
 	oldConn.releaseRead()
 
@@ -2429,6 +2553,38 @@ func (c *deadlineRecordingConn) deadlines() []time.Time {
 func (c *deadlineRecordingConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return c.Conn.Close()
+}
+
+type blockingDeadlineClearConn struct {
+	net.Conn
+
+	deadlineClearStarted chan struct{}
+	release              chan struct{}
+	startOnce            sync.Once
+	releaseOnce          sync.Once
+}
+
+func newBlockingDeadlineClearConn(conn net.Conn) *blockingDeadlineClearConn {
+	return &blockingDeadlineClearConn{
+		Conn:                 conn,
+		deadlineClearStarted: make(chan struct{}),
+		release:              make(chan struct{}),
+	}
+}
+
+func (c *blockingDeadlineClearConn) SetDeadline(deadline time.Time) error {
+	if err := c.Conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if deadline.IsZero() {
+		c.startOnce.Do(func() { close(c.deadlineClearStarted) })
+		<-c.release
+	}
+	return nil
+}
+
+func (c *blockingDeadlineClearConn) releaseDeadlineClear() {
+	c.releaseOnce.Do(func() { close(c.release) })
 }
 
 type testAddr string
