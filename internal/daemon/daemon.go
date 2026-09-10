@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -254,6 +256,14 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 
 func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 	handle := NewWorkerHandle(meta.SessionID)
+	instanceID, err := newWorkerInstanceID()
+	if err != nil {
+		return fmt.Errorf("generate worker instance ID: %w", err)
+	}
+	if instanceID == "" {
+		return errors.New("generate worker instance ID: empty value")
+	}
+	handle.InstanceID = instanceID
 
 	// Worker lifetime is controlled by its IPC close handshake, not the daemon
 	// service context. Stop waits for that handshake before canceling d.ctx.
@@ -269,6 +279,7 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 		"BOTMUX_RESUME_SESSION_ID="+meta.CliSessionID,
 		"BOTMUX_WORKING_DIR="+meta.WorkingDir,
 		"BOTMUX_STORE_DIR="+d.cfg.SessionsDir,
+		"BOTMUX_WORKER_INSTANCE_ID="+handle.InstanceID,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1126,32 +1137,35 @@ func (d *Daemon) handleConn(conn net.Conn) {
 	}
 
 	sessionID := first.SessionID
-	d.sessionsMu.RLock()
-	meta, ok := d.sessions[sessionID]
-	d.sessionsMu.RUnlock()
-	if !ok {
-		log.Printf("[daemon] session %s not registered for incoming worker conn", safeShort(sessionID))
-		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "session not registered").WriteTo(conn)
-		return
-	}
-	if meta.Closed {
+	if first.Type != protocol.MsgReady || first.WorkerInstanceID == "" {
+		log.Printf("[daemon] session %s rejected worker without ready instance identity", safeShort(sessionID))
+		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "worker must send ready with instance ID").WriteTo(conn)
 		return
 	}
 
 	d.workersMu.Lock()
 	d.sessionsMu.RLock()
-	if !d.isCurrentSessionLocked(meta) || meta.Closed {
+	meta, sessionExists := d.sessions[sessionID]
+	h := d.workers[sessionID]
+	isExpected := sessionExists &&
+		!meta.Closed &&
+		d.isCurrentSessionLocked(meta) &&
+		h != nil &&
+		d.workerOwners != nil &&
+		d.workerOwners[h] == meta
+	if !isExpected {
 		d.sessionsMu.RUnlock()
 		d.workersMu.Unlock()
+		log.Printf("[daemon] session %s rejected unexpected worker", safeShort(sessionID))
+		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "worker not expected").WriteTo(conn)
 		return
 	}
-	h, hasH := d.workers[sessionID]
-	if !hasH || h == nil {
-		h = NewWorkerHandle(sessionID)
-		d.installWorkerLocked(meta, h)
-	} else if d.workerOwners == nil {
-		d.workerOwners = make(map[*WorkerHandle]*SessionMeta)
-		d.workerOwners[h] = meta
+	if first.WorkerInstanceID != h.InstanceID {
+		d.sessionsMu.RUnlock()
+		d.workersMu.Unlock()
+		log.Printf("[daemon] session %s rejected worker with mismatched instance ID", safeShort(sessionID))
+		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "worker instance ID mismatch").WriteTo(conn)
+		return
 	}
 	oldConn := h.SetConn(conn)
 	d.sessionsMu.RUnlock()
@@ -1185,6 +1199,18 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		}
 		d.routeMessage(msg, meta, h)
 	}
+}
+
+func newWorkerInstanceID() (string, error) {
+	buf := make([]byte, 16)
+	n, err := rand.Read(buf)
+	if err != nil {
+		return "", fmt.Errorf("read random bytes: %w", err)
+	}
+	if n != len(buf) {
+		return "", fmt.Errorf("read random bytes: got %d, want %d", n, len(buf))
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 func (d *Daemon) handleClientConn(conn net.Conn, reader *protocol.MessageReader, first *protocol.Message) {

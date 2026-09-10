@@ -11,12 +11,13 @@ import (
 )
 
 type WorkerHandle struct {
-	SessionID string
-	Cmd       *exec.Cmd
-	Conn      net.Conn
-	Ready     chan struct{}
-	ExitDone  chan struct{}
-	Pid       int
+	SessionID  string
+	InstanceID string
+	Cmd        *exec.Cmd
+	Conn       net.Conn
+	Ready      chan struct{}
+	ExitDone   chan struct{}
+	Pid        int
 
 	mu                     sync.Mutex
 	hbSeen                 time.Time
