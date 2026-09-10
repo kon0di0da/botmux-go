@@ -191,8 +191,8 @@ func TestCancelTurnTimeoutPublishesOneFailureAndRestartsWorker(t *testing.T) {
 	}
 }
 
-func TestCancelTimeoutRejectsNewTurnBeforeWorkerRestart(t *testing.T) {
-	d, meta, _, workerConn := newCancelTestDaemon(t)
+func TestCancelTimeoutLateReadyDoesNotAdmitTurn(t *testing.T) {
+	d, meta, handle, workerConn := newCancelTestDaemon(t)
 	if !meta.BeginTurn() {
 		t.Fatal("begin turn")
 	}
@@ -214,24 +214,41 @@ func TestCancelTimeoutRejectsNewTurnBeforeWorkerRestart(t *testing.T) {
 	waitForCondition(t, time.Second, func() bool {
 		d.sessionsMu.RLock()
 		status := meta.Status
+		pending := d.pendingRestart[meta]
 		d.sessionsMu.RUnlock()
 		terminals, _, _ := meta.SnapshotTerminalsSince(0)
-		return status == StatusRecovering && len(terminals) == 1
+		return status == StatusRecovering && pending == handle && len(terminals) == 1
 	})
 
-	inputErr := make(chan error, 1)
 	inputDone := make(chan struct{})
-	go func() {
-		defer close(inputDone)
-		inputErr <- d.SendInput(meta.SessionID, "next turn")
-	}()
+	inputStarted := false
 	defer func() {
 		_ = workerConn.Close()
+		if !inputStarted {
+			return
+		}
 		select {
 		case <-inputDone:
 		case <-time.After(time.Second):
 			t.Error("SendInput goroutine did not return after unblocking worker IPC")
 		}
+	}()
+
+	// The current worker is already headed for restart. Its late READY must not
+	// reopen the session while the restart IPC write is blocked.
+	d.routeMessage(protocol.NewMessage(protocol.MsgReady, meta.SessionID, ""), meta, handle)
+	d.sessionsMu.RLock()
+	status := meta.Status
+	d.sessionsMu.RUnlock()
+	if status != StatusRecovering {
+		t.Fatalf("session status after late ready = %s, want %s", status, StatusRecovering)
+	}
+
+	inputErr := make(chan error, 1)
+	inputStarted = true
+	go func() {
+		defer close(inputDone)
+		inputErr <- d.SendInput(meta.SessionID, "next turn")
 	}()
 
 	select {
@@ -249,6 +266,21 @@ func TestCancelTimeoutRejectsNewTurnBeforeWorkerRestart(t *testing.T) {
 
 	if snapshot := meta.TurnSnapshot(); snapshot.Active || snapshot.Cancelling {
 		t.Fatalf("turn snapshot = %#v, want inactive non-cancelling turn", snapshot)
+	}
+
+	replacement := NewWorkerHandle(meta.SessionID)
+	d.workersMu.Lock()
+	d.workers[meta.SessionID] = replacement
+	d.workersMu.Unlock()
+	d.routeMessage(protocol.NewMessage(protocol.MsgReady, meta.SessionID, ""), meta, replacement)
+	if !replacement.IsReady() {
+		t.Fatal("replacement worker was not marked ready")
+	}
+	d.sessionsMu.RLock()
+	status = meta.Status
+	d.sessionsMu.RUnlock()
+	if status != StatusReady {
+		t.Fatalf("session status after replacement ready = %s, want %s", status, StatusReady)
 	}
 }
 

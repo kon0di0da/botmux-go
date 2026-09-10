@@ -45,6 +45,9 @@ type Daemon struct {
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*SessionMeta
+	// pendingRestart identifies the worker generation that must not reopen a
+	// recovering session with a late READY.
+	pendingRestart map[*SessionMeta]*WorkerHandle
 
 	workersMu sync.RWMutex
 	workers   map[string]*WorkerHandle
@@ -73,14 +76,15 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Daemon{
-		cfg:        cfg,
-		selfExe:    exe,
-		store:      NewSessionStore(cfg.SessionsDir),
-		ctx:        ctx,
-		cancel:     cancel,
-		sessions:   make(map[string]*SessionMeta),
-		workers:    make(map[string]*WorkerHandle),
-		connToSess: make(map[net.Conn]string),
+		cfg:            cfg,
+		selfExe:        exe,
+		store:          NewSessionStore(cfg.SessionsDir),
+		ctx:            ctx,
+		cancel:         cancel,
+		sessions:       make(map[string]*SessionMeta),
+		workers:        make(map[string]*WorkerHandle),
+		connToSess:     make(map[net.Conn]string),
+		pendingRestart: make(map[*SessionMeta]*WorkerHandle),
 	}, nil
 }
 
@@ -267,7 +271,12 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 	handle.Cmd = cmd
 
 	d.sessionsMu.Lock()
+	if !d.isCurrentSessionLocked(meta) {
+		d.sessionsMu.Unlock()
+		return fmt.Errorf("session %s is no longer current", meta.SessionID)
+	}
 	meta.Status = StatusSpawning
+	delete(d.pendingRestart, meta)
 	d.sessionsMu.Unlock()
 
 	d.workersMu.Lock()
@@ -289,7 +298,9 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 		}
 		d.workersMu.Unlock()
 		d.sessionsMu.Lock()
-		meta.Status = StatusRecovering
+		if d.isCurrentSessionLocked(meta) {
+			meta.Status = StatusRecovering
+		}
 		d.sessionsMu.Unlock()
 		return fmt.Errorf("spawn worker: %w", err)
 	}
@@ -595,6 +606,10 @@ func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64) {
 		return
 	}
 
+	// Resolve and fence the worker generation while committing the terminal
+	// recovery state, before any restart IPC can block.
+	d.workersMu.RLock()
+	handle := d.workers[meta.SessionID]
 	d.sessionsMu.Lock()
 	restart := false
 	if d.isCurrentSessionLocked(meta) && !meta.Closed {
@@ -606,8 +621,15 @@ func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64) {
 	}
 	if restart {
 		meta.Status = StatusRecovering
+		if handle != nil {
+			if d.pendingRestart == nil {
+				d.pendingRestart = make(map[*SessionMeta]*WorkerHandle)
+			}
+			d.pendingRestart[meta] = handle
+		}
 	}
 	d.sessionsMu.Unlock()
+	d.workersMu.RUnlock()
 	if restart {
 		d.restartWorkerForSession(meta)
 	}
@@ -815,12 +837,64 @@ func (d *Daemon) sendToCurrentWorker(
 }
 
 func (d *Daemon) restartWorkerForSession(meta *SessionMeta) {
-	handle, err := d.sendToCurrentWorker(meta, protocol.MsgRestartWorker, "", nil)
-	if err != nil {
-		log.Printf("[daemon] session %s restart worker: %v", safeShort(meta.SessionID), err)
-		return
-	}
+	var lastErr error
+	for attempt := 0; attempt < maxCurrentWorkerSendTries; attempt++ {
+		handle, current := d.markCurrentWorkerRestartPending(meta)
+		if !current {
+			return
+		}
+		if handle == nil || !handle.IsReady() {
+			log.Printf("[daemon] session %s restart worker: no ready worker", safeShort(meta.SessionID))
+			return
+		}
 
+		err := handle.Send(protocol.NewMessage(protocol.MsgRestartWorker, meta.SessionID, ""))
+		if d.isCurrentWorkerForSession(meta, handle) {
+			if err != nil {
+				log.Printf("[daemon] session %s restart worker: %v", safeShort(meta.SessionID), err)
+				return
+			}
+			d.restartWorkerAfterGrace(meta, handle)
+			return
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("worker generation changed while sending %s", protocol.MsgRestartWorker)
+		}
+	}
+	log.Printf("[daemon] session %s restart worker: generation changed after %d attempts: %v",
+		safeShort(meta.SessionID), maxCurrentWorkerSendTries, lastErr)
+}
+
+// markCurrentWorkerRestartPending binds the restart fence to the worker
+// generation selected for the next restart IPC. The worker lock is released
+// before the caller writes to its socket.
+func (d *Daemon) markCurrentWorkerRestartPending(meta *SessionMeta) (*WorkerHandle, bool) {
+	if meta == nil {
+		return nil, false
+	}
+	d.workersMu.RLock()
+	handle := d.workers[meta.SessionID]
+	d.sessionsMu.Lock()
+	if !d.isCurrentSessionLocked(meta) || meta.Closed {
+		d.sessionsMu.Unlock()
+		d.workersMu.RUnlock()
+		return nil, false
+	}
+	meta.Status = StatusRecovering
+	if handle != nil {
+		if d.pendingRestart == nil {
+			d.pendingRestart = make(map[*SessionMeta]*WorkerHandle)
+		}
+		d.pendingRestart[meta] = handle
+	}
+	d.sessionsMu.Unlock()
+	d.workersMu.RUnlock()
+	return handle, true
+}
+
+func (d *Daemon) restartWorkerAfterGrace(meta *SessionMeta, handle *WorkerHandle) {
 	go func() {
 		timer := time.NewTimer(d.workerRestartGrace())
 		defer timer.Stop()
@@ -1297,6 +1371,16 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 	case protocol.MsgReady:
 		h.markReady()
 		d.sessionsMu.Lock()
+		if !d.isCurrentSessionLocked(meta) {
+			d.sessionsMu.Unlock()
+			log.Printf("[daemon] session %s ignored ready from stale session", safeShort(meta.SessionID))
+			return
+		}
+		if d.pendingRestart[meta] == h {
+			d.sessionsMu.Unlock()
+			log.Printf("[daemon] session %s ignored late ready from restarting worker", safeShort(meta.SessionID))
+			return
+		}
 		if !meta.Closed {
 			meta.Status = StatusReady
 		}
