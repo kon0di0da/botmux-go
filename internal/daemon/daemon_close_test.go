@@ -11,6 +11,92 @@ import (
 	"botmux-go/internal/protocol"
 )
 
+func TestSessionFileLockRegistryReleasesUnusedEntries(t *testing.T) {
+	d := &Daemon{}
+
+	release := d.lockSessionFile("purged")
+	release()
+
+	d.sessionFileLocksMu.Lock()
+	_, exists := d.sessionFileLocks["purged"]
+	d.sessionFileLocksMu.Unlock()
+	if exists {
+		t.Fatal("released session file lock remained in the registry")
+	}
+}
+
+func TestSessionFileLockRegistryRetainsWaitingEntries(t *testing.T) {
+	const sessionID = "purged"
+
+	d := &Daemon{}
+	releaseFirst := d.lockSessionFile(sessionID)
+
+	waiterStarted := make(chan struct{})
+	waiterAcquired := make(chan struct{})
+	releaseWaiter := make(chan struct{}, 1)
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		close(waiterStarted)
+		releaseSecond := d.lockSessionFile(sessionID)
+		close(waiterAcquired)
+		<-releaseWaiter
+		releaseSecond()
+	}()
+	t.Cleanup(func() {
+		select {
+		case releaseWaiter <- struct{}{}:
+		default:
+		}
+		<-waiterDone
+	})
+
+	<-waiterStarted
+	waitForSessionFileLockRefs(t, d, sessionID, 2)
+
+	releaseFirst()
+	<-waiterAcquired
+	if exists, refs := sessionFileLockRegistryState(d, sessionID); !exists || refs != 1 {
+		t.Fatalf("registry after first release = exists:%t refs:%d, want exists:true refs:1", exists, refs)
+	}
+
+	releaseWaiter <- struct{}{}
+	<-waiterDone
+	if exists, refs := sessionFileLockRegistryState(d, sessionID); exists || refs != 0 {
+		t.Fatalf("registry after second release = exists:%t refs:%d, want exists:false refs:0", exists, refs)
+	}
+}
+
+func waitForSessionFileLockRefs(t *testing.T, d *Daemon, sessionID string, want int) {
+	t.Helper()
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		exists, refs := sessionFileLockRegistryState(d, sessionID)
+		if exists && refs == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("registry for %q = exists:%t refs:%d, want exists:true refs:%d", sessionID, exists, refs, want)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func sessionFileLockRegistryState(d *Daemon, sessionID string) (bool, int) {
+	d.sessionFileLocksMu.Lock()
+	defer d.sessionFileLocksMu.Unlock()
+
+	entry, exists := d.sessionFileLocks[sessionID]
+	if !exists {
+		return false, 0
+	}
+	return true, entry.refs
+}
+
 func TestStopWaitsForWorkerExitBeforeCancelingDaemonContext(t *testing.T) {
 	meta := NewSessionMeta("daemon-stop-waits-for-worker", "bot-test")
 	handle := NewWorkerHandle(meta.SessionID)

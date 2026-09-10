@@ -35,6 +35,11 @@ const (
 	cancelSendFailureNoLongerCancelling
 )
 
+type sessionFileLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
 type Daemon struct {
 	cfg          *config.DaemonConfig
 	listener     net.Listener
@@ -50,7 +55,7 @@ type Daemon struct {
 	sessions   map[string]*SessionMeta
 	// sessionFileLocks serializes lifecycle filesystem operations by session ID.
 	sessionFileLocksMu sync.Mutex
-	sessionFileLocks   map[string]*sync.Mutex
+	sessionFileLocks   map[string]*sessionFileLockEntry
 	// pendingRestart identifies the worker generation that must not reopen a
 	// recovering session with a late READY.
 	pendingRestart map[*SessionMeta]*WorkerHandle
@@ -91,7 +96,7 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 		ctx:              ctx,
 		cancel:           cancel,
 		sessions:         make(map[string]*SessionMeta),
-		sessionFileLocks: make(map[string]*sync.Mutex),
+		sessionFileLocks: make(map[string]*sessionFileLockEntry),
 		workers:          make(map[string]*WorkerHandle),
 		workerOwners:     make(map[*WorkerHandle]*SessionMeta),
 		connToSess:       make(map[net.Conn]string),
@@ -104,17 +109,30 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 func (d *Daemon) lockSessionFile(sessionID string) func() {
 	d.sessionFileLocksMu.Lock()
 	if d.sessionFileLocks == nil {
-		d.sessionFileLocks = make(map[string]*sync.Mutex)
+		d.sessionFileLocks = make(map[string]*sessionFileLockEntry)
 	}
-	lock := d.sessionFileLocks[sessionID]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		d.sessionFileLocks[sessionID] = lock
+	entry := d.sessionFileLocks[sessionID]
+	if entry == nil {
+		entry = &sessionFileLockEntry{}
+		d.sessionFileLocks[sessionID] = entry
 	}
+	entry.refs++
 	d.sessionFileLocksMu.Unlock()
 
-	lock.Lock()
-	return lock.Unlock
+	entry.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.mu.Unlock()
+
+			d.sessionFileLocksMu.Lock()
+			entry.refs--
+			if entry.refs == 0 && d.sessionFileLocks[sessionID] == entry {
+				delete(d.sessionFileLocks, sessionID)
+			}
+			d.sessionFileLocksMu.Unlock()
+		})
+	}
 }
 
 func (d *Daemon) Start() error {
