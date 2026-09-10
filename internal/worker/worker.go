@@ -354,8 +354,10 @@ func (w *Worker) readyHandshake(conn net.Conn) (*protocol.MessageReader, error) 
 		return nil, &workerHandshakeRejectedError{payload: msg.Payload}
 	}
 	if msg.Type != protocol.MsgAck || msg.SessionID != w.sessionID || msg.Payload != workerReadyAckPayload {
-		return nil, fmt.Errorf("unexpected ready acknowledgment: type=%s session=%q payload=%q",
-			msg.Type, msg.SessionID, msg.Payload)
+		return nil, &workerHandshakeRejectedError{payload: fmt.Sprintf(
+			"unexpected ready acknowledgment: type=%s session=%q payload=%q",
+			msg.Type, msg.SessionID, msg.Payload,
+		)}
 	}
 	return reader, nil
 }
@@ -365,18 +367,29 @@ func (w *Worker) sendError(msg string) {
 }
 
 func (w *Worker) sendMessage(typ protocol.MessageType, payload string) error {
+	_, err := w.sendMessageWithConn(typ, payload)
+	return err
+}
+
+func (w *Worker) sendMessageWithConn(typ protocol.MessageType, payload string) (net.Conn, error) {
 	w.sendMu.Lock()
 	defer w.sendMu.Unlock()
 	w.connMu.Lock()
 	conn := w.conn
 	w.connMu.Unlock()
 	if conn == nil {
-		return errors.New("connection closed")
+		return nil, errors.New("connection closed")
 	}
 	m := protocol.NewMessage(typ, w.sessionID, payload)
 	m.WorkerInstanceID = w.workerInstanceID
 	_, err := m.WriteTo(conn)
-	return err
+	return conn, err
+}
+
+func (w *Worker) isCurrentConn(conn net.Conn) bool {
+	w.connMu.Lock()
+	defer w.connMu.Unlock()
+	return conn != nil && w.conn == conn
 }
 
 func (w *Worker) readDaemonMessages() {
@@ -791,7 +804,8 @@ func (w *Worker) sendHeartbeats() {
 		case <-w.ctx.Done():
 			return
 		case <-ticks:
-			if err := w.sendMessage(protocol.MsgHeartbeat, ""); err != nil {
+			conn, err := w.sendMessageWithConn(protocol.MsgHeartbeat, "")
+			if err != nil && w.isCurrentConn(conn) {
 				w.setConnected(false)
 				go w.reconnectToDaemon()
 			}

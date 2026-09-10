@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -145,6 +146,169 @@ func TestWorkerInitialHandshakeRejectionCleansUpAdapter(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not close rejected connection")
+	}
+}
+
+func TestWorkerHandshakeRejectsMalformedAcknowledgement(t *testing.T) {
+	const sessionID = "worker-malformed-ack"
+
+	tests := []struct {
+		name       string
+		response   func() *protocol.Message
+		wantDetail string
+	}{
+		{
+			name: "ack with wrong session",
+			response: func() *protocol.Message {
+				return protocol.NewMessage(protocol.MsgAck, "other-session", workerReadyAckPayload)
+			},
+			wantDetail: `session="other-session"`,
+		},
+		{
+			name: "ack with wrong payload",
+			response: func() *protocol.Message {
+				return protocol.NewMessage(protocol.MsgAck, sessionID, "not_worker_ready")
+			},
+			wantDetail: `payload="not_worker_ready"`,
+		},
+		{
+			name: "heartbeat",
+			response: func() *protocol.Message {
+				return protocol.NewMessage(protocol.MsgHeartbeat, sessionID, "unexpected")
+			},
+			wantDetail: "type=heartbeat",
+		},
+		{
+			name: "error",
+			response: func() *protocol.Message {
+				return protocol.NewMessage(protocol.MsgError, sessionID, "daemon rejected worker")
+			},
+			wantDetail: "daemon rejected worker",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			daemonConn, workerConn := net.Pipe()
+			handshakeWorker := New(Options{
+				SessionID:  sessionID,
+				DaemonAddr: "daemon-test",
+				CliType:    "mock",
+			})
+			handshakePeerDone := make(chan error, 1)
+			go func() {
+				defer daemonConn.Close()
+				msg, err := protocol.NewMessageReader(daemonConn).Read()
+				if err != nil {
+					handshakePeerDone <- fmt.Errorf("read ready: %w", err)
+					return
+				}
+				if msg.Type != protocol.MsgReady {
+					handshakePeerDone <- fmt.Errorf("message type = %s, want %s", msg.Type, protocol.MsgReady)
+					return
+				}
+				_, err = tt.response().WriteTo(daemonConn)
+				handshakePeerDone <- err
+			}()
+
+			_, err := handshakeWorker.readyHandshake(workerConn)
+			_ = workerConn.Close()
+			var rejected *workerHandshakeRejectedError
+			if !errors.As(err, &rejected) {
+				t.Errorf("readyHandshake error = %T (%v), want workerHandshakeRejectedError", err, err)
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantDetail) {
+				t.Errorf("readyHandshake error = %v, want detail %q", err, tt.wantDetail)
+			}
+			select {
+			case err := <-handshakePeerDone:
+				if err != nil {
+					t.Fatalf("send malformed acknowledgement: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("handshake peer did not finish")
+			}
+
+			oldDaemonConn, oldWorkerConn := net.Pipe()
+			newDaemonConn, newWorkerConn := net.Pipe()
+			reconnectWorker := New(Options{
+				SessionID:  sessionID,
+				DaemonAddr: "daemon-test",
+				CliType:    "mock",
+			})
+			reconnectWorker.conn = oldWorkerConn
+			reconnectWorker.msgReader = protocol.NewMessageReader(oldWorkerConn)
+			reconnectWorker.reconnectSleep = func(time.Duration) {}
+
+			var dialCalls atomic.Int32
+			secondDial := make(chan struct{}, 1)
+			reconnectWorker.dial = func(string, string) (net.Conn, error) {
+				if dialCalls.Add(1) == 1 {
+					return newWorkerConn, nil
+				}
+				select {
+				case secondDial <- struct{}{}:
+				default:
+				}
+				<-reconnectWorker.ctx.Done()
+				return nil, reconnectWorker.ctx.Err()
+			}
+			t.Cleanup(func() {
+				reconnectWorker.Cancel()
+				_ = oldDaemonConn.Close()
+				_ = newDaemonConn.Close()
+			})
+
+			reconnectPeerDone := make(chan error, 1)
+			go func() {
+				defer newDaemonConn.Close()
+				msg, err := protocol.NewMessageReader(newDaemonConn).Read()
+				if err != nil {
+					reconnectPeerDone <- fmt.Errorf("read reconnect ready: %w", err)
+					return
+				}
+				if msg.Type != protocol.MsgReady {
+					reconnectPeerDone <- fmt.Errorf("reconnect message type = %s, want %s", msg.Type, protocol.MsgReady)
+					return
+				}
+				_, err = tt.response().WriteTo(newDaemonConn)
+				reconnectPeerDone <- err
+			}()
+
+			reconnectDone := make(chan struct{})
+			go func() {
+				reconnectWorker.reconnectToDaemon()
+				close(reconnectDone)
+			}()
+
+			select {
+			case <-reconnectDone:
+			case <-secondDial:
+				t.Fatal("reconnect retried after malformed acknowledgement")
+			case <-time.After(time.Second):
+				t.Fatal("reconnect did not stop after malformed acknowledgement")
+			}
+			if got := dialCalls.Load(); got != 1 {
+				t.Errorf("dial calls = %d, want 1", got)
+			}
+			if !reconnectWorker.isClosed() {
+				t.Error("worker was not cleaned up after malformed acknowledgement")
+			}
+			reconnectWorker.connMu.Lock()
+			publishedConn := reconnectWorker.conn
+			reconnectWorker.connMu.Unlock()
+			if publishedConn != nil {
+				t.Error("worker retained a connection after malformed acknowledgement")
+			}
+			select {
+			case err := <-reconnectPeerDone:
+				if err != nil {
+					t.Fatalf("send reconnect malformed acknowledgement: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("reconnect peer did not finish")
+			}
+		})
 	}
 }
 
@@ -1008,6 +1172,87 @@ func TestWorkerReconnectPublishesConnectionDespiteBlockedOldWrite(t *testing.T) 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("closing the stale connection did not unblock the old write")
+	}
+}
+
+func TestWorkerHeartbeatDoesNotReconnectAfterStaleWriteFailure(t *testing.T) {
+	oldDaemonConn, oldWorkerConn := net.Pipe()
+	staleConn := newCloseBlockingWriteConn(oldWorkerConn)
+	newConn := &recordingConn{}
+	ticks := make(chan time.Time, 1)
+	w := New(Options{
+		SessionID:  "worker-stale-heartbeat",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	w.conn = staleConn
+	w.msgReader = protocol.NewMessageReader(staleConn)
+	w.heartbeatTicks = ticks
+
+	var reconnectCalls atomic.Int32
+	reconnectStarted := make(chan struct{}, 1)
+	w.reconnectSleep = func(time.Duration) {
+		reconnectCalls.Add(1)
+		select {
+		case reconnectStarted <- struct{}{}:
+		default:
+		}
+		<-w.ctx.Done()
+	}
+	var dialCalls atomic.Int32
+	w.dial = func(string, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		return nil, errors.New("unexpected reconnect dial")
+	}
+
+	heartbeatsDone := make(chan struct{})
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = staleConn.Close()
+		_ = oldDaemonConn.Close()
+		select {
+		case <-heartbeatsDone:
+		case <-time.After(time.Second):
+			t.Error("heartbeat goroutine did not exit")
+		}
+	})
+
+	w.wg.Add(1)
+	go func() {
+		w.sendHeartbeats()
+		close(heartbeatsDone)
+	}()
+
+	ticks <- time.Now()
+	waitForSignal(t, staleConn.writeStarted, "stale heartbeat write to start")
+
+	oldConn := w.publishConnection(newConn, protocol.NewMessageReader(newConn))
+	if oldConn != staleConn {
+		t.Fatal("heartbeat did not write to the stale connection")
+	}
+	if err := oldConn.Close(); err != nil {
+		t.Fatalf("close stale connection: %v", err)
+	}
+
+	select {
+	case <-reconnectStarted:
+		t.Fatal("heartbeat started reconnect after stale write failure")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := reconnectCalls.Load(); got != 0 {
+		t.Fatalf("reconnect calls = %d, want 0", got)
+	}
+	if got := dialCalls.Load(); got != 0 {
+		t.Fatalf("dial calls = %d, want 0", got)
+	}
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != newConn {
+		t.Fatal("stale heartbeat failure replaced the newly published connection")
+	}
+	if !w.isConnected() {
+		t.Fatal("stale heartbeat failure marked the newly connected worker disconnected")
 	}
 }
 
