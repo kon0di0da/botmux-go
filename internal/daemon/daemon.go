@@ -1131,7 +1131,7 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		return
 	}
 
-	if isClientFirstMessage(first) {
+	if first.Type != protocol.MsgReady && isClientFirstMessage(first) {
 		d.handleClientConn(conn, reader, first)
 		return
 	}
