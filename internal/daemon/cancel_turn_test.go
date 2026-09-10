@@ -114,9 +114,7 @@ func TestCancelTurnRetriesReplacementWorker(t *testing.T) {
 	original.SetConn(&replaceOnFirstWriteConn{
 		Conn: originalConn,
 		replace: func() {
-			d.workersMu.Lock()
-			d.workers[meta.SessionID] = replacement
-			d.workersMu.Unlock()
+			installTestWorker(d, meta, replacement)
 		},
 		err: errors.New("original worker write failed"),
 	})
@@ -158,9 +156,7 @@ func TestCancelTurnAcceptsBeforeWorkerReplacementRetryExhaustionFailure(t *testi
 		current.SetConn(&replaceOnFirstWriteConn{
 			Conn: currentConn,
 			replace: func() {
-				d.workersMu.Lock()
-				d.workers[meta.SessionID] = next
-				d.workersMu.Unlock()
+				installTestWorker(d, meta, next)
 			},
 			err: fmt.Errorf("worker generation %d write failed", attempt),
 		})
@@ -329,9 +325,7 @@ func TestCancelTimeoutLateReadyDoesNotAdmitTurn(t *testing.T) {
 	}
 
 	replacement := NewWorkerHandle(meta.SessionID)
-	d.workersMu.Lock()
-	d.workers[meta.SessionID] = replacement
-	d.workersMu.Unlock()
+	installTestWorker(d, meta, replacement)
 	d.routeMessage(protocol.NewMessage(protocol.MsgReady, meta.SessionID, ""), meta, replacement)
 	if !replacement.IsReady() {
 		t.Fatal("replacement worker was not marked ready")
@@ -364,9 +358,7 @@ func TestCancelTimeoutRestartsCurrentReplacementWorker(t *testing.T) {
 	}
 
 	replacement, replacementWorkerConn := newCancelTestWorker(t, d, meta.SessionID)
-	d.workersMu.Lock()
-	d.workers[meta.SessionID] = replacement
-	d.workersMu.Unlock()
+	installTestWorker(d, meta, replacement)
 
 	if msg := mustReadMessage(t, replacementWorkerConn); msg.Type != protocol.MsgRestartWorker {
 		t.Fatalf("replacement message type = %s, want %s", msg.Type, protocol.MsgRestartWorker)
@@ -425,9 +417,7 @@ func TestCancelWatchdogDoesNotRestartReusedSessionID(t *testing.T) {
 	d.sessionsMu.Lock()
 	d.sessions[oldMeta.SessionID] = newMeta
 	d.sessionsMu.Unlock()
-	d.workersMu.Lock()
-	d.workers[oldMeta.SessionID] = newHandle
-	d.workersMu.Unlock()
+	installTestWorker(d, newMeta, newHandle)
 
 	watchDone := make(chan struct{})
 	go func() {
@@ -498,9 +488,7 @@ func TestCommitCancelSendFailureRetriesReplacementWorker(t *testing.T) {
 	}
 
 	replacement, replacementWorkerConn := newCancelTestWorker(t, d, meta.SessionID)
-	d.workersMu.Lock()
-	d.workers[meta.SessionID] = replacement
-	d.workersMu.Unlock()
+	installTestWorker(d, meta, replacement)
 
 	if got := d.commitCancelSendFailureIfCurrent(meta, token, original, errors.New("original worker write failed")); got != cancelSendFailureRetry {
 		t.Fatalf("commit cancel send failure result = %v, want retry", got)
@@ -565,9 +553,7 @@ func TestCancelTurnAbortedTerminalKeepsSessionOpen(t *testing.T) {
 func TestRouteMessageIgnoresTerminalFromStaleWorker(t *testing.T) {
 	d, meta, stale, _ := newCancelTestDaemon(t)
 	current := NewWorkerHandle(meta.SessionID)
-	d.workersMu.Lock()
-	d.workers[meta.SessionID] = current
-	d.workersMu.Unlock()
+	installTestWorker(d, meta, current)
 	if !meta.BeginTurn() {
 		t.Fatal("begin turn")
 	}
@@ -580,6 +566,185 @@ func TestRouteMessageIgnoresTerminalFromStaleWorker(t *testing.T) {
 
 	if snapshot := meta.TurnSnapshot(); !snapshot.Active {
 		t.Fatalf("turn snapshot = %#v, want active turn", snapshot)
+	}
+}
+
+func TestSpawnStaleSessionDoesNotReplaceReusedSessionWorker(t *testing.T) {
+	oldMeta := NewSessionMeta("reused-session", "bot-old")
+	oldMeta.Status = StatusReady
+	oldHandle := NewWorkerHandle(oldMeta.SessionID)
+	replacementMeta := NewSessionMeta(oldMeta.SessionID, "bot-new")
+	replacementMeta.Status = StatusReady
+	replacement := NewWorkerHandle(oldMeta.SessionID)
+	replacementConn, replacementPeer := net.Pipe()
+	replacement.SetConn(replacementConn)
+	t.Cleanup(func() {
+		_ = replacementConn.Close()
+		_ = replacementPeer.Close()
+	})
+
+	d := &Daemon{
+		cfg:            &config.DaemonConfig{ListenAddr: "127.0.0.1:1", SessionsDir: t.TempDir()},
+		selfExe:        "/definitely/not/a/botmux-worker",
+		store:          NewSessionStore(t.TempDir()),
+		sessions:       map[string]*SessionMeta{oldMeta.SessionID: oldMeta},
+		workers:        map[string]*WorkerHandle{oldMeta.SessionID: oldHandle},
+		workerOwners:   map[*WorkerHandle]*SessionMeta{oldHandle: oldMeta},
+		pendingRestart: make(map[*SessionMeta]*WorkerHandle),
+	}
+
+	d.workersMu.Lock()
+	spawnErr := make(chan error, 1)
+	go func() {
+		spawnErr <- d.spawnWorkerForSession(oldMeta)
+	}()
+
+	// The old implementation validates under sessionsMu, drops it, then waits
+	// for workersMu. A correct implementation waits on workersMu first.
+	oldSpawnObserved := false
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		d.sessionsMu.RLock()
+		oldSpawnObserved = oldMeta.Status == StatusSpawning
+		d.sessionsMu.RUnlock()
+		if oldSpawnObserved {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	d.sessionsMu.Lock()
+	d.sessions[oldMeta.SessionID] = replacementMeta
+	d.sessionsMu.Unlock()
+	d.workers[oldMeta.SessionID] = replacement
+	d.workerOwners[replacement] = replacementMeta
+	d.workersMu.Unlock()
+
+	err := <-spawnErr
+	if err == nil || !strings.Contains(err.Error(), "no longer current") {
+		t.Fatalf("spawn stale session error = %v, want current-session error (old phase observed=%t)", err, oldSpawnObserved)
+	}
+
+	d.sessionsMu.RLock()
+	currentMeta := d.sessions[oldMeta.SessionID]
+	status := replacementMeta.Status
+	d.sessionsMu.RUnlock()
+	if currentMeta != replacementMeta {
+		t.Fatalf("current session = %p, want replacement %p", currentMeta, replacementMeta)
+	}
+	if status != StatusReady || replacementMeta.Closed {
+		t.Fatalf("replacement session state = (%s, closed=%t), want READY and open", status, replacementMeta.Closed)
+	}
+	d.workersMu.RLock()
+	currentHandle := d.workers[oldMeta.SessionID]
+	owner := d.workerOwners[replacement]
+	d.workersMu.RUnlock()
+	if currentHandle != replacement {
+		t.Fatalf("current worker = %p, want replacement %p", currentHandle, replacement)
+	}
+	if owner != replacementMeta {
+		t.Fatalf("replacement owner = %p, want %p", owner, replacementMeta)
+	}
+}
+
+func TestWorkerExitDoesNotRecoverReusedSession(t *testing.T) {
+	oldMeta := NewSessionMeta("reused-session", "bot-old")
+	oldMeta.Status = StatusReady
+	newMeta := NewSessionMeta(oldMeta.SessionID, "bot-new")
+	newMeta.Status = StatusReady
+	callbackDrained := make(chan struct{}, 1)
+	newMeta.AddOnClose(func() { callbackDrained <- struct{}{} })
+
+	handle := NewWorkerHandle(oldMeta.SessionID)
+	handle.Cmd = exec.Command("/bin/sh", "-c", "sleep 10")
+	if err := handle.Cmd.Start(); err != nil {
+		t.Fatalf("start worker fixture: %v", err)
+	}
+	handle.Pid = handle.Cmd.Process.Pid
+	d := &Daemon{
+		sessions:      map[string]*SessionMeta{oldMeta.SessionID: oldMeta},
+		workers:       map[string]*WorkerHandle{oldMeta.SessionID: handle},
+		workerOwners:  map[*WorkerHandle]*SessionMeta{handle: oldMeta},
+		spawnFailures: make(map[string]*spawnFailure),
+	}
+	t.Cleanup(func() {
+		if handle.Cmd.Process != nil {
+			_ = handle.Cmd.Process.Kill()
+		}
+		select {
+		case <-handle.ExitDone:
+		case <-time.After(time.Second):
+			t.Error("worker fixture was not reaped")
+		}
+	})
+
+	d.sessionsMu.Lock()
+	d.sessions[oldMeta.SessionID] = newMeta
+	d.sessionsMu.Unlock()
+	go d.waitWorkerExit(handle)
+	if err := handle.Cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill old worker: %v", err)
+	}
+	select {
+	case <-handle.ExitDone:
+	case <-time.After(time.Second):
+		t.Fatal("old worker did not exit")
+	}
+
+	d.sessionsMu.RLock()
+	status := newMeta.Status
+	closed := newMeta.Closed
+	d.sessionsMu.RUnlock()
+	if status != StatusReady || closed {
+		t.Fatalf("replacement session state = (%s, closed=%t), want READY and open", status, closed)
+	}
+	select {
+	case <-callbackDrained:
+		t.Fatal("replacement session callback was drained by old worker exit")
+	default:
+	}
+	d.workersMu.RLock()
+	current := d.workers[newMeta.SessionID]
+	d.workersMu.RUnlock()
+	if current != handle {
+		t.Fatalf("current worker = %p, want old handle %p", current, handle)
+	}
+}
+
+func TestRouteMessageCloseDoesNotCloseReusedSession(t *testing.T) {
+	d, oldMeta, oldHandle, _ := newCancelTestDaemon(t)
+	newMeta := NewSessionMeta(oldMeta.SessionID, "bot-new")
+	newMeta.Status = StatusReady
+	callbackDrained := make(chan struct{}, 1)
+	newMeta.AddOnClose(func() { callbackDrained <- struct{}{} })
+
+	d.sessionsMu.Lock()
+	d.sessions[oldMeta.SessionID] = newMeta
+	d.sessionsMu.Unlock()
+
+	d.routeMessage(protocol.NewMessage(protocol.MsgClose, oldMeta.SessionID, ""), oldMeta, oldHandle)
+
+	d.sessionsMu.RLock()
+	currentMeta := d.sessions[oldMeta.SessionID]
+	status := newMeta.Status
+	closed := newMeta.Closed
+	d.sessionsMu.RUnlock()
+	if currentMeta != newMeta {
+		t.Fatalf("current session = %p, want replacement %p", currentMeta, newMeta)
+	}
+	if status != StatusReady || closed {
+		t.Fatalf("replacement session state = (%s, closed=%t), want READY and open", status, closed)
+	}
+	select {
+	case <-callbackDrained:
+		t.Fatal("replacement session callback was drained by old worker close")
+	default:
+	}
+	d.workersMu.RLock()
+	currentHandle := d.workers[oldMeta.SessionID]
+	d.workersMu.RUnlock()
+	if currentHandle != oldHandle {
+		t.Fatalf("current worker = %p, want old handle %p", currentHandle, oldHandle)
 	}
 }
 
@@ -611,6 +776,7 @@ func newCancelTestDaemon(t *testing.T) (*Daemon, *SessionMeta, *WorkerHandle, ne
 		store:              store,
 		sessions:           map[string]*SessionMeta{meta.SessionID: meta},
 		workers:            map[string]*WorkerHandle{meta.SessionID: handle},
+		workerOwners:       map[*WorkerHandle]*SessionMeta{handle: meta},
 		spawnFailures:      make(map[string]*spawnFailure),
 		turnCancelTimeout:  20 * time.Millisecond,
 		restartWorkerGrace: 20 * time.Millisecond,
@@ -660,6 +826,16 @@ func newCancelTestWorker(t *testing.T, d *Daemon, sessionID string) (*WorkerHand
 		}
 	})
 	return handle, workerConn
+}
+
+func installTestWorker(d *Daemon, meta *SessionMeta, handle *WorkerHandle) {
+	d.workersMu.Lock()
+	if d.workerOwners == nil {
+		d.workerOwners = make(map[*WorkerHandle]*SessionMeta)
+	}
+	d.workers[meta.SessionID] = handle
+	d.workerOwners[handle] = meta
+	d.workersMu.Unlock()
 }
 
 type replaceOnFirstWriteConn struct {

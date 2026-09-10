@@ -51,6 +51,9 @@ type Daemon struct {
 
 	workersMu sync.RWMutex
 	workers   map[string]*WorkerHandle
+	// workerOwners binds each worker generation to the exact SessionMeta
+	// instance that created it. Session IDs can be purged and reused.
+	workerOwners map[*WorkerHandle]*SessionMeta
 
 	connMapMu  sync.Mutex
 	connToSess map[net.Conn]string
@@ -83,6 +86,7 @@ func New(cfg *config.DaemonConfig) (*Daemon, error) {
 		cancel:         cancel,
 		sessions:       make(map[string]*SessionMeta),
 		workers:        make(map[string]*WorkerHandle),
+		workerOwners:   make(map[*WorkerHandle]*SessionMeta),
 		connToSess:     make(map[net.Conn]string),
 		pendingRestart: make(map[*SessionMeta]*WorkerHandle),
 	}, nil
@@ -270,41 +274,33 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 	cmd.Stderr = os.Stderr
 	handle.Cmd = cmd
 
+	// Keep the identity check and worker replacement in one workersMu ->
+	// sessionsMu critical section. A session ID may have been purged and
+	// recreated while an earlier spawn was waiting to run.
+	d.workersMu.Lock()
 	d.sessionsMu.Lock()
 	if !d.isCurrentSessionLocked(meta) {
 		d.sessionsMu.Unlock()
+		d.workersMu.Unlock()
 		return fmt.Errorf("session %s is no longer current", meta.SessionID)
 	}
 	meta.Status = StatusSpawning
 	delete(d.pendingRestart, meta)
-	d.sessionsMu.Unlock()
-
-	d.workersMu.Lock()
-	if existing, ok := d.workers[meta.SessionID]; ok && existing != nil {
-		if existing.Cmd != nil && existing.Cmd.Process != nil {
-			_ = existing.Cmd.Process.Kill()
-		}
-		if existing.Conn != nil {
-			_ = existing.Conn.Close()
-		}
-	}
-	d.workers[meta.SessionID] = handle
-	d.workersMu.Unlock()
-
+	existing := d.workers[meta.SessionID]
+	d.installWorkerLocked(meta, handle)
 	if err := cmd.Start(); err != nil {
-		d.workersMu.Lock()
-		if cur, ok := d.workers[meta.SessionID]; ok && cur == handle {
-			delete(d.workers, meta.SessionID)
-		}
-		d.workersMu.Unlock()
-		d.sessionsMu.Lock()
-		if d.isCurrentSessionLocked(meta) {
-			meta.Status = StatusRecovering
-		}
+		d.deleteWorkerIfCurrentLocked(meta.SessionID, handle)
+		meta.Status = StatusRecovering
 		d.sessionsMu.Unlock()
+		d.workersMu.Unlock()
+		d.stopWorkerHandle(existing)
 		return fmt.Errorf("spawn worker: %w", err)
 	}
 	handle.Pid = cmd.Process.Pid
+	d.sessionsMu.Unlock()
+	d.workersMu.Unlock()
+
+	d.stopWorkerHandle(existing)
 
 	_ = d.store.UpdateWorkerPID(meta.SessionID, handle.Pid)
 
@@ -371,23 +367,27 @@ func (d *Daemon) waitWorkerExit(handle *WorkerHandle) {
 		}
 	}
 
+	// Resolve the worker's original owner while deciding whether this exit can
+	// affect session state. A reused ID can have a different SessionMeta while
+	// the old worker remains in the current worker slot.
 	d.workersMu.Lock()
-	h, exists := d.workers[handle.SessionID]
-	isCurrent := exists && h == handle
-	if isCurrent {
-		delete(d.workers, handle.SessionID)
-	}
-	d.workersMu.Unlock()
-
 	d.sessionsMu.Lock()
-	meta, ok := d.sessions[handle.SessionID]
-	shouldRecover := isCurrent && ok && !meta.Closed
+	owner := d.workerOwnerLocked(handle)
+	h := d.workers[handle.SessionID]
+	isOwnedCurrent := h == handle && owner != nil && d.isCurrentSessionLocked(owner)
+	if isOwnedCurrent {
+		d.deleteWorkerIfCurrentLocked(handle.SessionID, handle)
+	} else if d.workerOwners != nil && d.workerOwners[handle] == owner {
+		delete(d.workerOwners, handle)
+	}
+	shouldRecover := isOwnedCurrent && !owner.Closed
 	if shouldRecover {
-		meta.Status = StatusRecovering
+		owner.Status = StatusRecovering
 	}
 	d.sessionsMu.Unlock()
+	d.workersMu.Unlock()
 
-	if isCurrent && shouldRecover && handle.markStartupFailure() {
+	if shouldRecover && handle.markStartupFailure() {
 		failCount := d.recordSpawnFailure(handle.SessionID)
 		log.Printf("[daemon] session %s: worker exited before READY (fail_count=%d)",
 			safeShort(handle.SessionID), failCount)
@@ -395,8 +395,8 @@ func (d *Daemon) waitWorkerExit(handle *WorkerHandle) {
 
 	handle.CloseConn()
 
-	if ok {
-		for _, fn := range meta.DrainOnClose() {
+	if isOwnedCurrent {
+		for _, fn := range owner.DrainOnClose() {
 			func() {
 				defer func() { _ = recover() }()
 				fn()
@@ -432,7 +432,7 @@ func (d *Daemon) removeSession(id string) {
 	d.workersMu.Lock()
 	h, hasHandle := d.workers[id]
 	if hasHandle {
-		delete(d.workers, id)
+		d.deleteWorkerIfCurrentLocked(id, h)
 	}
 	d.workersMu.Unlock()
 
@@ -462,17 +462,51 @@ func (d *Daemon) removeSession(id string) {
 	}
 }
 
-func (d *Daemon) PurgeSession(id string) {
-	d.workersMu.Lock()
-	h, hasHandle := d.workers[id]
-	if hasHandle {
-		delete(d.workers, id)
+func (d *Daemon) removeSessionMeta(meta *SessionMeta) {
+	if meta == nil {
+		return
 	}
+
+	d.workersMu.Lock()
+	d.sessionsMu.Lock()
+	if !d.isCurrentSessionLocked(meta) {
+		d.sessionsMu.Unlock()
+		d.workersMu.Unlock()
+		return
+	}
+
+	meta.Closed = true
+	meta.Status = StatusClosed
+	h := d.workers[meta.SessionID]
+	hasHandle := h != nil && d.workerOwnedByMetaLocked(h, meta)
+	if hasHandle {
+		d.deleteWorkerIfCurrentLocked(meta.SessionID, h)
+	}
+	d.sessionsMu.Unlock()
 	d.workersMu.Unlock()
 
+	_ = d.store.MarkClosed(meta.SessionID)
+	if hasHandle {
+		h.CloseConn()
+	}
+	for _, fn := range meta.DrainOnClose() {
+		func() {
+			defer func() { _ = recover() }()
+			fn()
+		}()
+	}
+}
+
+func (d *Daemon) PurgeSession(id string) {
+	d.workersMu.Lock()
 	d.sessionsMu.Lock()
+	h, hasHandle := d.workers[id]
+	if hasHandle {
+		d.deleteWorkerIfCurrentLocked(id, h)
+	}
 	delete(d.sessions, id)
 	d.sessionsMu.Unlock()
+	d.workersMu.Unlock()
 
 	if hasHandle && h != nil {
 		h.CloseConn()
@@ -740,6 +774,79 @@ func (d *Daemon) isCurrentSession(meta *SessionMeta) bool {
 
 func (d *Daemon) isCurrentSessionLocked(meta *SessionMeta) bool {
 	return meta != nil && d.sessions[meta.SessionID] == meta
+}
+
+// workerOwnedByMetaLocked treats a nil workerOwners map as a legacy test
+// fixture. Production daemons initialize it in New and record every install.
+func (d *Daemon) workerOwnedByMetaLocked(handle *WorkerHandle, meta *SessionMeta) bool {
+	if handle == nil || meta == nil {
+		return false
+	}
+	if d.workerOwners == nil {
+		return true
+	}
+	return d.workerOwners[handle] == meta
+}
+
+func (d *Daemon) workerOwnerLocked(handle *WorkerHandle) *SessionMeta {
+	if handle == nil {
+		return nil
+	}
+	if d.workerOwners != nil {
+		return d.workerOwners[handle]
+	}
+	// Older literal Daemon fixtures do not initialize workerOwners. Their
+	// worker map remains safe to use only while the handle is still current.
+	if d.workers[handle.SessionID] != handle {
+		return nil
+	}
+	return d.sessions[handle.SessionID]
+}
+
+func (d *Daemon) installWorkerLocked(meta *SessionMeta, handle *WorkerHandle) {
+	if d.workers == nil {
+		d.workers = make(map[string]*WorkerHandle)
+	}
+	if d.workerOwners == nil {
+		d.workerOwners = make(map[*WorkerHandle]*SessionMeta)
+	}
+	d.workers[meta.SessionID] = handle
+	d.workerOwners[handle] = meta
+}
+
+func (d *Daemon) deleteWorkerIfCurrentLocked(sessionID string, handle *WorkerHandle) bool {
+	if handle == nil || d.workers[sessionID] != handle {
+		return false
+	}
+	delete(d.workers, sessionID)
+	if d.workerOwners != nil {
+		delete(d.workerOwners, handle)
+	}
+	return true
+}
+
+func (d *Daemon) stopWorkerHandle(handle *WorkerHandle) {
+	if handle == nil {
+		return
+	}
+	if handle.Cmd != nil && handle.Cmd.Process != nil {
+		_ = handle.Cmd.Process.Kill()
+	}
+	handle.CloseConn()
+}
+
+func (d *Daemon) isCurrentSessionWorker(meta *SessionMeta, handle *WorkerHandle) bool {
+	if meta == nil || handle == nil {
+		return false
+	}
+	d.workersMu.RLock()
+	defer d.workersMu.RUnlock()
+	if d.workers[meta.SessionID] != handle || !d.workerOwnedByMetaLocked(handle, meta) {
+		return false
+	}
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	return d.isCurrentSessionLocked(meta)
 }
 
 func (d *Daemon) hasReadyCurrentWorkerForSession(meta *SessionMeta) bool {
@@ -1032,12 +1139,22 @@ func (d *Daemon) handleConn(conn net.Conn) {
 	}
 
 	d.workersMu.Lock()
+	d.sessionsMu.RLock()
+	if !d.isCurrentSessionLocked(meta) || meta.Closed {
+		d.sessionsMu.RUnlock()
+		d.workersMu.Unlock()
+		return
+	}
 	h, hasH := d.workers[sessionID]
 	if !hasH || h == nil {
 		h = NewWorkerHandle(sessionID)
-		d.workers[sessionID] = h
+		d.installWorkerLocked(meta, h)
+	} else if d.workerOwners == nil {
+		d.workerOwners = make(map[*WorkerHandle]*SessionMeta)
+		d.workerOwners[h] = meta
 	}
 	oldConn := h.SetConn(conn)
+	d.sessionsMu.RUnlock()
 	d.workersMu.Unlock()
 	if oldConn != nil && oldConn != conn {
 		_ = oldConn.Close()
@@ -1385,14 +1502,13 @@ func isClosedChan(ch chan struct{}) bool {
 }
 
 func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *WorkerHandle) {
-	if h != nil && !d.isCurrentWorker(h) {
+	if h != nil && !d.isCurrentSessionWorker(meta, h) {
 		log.Printf("[daemon] session %s ignored message from stale worker", safeShort(meta.SessionID))
 		return
 	}
 
 	switch msg.Type {
 	case protocol.MsgReady:
-		h.markReady()
 		d.sessionsMu.Lock()
 		if !d.isCurrentSessionLocked(meta) {
 			d.sessionsMu.Unlock()
@@ -1408,6 +1524,7 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 			meta.Status = StatusReady
 		}
 		d.sessionsMu.Unlock()
+		h.markReady()
 		d.clearSpawnFailure(meta.SessionID)
 		log.Printf("[daemon] session %s -> READY", safeShort(meta.SessionID))
 		meta.touchActive()
@@ -1445,7 +1562,7 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 		}
 	case protocol.MsgClose:
 		log.Printf("[daemon] session %s closed by worker", safeShort(meta.SessionID))
-		d.removeSession(meta.SessionID)
+		d.removeSessionMeta(meta)
 	default:
 		log.Printf("[daemon] session %s unknown msg type=%s", safeShort(meta.SessionID), msg.Type)
 	}
