@@ -20,6 +20,7 @@ import (
 const (
 	defaultCancelTurnTimeout  = 10 * time.Second
 	defaultRestartWorkerGrace = 2 * time.Second
+	maxCurrentWorkerSendTries = 3
 )
 
 type Daemon struct {
@@ -562,26 +563,22 @@ func (d *Daemon) CancelTurn(id string) error {
 	}
 	d.sessionsMu.RUnlock()
 
-	d.workersMu.RLock()
-	handle := d.workers[id]
-	d.workersMu.RUnlock()
-	if handle == nil || !handle.IsReady() || !d.isCurrentWorker(handle) {
-		return fmt.Errorf("session %s has no ready worker", id)
-	}
-
 	token, ok := meta.BeginTurnCancel()
 	if !ok {
 		return fmt.Errorf("session %s has no cancellable active turn", id)
 	}
-	if err := handle.Send(protocol.NewMessage(protocol.MsgCancelTurn, id, "")); err != nil {
+	if _, err := d.sendToCurrentWorker(id, protocol.MsgCancelTurn, "", func() bool {
+		snapshot := meta.TurnSnapshot()
+		return snapshot.Active && snapshot.Cancelling && snapshot.Token == token
+	}); err != nil {
 		d.finishCancelWithFailure(meta, token, "codex_cancel_failed", err.Error())
 		return fmt.Errorf("cancel Codex turn for session %s: %w", id, err)
 	}
-	go d.watchCancelledTurn(meta, token, handle)
+	go d.watchCancelledTurn(meta, token)
 	return nil
 }
 
-func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64, handle *WorkerHandle) {
+func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64) {
 	timer := time.NewTimer(d.cancelTurnTimeout())
 	defer timer.Stop()
 
@@ -601,7 +598,7 @@ func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64, handle *Wor
 		meta.Status = StatusRecovering
 	}
 	d.sessionsMu.Unlock()
-	d.restartWorker(handle)
+	d.restartWorker(meta.SessionID)
 }
 
 func (d *Daemon) finishCancelWithFailure(meta *SessionMeta, token uint64, errorCode, errorDetail string) bool {
@@ -612,12 +609,47 @@ func (d *Daemon) finishCancelWithFailure(meta *SessionMeta, token uint64, errorC
 	})
 }
 
-func (d *Daemon) restartWorker(handle *WorkerHandle) {
-	if handle == nil || !d.isCurrentWorker(handle) {
-		return
+func (d *Daemon) sendToCurrentWorker(
+	id string,
+	msgType protocol.MessageType,
+	payload string,
+	stillRelevant func() bool,
+) (*WorkerHandle, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxCurrentWorkerSendTries; attempt++ {
+		if stillRelevant != nil && !stillRelevant() {
+			return nil, fmt.Errorf("session %s operation is no longer active", id)
+		}
+
+		d.workersMu.RLock()
+		handle := d.workers[id]
+		d.workersMu.RUnlock()
+		if handle == nil || !handle.IsReady() {
+			return nil, fmt.Errorf("session %s has no ready worker", id)
+		}
+
+		err := handle.Send(protocol.NewMessage(msgType, id, payload))
+		if d.isCurrentWorker(handle) {
+			if err != nil {
+				return nil, err
+			}
+			return handle, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("worker generation changed while sending %s", msgType)
+		}
 	}
-	if err := handle.Send(protocol.NewMessage(protocol.MsgRestartWorker, handle.SessionID, "")); err != nil {
-		log.Printf("[daemon] session %s restart worker: %v", safeShort(handle.SessionID), err)
+	return nil, fmt.Errorf("session %s worker changed while sending %s after %d attempts: %w",
+		id, msgType, maxCurrentWorkerSendTries, lastErr)
+}
+
+func (d *Daemon) restartWorker(id string) {
+	handle, err := d.sendToCurrentWorker(id, protocol.MsgRestartWorker, "", nil)
+	if err != nil {
+		log.Printf("[daemon] session %s restart worker: %v", safeShort(id), err)
+		return
 	}
 
 	go func() {

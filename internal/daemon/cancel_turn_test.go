@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os/exec"
 	"testing"
@@ -39,6 +40,44 @@ func TestCancelTurnSendsIPCAndMarksCancelling(t *testing.T) {
 		t.Fatalf("worker handle = %p, want original handle %p", got, handle)
 	}
 
+	meta.CompleteTurn(protocol.TurnTerminal{Status: protocol.TurnAborted})
+}
+
+func TestCancelTurnRetriesReplacementWorker(t *testing.T) {
+	d, meta, original, _ := newCancelTestDaemon(t)
+	d.turnCancelTimeout = time.Second
+	if !meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+
+	replacement, replacementWorkerConn := newCancelTestWorker(t, d, meta.SessionID)
+	originalConn := original.Conn
+	original.SetConn(&replaceOnFirstWriteConn{
+		Conn: originalConn,
+		replace: func() {
+			d.workersMu.Lock()
+			d.workers[meta.SessionID] = replacement
+			d.workersMu.Unlock()
+		},
+		err: errors.New("original worker write failed"),
+	})
+
+	cancelErr := make(chan error, 1)
+	go func() {
+		cancelErr <- d.CancelTurn(meta.SessionID)
+	}()
+
+	if msg := mustReadMessage(t, replacementWorkerConn); msg.Type != protocol.MsgCancelTurn {
+		t.Fatalf("replacement message type = %s, want %s", msg.Type, protocol.MsgCancelTurn)
+	}
+	if err := <-cancelErr; err != nil {
+		t.Fatalf("CancelTurn: %v", err)
+	}
+
+	snapshot := meta.TurnSnapshot()
+	if !snapshot.Active || !snapshot.Cancelling {
+		t.Fatalf("turn snapshot = %#v, want active cancelling turn", snapshot)
+	}
 	meta.CompleteTurn(protocol.TurnTerminal{Status: protocol.TurnAborted})
 }
 
@@ -88,6 +127,59 @@ func TestCancelTurnTimeoutPublishesOneFailureAndRestartsWorker(t *testing.T) {
 	case <-handle.ExitDone:
 	case <-time.After(time.Second):
 		t.Fatal("worker did not exit after restart grace period")
+	}
+}
+
+func TestCancelTimeoutRestartsCurrentReplacementWorker(t *testing.T) {
+	d, meta, _, workerConn := newCancelTestDaemon(t)
+	d.turnCancelTimeout = 100 * time.Millisecond
+	if !meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+
+	cancelErr := make(chan error, 1)
+	go func() {
+		cancelErr <- d.CancelTurn(meta.SessionID)
+	}()
+
+	if msg := mustReadMessage(t, workerConn); msg.Type != protocol.MsgCancelTurn {
+		t.Fatalf("cancel message type = %s, want %s", msg.Type, protocol.MsgCancelTurn)
+	}
+	if err := <-cancelErr; err != nil {
+		t.Fatalf("CancelTurn: %v", err)
+	}
+
+	replacement, replacementWorkerConn := newCancelTestWorker(t, d, meta.SessionID)
+	d.workersMu.Lock()
+	d.workers[meta.SessionID] = replacement
+	d.workersMu.Unlock()
+
+	if msg := mustReadMessage(t, replacementWorkerConn); msg.Type != protocol.MsgRestartWorker {
+		t.Fatalf("replacement message type = %s, want %s", msg.Type, protocol.MsgRestartWorker)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		terminals, _, _ := meta.SnapshotTerminalsSince(0)
+		return len(terminals) == 1
+	})
+	terminals, _, _ := meta.SnapshotTerminalsSince(0)
+	if got := terminals[0]; got.Status != protocol.TurnFailed || got.ErrorCode != "codex_cancel_timeout" {
+		t.Fatalf("terminal = %#v, want codex_cancel_timeout failure", got)
+	}
+	d.sessionsMu.RLock()
+	closed := meta.Closed
+	status := meta.Status
+	d.sessionsMu.RUnlock()
+	if closed {
+		t.Fatal("session closed after cancellation timeout")
+	}
+	if status != StatusRecovering {
+		t.Fatalf("session status = %s, want %s", status, StatusRecovering)
+	}
+	select {
+	case <-replacement.ExitDone:
+	case <-time.After(time.Second):
+		t.Fatal("replacement worker did not exit after restart grace period")
 	}
 }
 
@@ -201,6 +293,51 @@ func newCancelTestDaemon(t *testing.T) (*Daemon, *SessionMeta, *WorkerHandle, ne
 		}
 	})
 	return d, meta, handle, workerConn
+}
+
+func newCancelTestWorker(t *testing.T, d *Daemon, sessionID string) (*WorkerHandle, net.Conn) {
+	t.Helper()
+
+	daemonConn, workerConn := net.Pipe()
+	handle := NewWorkerHandle(sessionID)
+	handle.SetConn(daemonConn)
+	handle.markReady()
+	handle.Cmd = exec.Command("/bin/sh", "-c", "sleep 10")
+	if err := handle.Cmd.Start(); err != nil {
+		t.Fatalf("start worker fixture: %v", err)
+	}
+	handle.Pid = handle.Cmd.Process.Pid
+	go d.waitWorkerExit(handle)
+
+	t.Cleanup(func() {
+		_ = daemonConn.Close()
+		_ = workerConn.Close()
+		if handle.Cmd.Process != nil {
+			_ = handle.Cmd.Process.Kill()
+		}
+		select {
+		case <-handle.ExitDone:
+		case <-time.After(time.Second):
+			t.Error("worker fixture was not reaped")
+		}
+	})
+	return handle, workerConn
+}
+
+type replaceOnFirstWriteConn struct {
+	net.Conn
+	replace func()
+	err     error
+	done    bool
+}
+
+func (c *replaceOnFirstWriteConn) Write(p []byte) (int, error) {
+	if !c.done {
+		c.done = true
+		c.replace()
+		return 0, c.err
+	}
+	return c.Conn.Write(p)
 }
 
 func mustReadMessage(t *testing.T, conn net.Conn) *protocol.Message {
