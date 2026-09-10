@@ -140,6 +140,8 @@ func (w *Worker) Run() error {
 		w.cleanup(false)
 		return fmt.Errorf("start cli: %w", err)
 	}
+	w.wg.Add(1)
+	go w.readCliOutput()
 	cleanupInitialFailure := true
 	defer func() {
 		if cleanupInitialFailure {
@@ -164,7 +166,7 @@ func (w *Worker) Run() error {
 	w.wg.Add(1)
 	go w.readDaemonMessages()
 
-	goroutines := 2
+	goroutines := 1
 	if w.startResult.Events != nil {
 		goroutines++
 	}
@@ -172,7 +174,6 @@ func (w *Worker) Run() error {
 	if w.startResult.Events != nil {
 		go w.readAdapterEvents()
 	}
-	go w.readCliOutput()
 	go w.sendHeartbeats()
 
 	w.wg.Wait()
@@ -398,6 +399,12 @@ func (w *Worker) isCurrentConn(conn net.Conn) bool {
 	return conn != nil && w.conn == conn
 }
 
+func (w *Worker) isCurrentMessageReader(reader *protocol.MessageReader) bool {
+	w.connMu.Lock()
+	defer w.connMu.Unlock()
+	return reader != nil && w.msgReader == reader
+}
+
 func (w *Worker) readDaemonMessages() {
 	defer w.wg.Done()
 	defer w.Cancel()
@@ -418,6 +425,9 @@ func (w *Worker) readDaemonMessages() {
 		if err != nil {
 			if w.ctx.Err() != nil {
 				return
+			}
+			if !w.isCurrentMessageReader(reader) {
+				continue
 			}
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				log.Printf("[worker:%s] read daemon error: %v", safeShortID(w.sessionID), err)
@@ -557,19 +567,23 @@ func (w *Worker) readCliOutput() {
 			clean = stripAnsi(clean)
 			clean = strings.TrimSpace(clean)
 			if clean != "" && !w.startResult.StructuredOutput {
-				if out := w.deduper.Check(clean); out != "" {
-					emitCount++
-					if err := w.sendMessage(protocol.MsgOutput, out); err != nil {
-						log.Printf("[worker:%s] send output: %v", safeShortID(w.sessionID), err)
-						time.Sleep(500 * time.Millisecond)
-					} else if time.Since(lastLog) > 5*time.Second || emitCount <= 5 {
-						preview := out
-						if len(preview) > 120 {
-							preview = preview[:120] + "..."
+				select {
+				case <-w.readyCh:
+					if out := w.deduper.Check(clean); out != "" {
+						emitCount++
+						if err := w.sendMessage(protocol.MsgOutput, out); err != nil {
+							log.Printf("[worker:%s] send output: %v", safeShortID(w.sessionID), err)
+							time.Sleep(500 * time.Millisecond)
+						} else if time.Since(lastLog) > 5*time.Second || emitCount <= 5 {
+							preview := out
+							if len(preview) > 120 {
+								preview = preview[:120] + "..."
+							}
+							log.Printf("[worker:%s] >> %s", safeShortID(w.sessionID), preview)
+							lastLog = time.Now()
 						}
-						log.Printf("[worker:%s] >> %s", safeShortID(w.sessionID), preview)
-						lastLog = time.Now()
 					}
+				default:
 				}
 			}
 			readCh = make(chan readResult, 1)

@@ -730,6 +730,74 @@ func TestWorkerSendsReadyBeforeOutputEvents(t *testing.T) {
 	}
 }
 
+func TestWorkerDrainsStartupOutputBeforeReady(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	cli := newStartupOutputReadyTestAdapter()
+	w := New(Options{
+		SessionID:        "worker-drain-startup-output",
+		WorkerInstanceID: "nonce-drain-output-123",
+		DaemonAddr:       listener.Addr().String(),
+		CliType:          "mock",
+	})
+	w.cliAdapter = cli
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run() }()
+	runExited := false
+
+	conn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("accept worker: %v", err)
+	}
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = cli.Close()
+		_ = conn.Close()
+		if !runExited {
+			select {
+			case <-runDone:
+			case <-time.After(time.Second):
+				t.Error("worker did not exit during cleanup")
+			}
+		}
+	})
+
+	waitForSignal(t, cli.startupWritesComplete, "adapter startup output writes to complete")
+
+	reader := protocol.NewMessageReader(conn)
+	first, err := reader.Read()
+	if err != nil {
+		t.Fatalf("read ready message: %v", err)
+	}
+	if first.Type != protocol.MsgReady {
+		t.Fatalf("first worker message = %s, want %s", first.Type, protocol.MsgReady)
+	}
+	if first.WorkerInstanceID != "nonce-drain-output-123" {
+		t.Fatalf("ready worker instance ID = %q, want %q", first.WorkerInstanceID, "nonce-drain-output-123")
+	}
+	if _, err := protocol.NewMessage(protocol.MsgAck, w.sessionID, workerReadyAckPayload).WriteTo(conn); err != nil {
+		t.Fatalf("acknowledge ready: %v", err)
+	}
+
+	if _, err := protocol.NewMessage(protocol.MsgClose, w.sessionID, "").WriteTo(conn); err != nil {
+		t.Fatalf("send close: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		runExited = true
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not exit after MsgClose")
+	}
+}
+
 func TestWorkerDoesNotProcessInputBeforeReadyAcknowledgment(t *testing.T) {
 	daemonConn, workerConn := net.Pipe()
 	blockingConn := newBlockingWriteConn(workerConn)
@@ -1431,6 +1499,80 @@ func TestWorkerHeartbeatDoesNotReconnectAfterStaleWriteFailure(t *testing.T) {
 	}
 }
 
+func TestWorkerIgnoresStaleDaemonReaderFailureAfterReconnect(t *testing.T) {
+	oldConn := newBlockingReadConn(errors.New("old reader failed"))
+	newConn := newBlockingReadConn(net.ErrClosed)
+	w := New(Options{
+		SessionID:  "worker-stale-daemon-reader",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	w.conn = oldConn
+	w.msgReader = protocol.NewMessageReader(oldConn)
+	w.setConnected(true)
+
+	var reconnectCalls atomic.Int32
+	reconnectStarted := make(chan struct{}, 1)
+	w.reconnectSleep = func(time.Duration) {
+		reconnectCalls.Add(1)
+		reconnectStarted <- struct{}{}
+		<-w.ctx.Done()
+	}
+	var dialCalls atomic.Int32
+	dialStarted := make(chan struct{}, 1)
+	w.dial = func(string, string) (net.Conn, error) {
+		dialCalls.Add(1)
+		dialStarted <- struct{}{}
+		return nil, errors.New("unexpected reconnect dial")
+	}
+
+	daemonReadDone := make(chan struct{})
+	t.Cleanup(func() {
+		w.Cancel()
+		select {
+		case <-daemonReadDone:
+		case <-time.After(time.Second):
+			t.Error("daemon reader did not exit during cleanup")
+		}
+	})
+
+	w.wg.Add(1)
+	go func() {
+		w.readDaemonMessages()
+		close(daemonReadDone)
+	}()
+	waitForSignal(t, oldConn.readStarted, "old daemon reader to start")
+
+	oldPublishedConn := w.publishConnection(newConn, protocol.NewMessageReader(newConn))
+	if oldPublishedConn != oldConn {
+		t.Fatal("replacement connection did not replace the old connection")
+	}
+	oldConn.releaseRead()
+
+	select {
+	case <-newConn.readStarted:
+	case <-reconnectStarted:
+		t.Fatal("stale daemon reader error started reconnect")
+	case <-dialStarted:
+		t.Fatal("stale daemon reader error dialed reconnect")
+	}
+	if got := reconnectCalls.Load(); got != 0 {
+		t.Fatalf("reconnect calls = %d, want 0", got)
+	}
+	if got := dialCalls.Load(); got != 0 {
+		t.Fatalf("dial calls = %d, want 0", got)
+	}
+	if !w.isConnected() {
+		t.Fatal("stale daemon reader error marked the replacement connection disconnected")
+	}
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != newConn {
+		t.Fatal("stale daemon reader error replaced the newly published connection")
+	}
+}
+
 type delayedReadyTestAdapter struct {
 	ready   <-chan error
 	outputR *io.PipeReader
@@ -1631,6 +1773,63 @@ func (a *readyOutputTestAdapter) Close() error {
 	return a.outputW.Close()
 }
 
+type startupOutputReadyTestAdapter struct {
+	ready                 chan error
+	startupWritesComplete chan struct{}
+	closed                chan struct{}
+	outputR               *io.PipeReader
+	outputW               *io.PipeWriter
+	closeOnce             sync.Once
+}
+
+func newStartupOutputReadyTestAdapter() *startupOutputReadyTestAdapter {
+	outputR, outputW := io.Pipe()
+	return &startupOutputReadyTestAdapter{
+		ready:                 make(chan error),
+		startupWritesComplete: make(chan struct{}),
+		closed:                make(chan struct{}),
+		outputR:               outputR,
+		outputW:               outputW,
+	}
+}
+
+func (a *startupOutputReadyTestAdapter) Name() string {
+	return "startup-output-ready-test"
+}
+
+func (a *startupOutputReadyTestAdapter) Start(context.Context, string) (*adapter.CliStartResult, error) {
+	go func() {
+		for _, output := range []string{"startup output\n", "composer-ready signal\n"} {
+			if _, err := io.WriteString(a.outputW, output); err != nil {
+				return
+			}
+		}
+		close(a.startupWritesComplete)
+		select {
+		case a.ready <- nil:
+		case <-a.closed:
+		}
+	}()
+	return &adapter.CliStartResult{
+		Output:      a.outputR,
+		ErrCh:       make(chan error),
+		ReadyResult: a.ready,
+	}, nil
+}
+
+func (a *startupOutputReadyTestAdapter) Send(context.Context, string) (adapter.SendResult, error) {
+	return adapter.SendResult{}, nil
+}
+
+func (a *startupOutputReadyTestAdapter) Close() error {
+	a.closeOnce.Do(func() {
+		close(a.closed)
+		_ = a.outputR.Close()
+		_ = a.outputW.Close()
+	})
+	return nil
+}
+
 type readyBarrierTestAdapter struct {
 	sendStarted chan struct{}
 	outputR     *io.PipeReader
@@ -1738,6 +1937,73 @@ func (c *closeBlockingWriteConn) Write([]byte) (int, error) {
 func (c *closeBlockingWriteConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return c.Conn.Close()
+}
+
+type blockingReadConn struct {
+	readStarted chan struct{}
+	release     chan struct{}
+	closed      chan struct{}
+	err         error
+	readOnce    sync.Once
+	releaseOnce sync.Once
+	closeOnce   sync.Once
+}
+
+func newBlockingReadConn(err error) *blockingReadConn {
+	return &blockingReadConn{
+		readStarted: make(chan struct{}),
+		release:     make(chan struct{}),
+		closed:      make(chan struct{}),
+		err:         err,
+	}
+}
+
+func (c *blockingReadConn) Read([]byte) (int, error) {
+	c.readOnce.Do(func() { close(c.readStarted) })
+	select {
+	case <-c.release:
+		return 0, c.err
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *blockingReadConn) Write(data []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+		return len(data), nil
+	}
+}
+
+func (c *blockingReadConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *blockingReadConn) LocalAddr() net.Addr {
+	return testAddr("local")
+}
+
+func (c *blockingReadConn) RemoteAddr() net.Addr {
+	return testAddr("remote")
+}
+
+func (c *blockingReadConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *blockingReadConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *blockingReadConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (c *blockingReadConn) releaseRead() {
+	c.releaseOnce.Do(func() { close(c.release) })
 }
 
 type recordingConn struct {
