@@ -539,8 +539,10 @@ func (d *Daemon) SendInput(id, input string) error {
 		return fmt.Errorf("session %s worker not connected (status=%s)", id, meta.Status)
 	}
 
-	if meta.CliType == string(config.CliCodex) && !meta.BeginTurn() {
-		return fmt.Errorf("session %s already has an active turn", id)
+	if meta.CliType == string(config.CliCodex) {
+		if err := d.beginCodexTurnIfReady(meta); err != nil {
+			return err
+		}
 	}
 	msg := protocol.NewMessage(protocol.MsgUserInput, id, input)
 	meta.touchActive()
@@ -570,9 +572,8 @@ func (d *Daemon) CancelTurn(id string) error {
 		d.sessionsMu.RUnlock()
 		return fmt.Errorf("session %s does not use Codex", id)
 	}
+	token, ok := d.beginTurnCancelIfCurrentLocked(meta)
 	d.sessionsMu.RUnlock()
-
-	token, ok := meta.BeginTurnCancel()
 	if !ok {
 		return fmt.Errorf("session %s has no cancellable active turn", id)
 	}
@@ -594,13 +595,15 @@ func (d *Daemon) watchCancelledTurn(meta *SessionMeta, token uint64) {
 		return
 	}
 
-	if !d.finishCancelWithFailure(meta, token, "codex_cancel_timeout",
-		"Codex did not report turn_aborted after cancellation") {
-		return
-	}
-
 	d.sessionsMu.Lock()
-	restart := d.isCurrentSessionLocked(meta) && !meta.Closed
+	restart := false
+	if d.isCurrentSessionLocked(meta) && !meta.Closed {
+		restart = meta.FailCancellingTurn(token, protocol.TurnTerminal{
+			Status:      protocol.TurnFailed,
+			ErrorCode:   "codex_cancel_timeout",
+			ErrorDetail: "Codex did not report turn_aborted after cancellation",
+		})
+	}
 	if restart {
 		meta.Status = StatusRecovering
 	}
@@ -707,6 +710,37 @@ func (d *Daemon) isCurrentSession(meta *SessionMeta) bool {
 
 func (d *Daemon) isCurrentSessionLocked(meta *SessionMeta) bool {
 	return meta != nil && d.sessions[meta.SessionID] == meta
+}
+
+func (d *Daemon) beginCodexTurnIfReady(meta *SessionMeta) error {
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	if !d.isCurrentSessionLocked(meta) {
+		return fmt.Errorf("session %s not found", meta.SessionID)
+	}
+	if meta.Closed {
+		return fmt.Errorf("session %s is closed", meta.SessionID)
+	}
+	if meta.Status != StatusReady {
+		return fmt.Errorf("session %s is not ready (status=%s)", meta.SessionID, meta.Status)
+	}
+	if !meta.BeginTurn() {
+		return fmt.Errorf("session %s already has an active turn", meta.SessionID)
+	}
+	return nil
+}
+
+func (d *Daemon) beginTurnCancelIfCurrent(meta *SessionMeta) (uint64, bool) {
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	return d.beginTurnCancelIfCurrentLocked(meta)
+}
+
+func (d *Daemon) beginTurnCancelIfCurrentLocked(meta *SessionMeta) (uint64, bool) {
+	if !d.isCurrentSessionLocked(meta) || meta.Closed || meta.CliType != string(config.CliCodex) {
+		return 0, false
+	}
+	return meta.BeginTurnCancel()
 }
 
 // Worker map checks precede session map checks everywhere both locks are held.
@@ -1143,9 +1177,11 @@ func (d *Daemon) forwardClientMessage(clientConn net.Conn, msg *protocol.Message
 	cursor, outputCh := meta.OutputSubscription()
 	terminalCursor, terminalCh := meta.TerminalSubscription()
 	if msg.Type == protocol.MsgUserInput {
-		if meta.CliType == string(config.CliCodex) && !meta.BeginTurn() {
-			_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, "session already has an active turn").WriteTo(clientConn)
-			return
+		if meta.CliType == string(config.CliCodex) {
+			if err := d.beginCodexTurnIfReady(meta); err != nil {
+				_, _ = protocol.NewMessage(protocol.MsgError, msg.SessionID, err.Error()).WriteTo(clientConn)
+				return
+			}
 		}
 		inCopy := *msg
 		if err := h.Send(&inCopy); err != nil {

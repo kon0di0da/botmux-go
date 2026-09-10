@@ -191,6 +191,67 @@ func TestCancelTurnTimeoutPublishesOneFailureAndRestartsWorker(t *testing.T) {
 	}
 }
 
+func TestCancelTimeoutRejectsNewTurnBeforeWorkerRestart(t *testing.T) {
+	d, meta, _, workerConn := newCancelTestDaemon(t)
+	if !meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+
+	cancelErr := make(chan error, 1)
+	go func() {
+		cancelErr <- d.CancelTurn(meta.SessionID)
+	}()
+
+	if msg := mustReadMessage(t, workerConn); msg.Type != protocol.MsgCancelTurn {
+		t.Fatalf("cancel message type = %s, want %s", msg.Type, protocol.MsgCancelTurn)
+	}
+	if err := <-cancelErr; err != nil {
+		t.Fatalf("CancelTurn: %v", err)
+	}
+
+	// Do not read the restart IPC. This holds the watchdog in restartWorkerForSession
+	// after it has committed the timeout terminal and RECOVERING status.
+	waitForCondition(t, time.Second, func() bool {
+		d.sessionsMu.RLock()
+		status := meta.Status
+		d.sessionsMu.RUnlock()
+		terminals, _, _ := meta.SnapshotTerminalsSince(0)
+		return status == StatusRecovering && len(terminals) == 1
+	})
+
+	inputErr := make(chan error, 1)
+	inputDone := make(chan struct{})
+	go func() {
+		defer close(inputDone)
+		inputErr <- d.SendInput(meta.SessionID, "next turn")
+	}()
+	defer func() {
+		_ = workerConn.Close()
+		select {
+		case <-inputDone:
+		case <-time.After(time.Second):
+			t.Error("SendInput goroutine did not return after unblocking worker IPC")
+		}
+	}()
+
+	select {
+	case err := <-inputErr:
+		if err == nil || !strings.Contains(err.Error(), string(StatusRecovering)) {
+			t.Fatalf("SendInput error = %v, want RECOVERING rejection", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		snapshot := meta.TurnSnapshot()
+		if snapshot.Active {
+			t.Fatalf("SendInput admitted a turn during recovery: %#v", snapshot)
+		}
+		t.Fatal("SendInput did not promptly reject a recovering session")
+	}
+
+	if snapshot := meta.TurnSnapshot(); snapshot.Active || snapshot.Cancelling {
+		t.Fatalf("turn snapshot = %#v, want inactive non-cancelling turn", snapshot)
+	}
+}
+
 func TestCancelTimeoutRestartsCurrentReplacementWorker(t *testing.T) {
 	d, meta, _, workerConn := newCancelTestDaemon(t)
 	d.turnCancelTimeout = 100 * time.Millisecond
@@ -310,6 +371,27 @@ func TestCancelWatchdogDoesNotRestartReusedSessionID(t *testing.T) {
 	}
 	if status != StatusReady {
 		t.Fatalf("new meta status = %s, want %s", status, StatusReady)
+	}
+}
+
+func TestBeginTurnCancelIfCurrentRejectsReusedSessionID(t *testing.T) {
+	d, oldMeta, _, _ := newCancelTestDaemon(t)
+	if !oldMeta.BeginTurn() {
+		t.Fatal("begin old turn")
+	}
+
+	replacement := NewSessionMeta(oldMeta.SessionID, "bot-codex")
+	replacement.CliType = string(config.CliCodex)
+	replacement.Status = StatusReady
+	d.sessionsMu.Lock()
+	d.sessions[oldMeta.SessionID] = replacement
+	d.sessionsMu.Unlock()
+
+	if token, ok := d.beginTurnCancelIfCurrent(oldMeta); ok || token != 0 {
+		t.Fatalf("begin stale cancellation = (%d, %t), want (0, false)", token, ok)
+	}
+	if snapshot := oldMeta.TurnSnapshot(); !snapshot.Active || snapshot.Cancelling {
+		t.Fatalf("old turn snapshot = %#v, want unchanged active non-cancelling turn", snapshot)
 	}
 }
 
