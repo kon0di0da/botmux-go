@@ -21,16 +21,17 @@ import (
 )
 
 const (
-	EnvRole            = "BOTMUX_ROLE"
-	EnvSessionID       = "BOTMUX_SESSION_ID"
-	EnvDaemonAddr      = "BOTMUX_DAEMON_ADDR"
-	EnvCliType         = "BOTMUX_CLI_TYPE"
-	EnvCliPath         = "BOTMUX_CLI_PATH"
-	EnvModel           = "BOTMUX_MODEL"
-	EnvCodexProfile    = "BOTMUX_CODEX_PROFILE"
-	EnvResumeSessionID = "BOTMUX_RESUME_SESSION_ID"
-	EnvWorkingDir      = "BOTMUX_WORKING_DIR"
-	EnvStoreDir        = "BOTMUX_STORE_DIR"
+	EnvRole             = "BOTMUX_ROLE"
+	EnvSessionID        = "BOTMUX_SESSION_ID"
+	EnvWorkerInstanceID = "BOTMUX_WORKER_INSTANCE_ID"
+	EnvDaemonAddr       = "BOTMUX_DAEMON_ADDR"
+	EnvCliType          = "BOTMUX_CLI_TYPE"
+	EnvCliPath          = "BOTMUX_CLI_PATH"
+	EnvModel            = "BOTMUX_MODEL"
+	EnvCodexProfile     = "BOTMUX_CODEX_PROFILE"
+	EnvResumeSessionID  = "BOTMUX_RESUME_SESSION_ID"
+	EnvWorkingDir       = "BOTMUX_WORKING_DIR"
+	EnvStoreDir         = "BOTMUX_STORE_DIR"
 )
 
 func main() {
@@ -42,42 +43,50 @@ func main() {
 }
 
 func runWorker() {
-	sessionID := os.Getenv(EnvSessionID)
-	if sessionID == "" {
-		log.Fatalf("[worker] %s required", EnvSessionID)
+	opts, err := workerOptionsFromEnv(os.Getenv)
+	if err != nil {
+		log.Fatalf("[worker] %v", err)
 	}
-	daemonAddr := os.Getenv(EnvDaemonAddr)
+	w := worker.New(opts)
+	if err := w.Run(); err != nil {
+		log.Fatalf("[worker] fatal: %v", err)
+	}
+}
+
+func workerOptionsFromEnv(getenv func(string) string) (worker.Options, error) {
+	sessionID := getenv(EnvSessionID)
+	if sessionID == "" {
+		return worker.Options{}, fmt.Errorf("%s required", EnvSessionID)
+	}
+	daemonAddr := getenv(EnvDaemonAddr)
 	if daemonAddr == "" {
 		daemonAddr = "127.0.0.1:17890"
 	}
-	cliType := os.Getenv(EnvCliType)
+	cliType := getenv(EnvCliType)
 	if cliType == "" {
 		cliType = "mock"
 	}
-	cliPath := os.Getenv(EnvCliPath)
-	model := os.Getenv(EnvModel)
-	codexProfile := os.Getenv(EnvCodexProfile)
-	resumeSessionID := os.Getenv(EnvResumeSessionID)
-	workingDir := os.Getenv(EnvWorkingDir)
+	cliPath := getenv(EnvCliPath)
+	model := getenv(EnvModel)
+	codexProfile := getenv(EnvCodexProfile)
+	resumeSessionID := getenv(EnvResumeSessionID)
+	workingDir := getenv(EnvWorkingDir)
 	if workingDir == "" {
 		home, _ := os.UserHomeDir()
 		workingDir = home
 	}
-	storeDir := os.Getenv(EnvStoreDir)
-	w := worker.New(worker.Options{
-		SessionID:       sessionID,
-		DaemonAddr:      daemonAddr,
-		CliType:         cliType,
-		CliPath:         cliPath,
-		Model:           model,
-		CodexProfile:    codexProfile,
-		ResumeSessionID: resumeSessionID,
-		WorkingDir:      workingDir,
-		StoreDir:        storeDir,
-	})
-	if err := w.Run(); err != nil {
-		log.Fatalf("[worker] fatal: %v", err)
-	}
+	return worker.Options{
+		SessionID:        sessionID,
+		WorkerInstanceID: getenv(EnvWorkerInstanceID),
+		DaemonAddr:       daemonAddr,
+		CliType:          cliType,
+		CliPath:          cliPath,
+		Model:            model,
+		CodexProfile:     codexProfile,
+		ResumeSessionID:  resumeSessionID,
+		WorkingDir:       workingDir,
+		StoreDir:         getenv(EnvStoreDir),
+	}, nil
 }
 
 func runDaemon() {

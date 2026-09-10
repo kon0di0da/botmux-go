@@ -101,6 +101,67 @@ func TestExecSendCommandReturnsTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestWorkerOptionsFromEnvIncludesInstanceID(t *testing.T) {
+	env := map[string]string{
+		EnvSessionID:        "session-123",
+		EnvDaemonAddr:       "127.0.0.1:19000",
+		EnvCliType:          "codex",
+		EnvCliPath:          "/usr/local/bin/codex",
+		EnvModel:            "gpt-5",
+		EnvCodexProfile:     "development",
+		EnvResumeSessionID:  "cli-session-456",
+		EnvWorkingDir:       "/tmp/botmux-working",
+		EnvStoreDir:         "/tmp/botmux-store",
+		EnvWorkerInstanceID: "nonce-123",
+	}
+	getenv := func(key string) string {
+		return env[key]
+	}
+
+	opts, err := workerOptionsFromEnv(getenv)
+	if err != nil {
+		t.Fatalf("workerOptionsFromEnv: %v", err)
+	}
+
+	if opts.SessionID != "session-123" {
+		t.Errorf("session ID = %q, want %q", opts.SessionID, "session-123")
+	}
+	if opts.DaemonAddr != "127.0.0.1:19000" {
+		t.Errorf("daemon address = %q, want %q", opts.DaemonAddr, "127.0.0.1:19000")
+	}
+	if opts.CliType != "codex" {
+		t.Errorf("CLI type = %q, want %q", opts.CliType, "codex")
+	}
+	if opts.CliPath != "/usr/local/bin/codex" {
+		t.Errorf("CLI path = %q, want %q", opts.CliPath, "/usr/local/bin/codex")
+	}
+	if opts.Model != "gpt-5" {
+		t.Errorf("model = %q, want %q", opts.Model, "gpt-5")
+	}
+	if opts.CodexProfile != "development" {
+		t.Errorf("Codex profile = %q, want %q", opts.CodexProfile, "development")
+	}
+	if opts.ResumeSessionID != "cli-session-456" {
+		t.Errorf("resume session ID = %q, want %q", opts.ResumeSessionID, "cli-session-456")
+	}
+	if opts.WorkingDir != "/tmp/botmux-working" {
+		t.Errorf("working directory = %q, want %q", opts.WorkingDir, "/tmp/botmux-working")
+	}
+	if opts.StoreDir != "/tmp/botmux-store" {
+		t.Errorf("store directory = %q, want %q", opts.StoreDir, "/tmp/botmux-store")
+	}
+	if opts.WorkerInstanceID != "nonce-123" {
+		t.Errorf("worker instance ID = %q, want %q", opts.WorkerInstanceID, "nonce-123")
+	}
+}
+
+func TestWorkerOptionsFromEnvRequiresSessionID(t *testing.T) {
+	_, err := workerOptionsFromEnv(func(string) string { return "" })
+	if err == nil {
+		t.Fatal("workerOptionsFromEnv returned nil error without a session ID")
+	}
+}
+
 type unexpectedMessageError struct {
 	msg *protocol.Message
 }

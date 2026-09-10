@@ -46,10 +46,11 @@ type TurnTerminal struct {
 }
 
 type Message struct {
-	Type      MessageType `json:"type"`
-	SessionID string      `json:"session_id"`
-	Payload   string      `json:"payload,omitempty"`
-	Timestamp int64       `json:"ts"`
+	Type             MessageType `json:"type"`
+	SessionID        string      `json:"session_id"`
+	WorkerInstanceID string      `json:"worker_instance_id,omitempty"`
+	Payload          string      `json:"payload,omitempty"`
+	Timestamp        int64       `json:"ts"`
 }
 
 func NewMessage(typ MessageType, sessionID, payload string) *Message {

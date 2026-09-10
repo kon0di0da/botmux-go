@@ -28,12 +28,13 @@ const (
 )
 
 type Worker struct {
-	sessionID  string
-	daemonAddr string
-	storeDir   string
-	cliAdapter adapter.CliAdapter
-	workingDir string
-	cliType    string
+	sessionID        string
+	workerInstanceID string
+	daemonAddr       string
+	storeDir         string
+	cliAdapter       adapter.CliAdapter
+	workingDir       string
+	cliType          string
 
 	conn      net.Conn
 	connMu    sync.Mutex
@@ -66,23 +67,25 @@ type Worker struct {
 }
 
 type Options struct {
-	SessionID       string
-	DaemonAddr      string
-	CliType         string
-	CliPath         string
-	Model           string
-	CodexProfile    string
-	ResumeSessionID string
-	WorkingDir      string
-	StoreDir        string
+	SessionID        string
+	WorkerInstanceID string
+	DaemonAddr       string
+	CliType          string
+	CliPath          string
+	Model            string
+	CodexProfile     string
+	ResumeSessionID  string
+	WorkingDir       string
+	StoreDir         string
 }
 
 func New(opts Options) *Worker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Worker{
-		sessionID:  opts.SessionID,
-		daemonAddr: opts.DaemonAddr,
-		storeDir:   opts.StoreDir,
+		sessionID:        opts.SessionID,
+		workerInstanceID: opts.WorkerInstanceID,
+		daemonAddr:       opts.DaemonAddr,
+		storeDir:         opts.StoreDir,
 		cliAdapter: adapter.Create(adapter.AdapterOptions{
 			CliType: opts.CliType, CliPath: opts.CliPath, Model: opts.Model, Profile: opts.CodexProfile,
 			ResumeSessionID: opts.ResumeSessionID,
@@ -278,6 +281,7 @@ func (w *Worker) sendMessage(typ protocol.MessageType, payload string) error {
 		return errors.New("connection closed")
 	}
 	m := protocol.NewMessage(typ, w.sessionID, payload)
+	m.WorkerInstanceID = w.workerInstanceID
 	_, err := m.WriteTo(w.conn)
 	return err
 }
