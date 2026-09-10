@@ -32,6 +32,21 @@ func TestWaitForCLIReadyUsesAuthoritativeResult(t *testing.T) {
 	}
 }
 
+func TestWorkerReadyHandshakeTimeoutDefaultsWhenUnset(t *testing.T) {
+	w := New(Options{CliType: "mock"})
+	t.Cleanup(w.Cancel)
+
+	if got := w.readyHandshakeTimeout; got != defaultReadyHandshakeTimeout {
+		t.Fatalf("ready handshake timeout = %v, want %v", got, defaultReadyHandshakeTimeout)
+	}
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		w.readyHandshakeTimeout = timeout
+		if got := w.readyHandshakeTimeoutOrDefault(); got != defaultReadyHandshakeTimeout {
+			t.Fatalf("ready handshake timeout for %v = %v, want %v", timeout, got, defaultReadyHandshakeTimeout)
+		}
+	}
+}
+
 func TestWorkerStartFailureCleansUpAdapter(t *testing.T) {
 	startErr := errors.New("adapter start failed")
 	daemonConn, workerConn := net.Pipe()
@@ -484,6 +499,321 @@ func TestWorkerHandshakeKeepsConnectionCloseTemporary(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("handshake peer did not finish")
+	}
+}
+
+func TestWorkerReadyHandshakeTimesOut(t *testing.T) {
+	daemonConn, rawWorkerConn := net.Pipe()
+	workerConn := newDeadlineRecordingConn(rawWorkerConn)
+	w := New(Options{
+		SessionID:  "worker-ready-timeout",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	w.readyHandshakeTimeout = 20 * time.Millisecond
+
+	peerObservedReady := make(chan struct{})
+	peerRelease := make(chan struct{})
+	var releasePeerOnce sync.Once
+	releasePeer := func() {
+		releasePeerOnce.Do(func() { close(peerRelease) })
+	}
+	peerDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(daemonConn).Read()
+		if err != nil {
+			peerDone <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			peerDone <- fmt.Errorf("message type = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		close(peerObservedReady)
+		<-peerRelease
+		peerDone <- nil
+	}()
+	t.Cleanup(func() {
+		releasePeer()
+		w.Cancel()
+		_ = workerConn.Close()
+		_ = daemonConn.Close()
+	})
+
+	handshakeDone := make(chan error, 1)
+	go func() {
+		_, err := w.readyHandshake(workerConn)
+		handshakeDone <- err
+	}()
+
+	waitForSignal(t, peerObservedReady, "ready handshake write")
+	select {
+	case err := <-handshakeDone:
+		var rejected *workerHandshakeRejectedError
+		if errors.As(err, &rejected) {
+			t.Fatalf("readyHandshake error = %T (%v), want temporary timeout", err, err)
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("readyHandshake error = %T (%v), want timeout", err, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ready handshake did not time out")
+	}
+
+	deadlines := workerConn.deadlines()
+	if len(deadlines) != 1 || deadlines[0].IsZero() {
+		t.Fatalf("handshake deadlines = %v, want one non-zero deadline", deadlines)
+	}
+	w.Cancel()
+	select {
+	case <-workerConn.closed:
+		t.Fatal("timed-out handshake cancellation watcher did not exit")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releasePeer()
+	select {
+	case err := <-peerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout peer did not exit")
+	}
+}
+
+func TestWorkerReadyHandshakeClearsDeadlineAfterAcknowledgment(t *testing.T) {
+	daemonConn, rawWorkerConn := net.Pipe()
+	workerConn := newDeadlineRecordingConn(rawWorkerConn)
+	w := New(Options{
+		SessionID:  "worker-ready-deadline-clear",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = workerConn.Close()
+		_ = daemonConn.Close()
+	})
+
+	peerDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(daemonConn).Read()
+		if err != nil {
+			peerDone <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			peerDone <- fmt.Errorf("message type = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		_, err = protocol.NewMessage(protocol.MsgAck, w.sessionID, workerReadyAckPayload).WriteTo(daemonConn)
+		peerDone <- err
+	}()
+
+	if _, err := w.readyHandshake(workerConn); err != nil {
+		t.Fatalf("readyHandshake: %v", err)
+	}
+	deadlines := workerConn.deadlines()
+	if len(deadlines) != 2 || deadlines[0].IsZero() || !deadlines[1].IsZero() {
+		t.Fatalf("handshake deadlines = %v, want non-zero deadline followed by clear", deadlines)
+	}
+	select {
+	case err := <-peerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acknowledgment peer did not finish")
+	}
+}
+
+func TestWorkerReadyHandshakeCancelsPrivateConnection(t *testing.T) {
+	daemonConn, workerConn := net.Pipe()
+	w := New(Options{
+		SessionID:  "worker-ready-cancel",
+		DaemonAddr: "daemon-test",
+		CliType:    "mock",
+	})
+	w.readyHandshakeTimeout = time.Second
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = workerConn.Close()
+		_ = daemonConn.Close()
+	})
+
+	readySent := make(chan struct{})
+	peerDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(daemonConn).Read()
+		if err != nil {
+			peerDone <- fmt.Errorf("read ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			peerDone <- fmt.Errorf("message type = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		close(readySent)
+		var data [1]byte
+		_, err = daemonConn.Read(data[:])
+		peerDone <- err
+	}()
+
+	handshakeDone := make(chan error, 1)
+	go func() {
+		_, err := w.readyHandshake(workerConn)
+		handshakeDone <- err
+	}()
+
+	waitForSignal(t, readySent, "ready handshake write before cancellation")
+	w.Cancel()
+	select {
+	case err := <-handshakeDone:
+		var rejected *workerHandshakeRejectedError
+		if errors.As(err, &rejected) {
+			t.Fatalf("readyHandshake error = %T (%v), want temporary connection error", err, err)
+		}
+		if err == nil {
+			t.Fatal("readyHandshake succeeded after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ready handshake did not return after cancellation")
+	}
+	select {
+	case err := <-peerDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("private connection read after cancellation = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("private connection was not closed by cancellation")
+	}
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != nil {
+		t.Fatal("ready handshake published a connection before acknowledgment")
+	}
+}
+
+func TestWorkerReconnectRetriesAfterReadyHandshakeTimeout(t *testing.T) {
+	oldDaemonConn, oldWorkerConn := net.Pipe()
+	firstDaemonConn, firstWorkerConn := net.Pipe()
+	secondDaemonConn, secondWorkerConn := net.Pipe()
+	w := New(Options{
+		SessionID:        "worker-reconnect-timeout",
+		WorkerInstanceID: "timeout-nonce",
+		DaemonAddr:       "daemon-test",
+		CliType:          "mock",
+	})
+	w.readyHandshakeTimeout = 20 * time.Millisecond
+	w.conn = oldWorkerConn
+	w.msgReader = protocol.NewMessageReader(oldWorkerConn)
+	w.reconnectSleep = func(time.Duration) {}
+
+	var dialCalls atomic.Int32
+	w.dial = func(string, string) (net.Conn, error) {
+		switch dialCalls.Add(1) {
+		case 1:
+			return firstWorkerConn, nil
+		case 2:
+			return secondWorkerConn, nil
+		default:
+			return nil, errors.New("unexpected reconnect dial")
+		}
+	}
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = oldDaemonConn.Close()
+		_ = firstDaemonConn.Close()
+		_ = firstWorkerConn.Close()
+		_ = secondDaemonConn.Close()
+		_ = secondWorkerConn.Close()
+	})
+
+	firstReady := make(chan struct{})
+	firstPeerDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(firstDaemonConn).Read()
+		if err != nil {
+			firstPeerDone <- fmt.Errorf("read first ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			firstPeerDone <- fmt.Errorf("first message type = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		close(firstReady)
+		var data [1]byte
+		_, err = firstDaemonConn.Read(data[:])
+		firstPeerDone <- err
+	}()
+
+	secondPeerDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(secondDaemonConn).Read()
+		if err != nil {
+			secondPeerDone <- fmt.Errorf("read second ready: %w", err)
+			return
+		}
+		if msg.Type != protocol.MsgReady {
+			secondPeerDone <- fmt.Errorf("second message type = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		_, err = protocol.NewMessage(protocol.MsgAck, w.sessionID, workerReadyAckPayload).WriteTo(secondDaemonConn)
+		secondPeerDone <- err
+	}()
+
+	reconnectDone := make(chan struct{})
+	go func() {
+		w.reconnectToDaemon()
+		close(reconnectDone)
+	}()
+
+	waitForSignal(t, firstReady, "first reconnect ready")
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != oldWorkerConn {
+		t.Fatal("reconnect published the timed-out connection")
+	}
+
+	select {
+	case <-reconnectDone:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not retry after ready handshake timeout")
+	}
+	if got := dialCalls.Load(); got != 2 {
+		t.Fatalf("reconnect dial calls = %d, want 2", got)
+	}
+	w.connMu.Lock()
+	publishedConn = w.conn
+	publishedReader := w.msgReader
+	w.connMu.Unlock()
+	if publishedConn != secondWorkerConn {
+		t.Fatal("reconnect did not publish the acknowledged connection")
+	}
+	if publishedReader == nil {
+		t.Fatal("reconnect did not publish a message reader")
+	}
+	if !w.isConnected() {
+		t.Fatal("reconnect did not mark worker connected after retry")
+	}
+	select {
+	case err := <-firstPeerDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("first connection read after timeout = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed-out reconnect connection was not closed")
+	}
+	select {
+	case err := <-secondPeerDone:
+		if err != nil {
+			t.Fatalf("acknowledge second reconnect ready: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second reconnect peer did not finish")
 	}
 }
 
@@ -2062,6 +2392,43 @@ func (c *recordingConn) writes() [][]byte {
 		writes[i] = append([]byte(nil), data...)
 	}
 	return writes
+}
+
+type deadlineRecordingConn struct {
+	net.Conn
+
+	deadlinesMu sync.Mutex
+	deadlinesV  []time.Time
+	closed      chan struct{}
+	closeOnce   sync.Once
+}
+
+func newDeadlineRecordingConn(conn net.Conn) *deadlineRecordingConn {
+	return &deadlineRecordingConn{
+		Conn:   conn,
+		closed: make(chan struct{}),
+	}
+}
+
+func (c *deadlineRecordingConn) SetDeadline(deadline time.Time) error {
+	if err := c.Conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	c.deadlinesMu.Lock()
+	c.deadlinesV = append(c.deadlinesV, deadline)
+	c.deadlinesMu.Unlock()
+	return nil
+}
+
+func (c *deadlineRecordingConn) deadlines() []time.Time {
+	c.deadlinesMu.Lock()
+	defer c.deadlinesMu.Unlock()
+	return append([]time.Time(nil), c.deadlinesV...)
+}
+
+func (c *deadlineRecordingConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return c.Conn.Close()
 }
 
 type testAddr string

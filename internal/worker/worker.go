@@ -20,12 +20,13 @@ import (
 )
 
 const (
-	cliOutputIdleAfter     = 15 * time.Second
-	cliOutputStallAfter    = 60 * time.Second
-	cliOutputIdleLogEvery  = 15 * time.Second
-	cliOutputObserveFor    = 130 * time.Second
-	cliOutputCheckInterval = 5 * time.Second
-	workerReadyAckPayload  = "worker_ready"
+	cliOutputIdleAfter           = 15 * time.Second
+	cliOutputStallAfter          = 60 * time.Second
+	cliOutputIdleLogEvery        = 15 * time.Second
+	cliOutputObserveFor          = 130 * time.Second
+	cliOutputCheckInterval       = 5 * time.Second
+	workerReadyAckPayload        = "worker_ready"
+	defaultReadyHandshakeTimeout = 10 * time.Second
 )
 
 type workerHandshakeRejectedError struct {
@@ -55,12 +56,13 @@ type Worker struct {
 
 	startResult *adapter.CliStartResult
 
-	ctx               context.Context
-	cancel            context.CancelFunc
-	heartbeatInterval time.Duration
-	heartbeatTicks    <-chan time.Time
-	dial              func(network, address string) (net.Conn, error)
-	reconnectSleep    func(time.Duration)
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	heartbeatInterval     time.Duration
+	heartbeatTicks        <-chan time.Time
+	dial                  func(network, address string) (net.Conn, error)
+	reconnectSleep        func(time.Duration)
+	readyHandshakeTimeout time.Duration
 
 	wg      sync.WaitGroup
 	readyCh chan struct{}
@@ -107,16 +109,17 @@ func New(opts Options) *Worker {
 			CliType: opts.CliType, CliPath: opts.CliPath, Model: opts.Model, Profile: opts.CodexProfile,
 			ResumeSessionID: opts.ResumeSessionID,
 		}),
-		workingDir:           opts.WorkingDir,
-		cliType:              opts.CliType,
-		ctx:                  ctx,
-		cancel:               cancel,
-		heartbeatInterval:    5 * time.Second,
-		dial:                 net.Dial,
-		reconnectSleep:       time.Sleep,
-		readyCh:              make(chan struct{}),
-		daemonDisconnectedCh: make(chan struct{}, 1),
-		deduper:              NewLineDeduper(400),
+		workingDir:            opts.WorkingDir,
+		cliType:               opts.CliType,
+		ctx:                   ctx,
+		cancel:                cancel,
+		heartbeatInterval:     5 * time.Second,
+		dial:                  net.Dial,
+		reconnectSleep:        time.Sleep,
+		readyHandshakeTimeout: defaultReadyHandshakeTimeout,
+		readyCh:               make(chan struct{}),
+		daemonDisconnectedCh:  make(chan struct{}, 1),
+		deduper:               NewLineDeduper(400),
 		outputIdleObserver: newCLIOutputIdleObserver(
 			cliOutputIdleAfter,
 			cliOutputStallAfter,
@@ -342,15 +345,58 @@ func (w *Worker) sendReadyTo(conn net.Conn) error {
 	return err
 }
 
+func (w *Worker) readyHandshakeTimeoutOrDefault() time.Duration {
+	if w.readyHandshakeTimeout <= 0 {
+		return defaultReadyHandshakeTimeout
+	}
+	return w.readyHandshakeTimeout
+}
+
+func isTransientReadyHandshakeError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 func (w *Worker) readyHandshake(conn net.Conn) (*protocol.MessageReader, error) {
+	if conn == nil {
+		return nil, errors.New("connection closed")
+	}
+
+	done := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-w.ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	defer func() {
+		close(done)
+		<-watcherDone
+	}()
+
+	handshakeSucceeded := false
+	defer func() {
+		if handshakeSucceeded {
+			_ = conn.SetDeadline(time.Time{})
+		}
+	}()
+
+	if err := conn.SetDeadline(time.Now().Add(w.readyHandshakeTimeoutOrDefault())); err != nil {
+		return nil, fmt.Errorf("set ready handshake deadline: %w", err)
+	}
 	if err := w.sendReadyTo(conn); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("write ready message: %w", err)
 	}
 	reader := protocol.NewMessageReader(conn)
 	msg, err := reader.Read()
 	if err != nil {
-		var netErr net.Error
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) || errors.As(err, &netErr) {
+		if isTransientReadyHandshakeError(err) {
 			return nil, fmt.Errorf("read ready acknowledgment: %w", err)
 		}
 		return nil, &workerHandshakeRejectedError{
@@ -366,6 +412,7 @@ func (w *Worker) readyHandshake(conn net.Conn) (*protocol.MessageReader, error) 
 			msg.Type, msg.SessionID, msg.Payload,
 		)}
 	}
+	handshakeSucceeded = true
 	return reader, nil
 }
 
