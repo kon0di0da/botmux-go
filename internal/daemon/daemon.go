@@ -577,6 +577,7 @@ func (d *Daemon) CancelTurn(id string) error {
 		return fmt.Errorf("session %s has no cancellable active turn", id)
 	}
 	if err := d.sendCancelToCurrentWorker(meta, token); err != nil {
+		d.finishCancelWithFailure(meta, token, "codex_cancel_failed", err.Error())
 		return fmt.Errorf("cancel Codex turn for session %s: %w", id, err)
 	}
 	go d.watchCancelledTurn(meta, token)
