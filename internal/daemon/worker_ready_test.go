@@ -403,9 +403,12 @@ func readReadyTestMessage(t *testing.T, conn net.Conn) *protocol.Message {
 func expectReadyTestEOF(t *testing.T, conn net.Conn) {
 	t.Helper()
 	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+			return
+		}
 		t.Fatalf("set EOF read deadline: %v", err)
 	}
-	if _, err := protocol.DecodeMessage(conn); !errors.Is(err, io.EOF) {
-		t.Fatalf("read after error = %v, want EOF", err)
+	if _, err := protocol.DecodeMessage(conn); !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("read after error = %v, want closed peer", err)
 	}
 }

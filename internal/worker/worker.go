@@ -42,8 +42,9 @@ type Worker struct {
 
 	startResult *adapter.CliStartResult
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx               context.Context
+	cancel            context.CancelFunc
+	heartbeatInterval time.Duration
 
 	wg      sync.WaitGroup
 	readyCh chan struct{}
@@ -94,6 +95,7 @@ func New(opts Options) *Worker {
 		cliType:              opts.CliType,
 		ctx:                  ctx,
 		cancel:               cancel,
+		heartbeatInterval:    5 * time.Second,
 		readyCh:              make(chan struct{}),
 		daemonDisconnectedCh: make(chan struct{}, 1),
 		deduper:              NewLineDeduper(400),
@@ -119,7 +121,7 @@ func (w *Worker) Run() error {
 		return err
 	}
 
-	goroutines := 3
+	goroutines := 2
 	if w.startResult.Events != nil {
 		goroutines++
 	}
@@ -129,7 +131,6 @@ func (w *Worker) Run() error {
 	}
 	go w.readDaemonMessages()
 	go w.readCliOutput()
-	go w.sendHeartbeats()
 
 	if err := w.waitForCLIReady(); err != nil {
 		w.sendError("cli_ready: " + err.Error())
@@ -141,6 +142,9 @@ func (w *Worker) Run() error {
 	if err := w.sendReady(); err != nil {
 		return err
 	}
+
+	w.wg.Add(1)
+	go w.sendHeartbeats()
 
 	w.wg.Wait()
 	return nil
@@ -686,7 +690,7 @@ type readResult struct {
 
 func (w *Worker) sendHeartbeats() {
 	defer w.wg.Done()
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(w.heartbeatInterval)
 	defer ticker.Stop()
 	for {
 		select {
