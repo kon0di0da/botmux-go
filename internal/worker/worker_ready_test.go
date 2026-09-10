@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -438,6 +439,119 @@ func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
 	}
 	if first.Type != protocol.MsgReady {
 		t.Fatalf("first reconnect write = %s, want %s", first.Type, protocol.MsgReady)
+	}
+}
+
+func TestWorkerReconnectIsSingleFlight(t *testing.T) {
+	daemonConn, workerConn := net.Pipe()
+	firstDialEntered := make(chan struct{})
+	releaseFirstDial := make(chan struct{})
+	duplicateDialEntered := make(chan struct{}, 4)
+	duplicateReturned := make(chan struct{}, 4)
+	ownerDone := make(chan struct{})
+	var dialCalls atomic.Int32
+	var reconnectWG sync.WaitGroup
+	var releaseOnce sync.Once
+	releaseDial := func() {
+		releaseOnce.Do(func() { close(releaseFirstDial) })
+	}
+
+	w := New(Options{
+		SessionID:        "worker-reconnect-single-flight",
+		WorkerInstanceID: "nonce-single-flight-123",
+		DaemonAddr:       "daemon-test",
+		CliType:          "mock",
+	})
+	w.reconnectSleep = func(time.Duration) {}
+	w.dial = func(string, string) (net.Conn, error) {
+		if dialCalls.Add(1) == 1 {
+			close(firstDialEntered)
+			<-releaseFirstDial
+			return workerConn, nil
+		}
+		duplicateDialEntered <- struct{}{}
+		<-w.ctx.Done()
+		return nil, w.ctx.Err()
+	}
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = daemonConn.Close()
+		releaseDial()
+		_ = workerConn.Close()
+
+		reconnectsDone := make(chan struct{})
+		go func() {
+			reconnectWG.Wait()
+			close(reconnectsDone)
+		}()
+		select {
+		case <-reconnectsDone:
+		case <-time.After(time.Second):
+			t.Error("reconnect goroutines did not exit during cleanup")
+		}
+	})
+
+	reconnectWG.Add(1)
+	go func() {
+		defer reconnectWG.Done()
+		defer close(ownerDone)
+		w.reconnectToDaemon()
+	}()
+	waitForSignal(t, firstDialEntered, "first reconnect dial to start")
+
+	for range 4 {
+		reconnectWG.Add(1)
+		go func() {
+			defer reconnectWG.Done()
+			w.reconnectToDaemon()
+			duplicateReturned <- struct{}{}
+		}()
+	}
+	for range 4 {
+		select {
+		case <-duplicateReturned:
+		case <-duplicateDialEntered:
+			t.Fatal("duplicate reconnect attempted to dial while the first reconnect was in progress")
+		case <-time.After(time.Second):
+			t.Fatal("duplicate reconnect did not return while the first reconnect was in progress")
+		}
+	}
+	if got := dialCalls.Load(); got != 1 {
+		t.Fatalf("dial calls while first reconnect was blocked = %d, want 1", got)
+	}
+
+	readyMessage := make(chan *protocol.Message, 1)
+	readyErr := make(chan error, 1)
+	go func() {
+		msg, err := protocol.DecodeMessage(daemonConn)
+		if err != nil {
+			readyErr <- err
+			return
+		}
+		readyMessage <- msg
+	}()
+	releaseDial()
+
+	select {
+	case err := <-readyErr:
+		t.Fatalf("read reconnect ready message: %v", err)
+	case msg := <-readyMessage:
+		if msg.Type != protocol.MsgReady {
+			t.Fatalf("reconnect message type = %s, want %s", msg.Type, protocol.MsgReady)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not send READY")
+	}
+	waitForSignal(t, ownerDone, "first reconnect to finish")
+
+	if got := dialCalls.Load(); got != 1 {
+		t.Fatalf("dial calls = %d, want 1", got)
+	}
+	w.connMu.Lock()
+	publishedConn := w.conn
+	w.connMu.Unlock()
+	if publishedConn != workerConn {
+		t.Fatal("reconnect did not publish the sole ready connection")
 	}
 }
 

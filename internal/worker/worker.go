@@ -41,6 +41,9 @@ type Worker struct {
 	sendMu    sync.Mutex
 	msgReader *protocol.MessageReader
 
+	reconnectMu  sync.Mutex
+	reconnecting bool
+
 	startResult *adapter.CliStartResult
 
 	ctx               context.Context
@@ -216,6 +219,19 @@ func (w *Worker) connectToDaemon() error {
 }
 
 func (w *Worker) reconnectToDaemon() {
+	w.reconnectMu.Lock()
+	if w.reconnecting {
+		w.reconnectMu.Unlock()
+		return
+	}
+	w.reconnecting = true
+	w.reconnectMu.Unlock()
+	defer func() {
+		w.reconnectMu.Lock()
+		w.reconnecting = false
+		w.reconnectMu.Unlock()
+	}()
+
 	log.Printf("[worker:%s] daemon disconnected, starting reconnection...", safeShortID(w.sessionID))
 	for attempt := 0; attempt < 100; attempt++ {
 		if w.isClosed() {
