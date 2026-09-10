@@ -56,6 +56,9 @@ func TestRunCleansUpAfterDaemonClose(t *testing.T) {
 	if ready.Type != protocol.MsgReady {
 		t.Fatalf("worker first message = %s, want %s", ready.Type, protocol.MsgReady)
 	}
+	if _, err := protocol.NewMessage(protocol.MsgAck, sessionID, "worker_ready").WriteTo(conn); err != nil {
+		t.Fatalf("acknowledge worker ready: %v", err)
+	}
 	if _, err := protocol.NewMessage(protocol.MsgClose, sessionID, "test").WriteTo(conn); err != nil {
 		t.Fatalf("send close: %v", err)
 	}

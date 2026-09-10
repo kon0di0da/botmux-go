@@ -23,6 +23,7 @@ const (
 	defaultCancelTurnTimeout  = 10 * time.Second
 	defaultRestartWorkerGrace = 2 * time.Second
 	maxCurrentWorkerSendTries = 3
+	workerReadyAckPayload     = "worker_ready"
 )
 
 type cancelSendFailureResult uint8
@@ -1167,6 +1168,12 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		_, _ = protocol.NewMessage(protocol.MsgError, sessionID, "worker instance ID mismatch").WriteTo(conn)
 		return
 	}
+	if _, err := protocol.NewMessage(protocol.MsgAck, sessionID, workerReadyAckPayload).WriteTo(conn); err != nil {
+		d.sessionsMu.RUnlock()
+		d.workersMu.Unlock()
+		log.Printf("[daemon] session %s ready acknowledgment: %v", safeShort(sessionID), err)
+		return
+	}
 	oldConn := h.SetConn(conn)
 	d.sessionsMu.RUnlock()
 	d.workersMu.Unlock()
@@ -1183,9 +1190,7 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		d.connMapMu.Unlock()
 	}()
 
-	if first.Type != protocol.MsgNewSession {
-		d.routeMessage(first, meta, h)
-	}
+	d.routeMessage(first, meta, h)
 	for {
 		msg, err := reader.Read()
 		if err != nil {

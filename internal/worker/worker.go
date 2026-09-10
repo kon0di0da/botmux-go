@@ -25,7 +25,16 @@ const (
 	cliOutputIdleLogEvery  = 15 * time.Second
 	cliOutputObserveFor    = 130 * time.Second
 	cliOutputCheckInterval = 5 * time.Second
+	workerReadyAckPayload  = "worker_ready"
 )
+
+type workerHandshakeRejectedError struct {
+	payload string
+}
+
+func (e *workerHandshakeRejectedError) Error() string {
+	return "worker ready rejected: " + e.payload
+}
 
 type Worker struct {
 	sessionID        string
@@ -121,27 +130,32 @@ func (w *Worker) Run() error {
 	if w.cliAdapter == nil {
 		return fmt.Errorf("no adapter registered for cli_type")
 	}
-	if err := w.connectToDaemon(); err != nil {
+	conn, err := w.connectToDaemon()
+	if err != nil {
 		return err
 	}
 
 	if err := w.startCli(); err != nil {
-		w.sendError("start_cli: " + err.Error())
+		_ = conn.Close()
 		return err
 	}
+
+	if err := w.waitForCLIReady(); err != nil {
+		_ = conn.Close()
+		return err
+	}
+
+	reader, err := w.readyHandshake(conn)
+	if err != nil {
+		_ = conn.Close()
+		return err
+	}
+	w.publishConnection(conn, reader)
+	log.Printf("[worker:%s] connected to daemon %s", safeShortID(w.sessionID), w.daemonAddr)
+	close(w.readyCh)
 
 	w.wg.Add(1)
 	go w.readDaemonMessages()
-
-	if err := w.waitForCLIReady(); err != nil {
-		w.sendError("cli_ready: " + err.Error())
-		return err
-	}
-
-	if err := w.sendReady(); err != nil {
-		return err
-	}
-	close(w.readyCh)
 
 	goroutines := 2
 	if w.startResult.Events != nil {
@@ -191,7 +205,7 @@ func (w *Worker) waitForCLIReady() error {
 	}
 }
 
-func (w *Worker) connectToDaemon() error {
+func (w *Worker) connectToDaemon() (net.Conn, error) {
 	var conn net.Conn
 	var err error
 	backoff := 100 * time.Millisecond
@@ -207,15 +221,9 @@ func (w *Worker) connectToDaemon() error {
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("connect daemon %s: %w", w.daemonAddr, err)
+		return nil, fmt.Errorf("connect daemon %s: %w", w.daemonAddr, err)
 	}
-	w.connMu.Lock()
-	w.conn = conn
-	w.msgReader = protocol.NewMessageReader(conn)
-	w.connMu.Unlock()
-	w.setConnected(true)
-	log.Printf("[worker:%s] connected to daemon %s", safeShortID(w.sessionID), w.daemonAddr)
-	return nil
+	return conn, nil
 }
 
 func (w *Worker) reconnectToDaemon() {
@@ -253,17 +261,19 @@ func (w *Worker) reconnectToDaemon() {
 		if err != nil {
 			continue
 		}
-		if err := w.sendReadyTo(conn); err != nil {
+		reader, err := w.readyHandshake(conn)
+		if err != nil {
 			_ = conn.Close()
+			var rejected *workerHandshakeRejectedError
+			if errors.As(err, &rejected) {
+				log.Printf("[worker:%s] reconnect rejected: %s", safeShortID(w.sessionID), rejected.payload)
+				w.Cancel()
+				return
+			}
 			log.Printf("[worker:%s] reconnect ready: %v", safeShortID(w.sessionID), err)
 			continue
 		}
-		w.connMu.Lock()
-		oldConn := w.conn
-		w.conn = conn
-		w.msgReader = protocol.NewMessageReader(conn)
-		w.connMu.Unlock()
-		w.setConnected(true)
+		oldConn := w.publishConnection(conn, reader)
 		if oldConn != nil {
 			_ = oldConn.Close()
 		}
@@ -272,6 +282,16 @@ func (w *Worker) reconnectToDaemon() {
 		return
 	}
 	log.Printf("[worker:%s] failed to reconnect after 100 attempts, giving up", safeShortID(w.sessionID))
+}
+
+func (w *Worker) publishConnection(conn net.Conn, reader *protocol.MessageReader) net.Conn {
+	w.connMu.Lock()
+	oldConn := w.conn
+	w.conn = conn
+	w.msgReader = reader
+	w.connMu.Unlock()
+	w.setConnected(true)
+	return oldConn
 }
 
 func (w *Worker) setConnected(v bool) {
@@ -312,6 +332,25 @@ func (w *Worker) sendReadyTo(conn net.Conn) error {
 	m.WorkerInstanceID = w.workerInstanceID
 	_, err := m.WriteTo(conn)
 	return err
+}
+
+func (w *Worker) readyHandshake(conn net.Conn) (*protocol.MessageReader, error) {
+	if err := w.sendReadyTo(conn); err != nil {
+		return nil, err
+	}
+	reader := protocol.NewMessageReader(conn)
+	msg, err := reader.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read ready acknowledgment: %w", err)
+	}
+	if msg.Type == protocol.MsgError {
+		return nil, &workerHandshakeRejectedError{payload: msg.Payload}
+	}
+	if msg.Type != protocol.MsgAck || msg.SessionID != w.sessionID || msg.Payload != workerReadyAckPayload {
+		return nil, fmt.Errorf("unexpected ready acknowledgment: type=%s session=%q payload=%q",
+			msg.Type, msg.SessionID, msg.Payload)
+	}
+	return reader, nil
 }
 
 func (w *Worker) sendError(msg string) {

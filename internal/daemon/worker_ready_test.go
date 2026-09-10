@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,6 +172,10 @@ func TestHandleConnAcceptsReadyWithMatchingWorkerInstanceID(t *testing.T) {
 	if _, err := readyTestWorkerMessage(handle, protocol.MsgReady, "ready").WriteTo(workerConn); err != nil {
 		t.Fatalf("write ready message: %v", err)
 	}
+	ack := readReadyTestMessage(t, workerConn)
+	if ack.Type != protocol.MsgAck || ack.SessionID != handle.SessionID || ack.Payload != "worker_ready" {
+		t.Fatalf("ready response = %#v, want worker_ready acknowledgment", ack)
+	}
 
 	select {
 	case <-handle.Ready:
@@ -198,6 +203,10 @@ func TestHandleConnAcceptsSameWorkerReconnect(t *testing.T) {
 	if _, err := readyTestWorkerMessage(handle, protocol.MsgReady, "ready").WriteTo(workerConn1); err != nil {
 		t.Fatalf("write first ready message: %v", err)
 	}
+	ack := readReadyTestMessage(t, workerConn1)
+	if ack.Type != protocol.MsgAck || ack.SessionID != handle.SessionID || ack.Payload != "worker_ready" {
+		t.Fatalf("first ready response = %#v, want worker_ready acknowledgment", ack)
+	}
 	select {
 	case <-handle.Ready:
 	case <-time.After(time.Second):
@@ -224,6 +233,10 @@ func TestHandleConnAcceptsSameWorkerReconnect(t *testing.T) {
 	go d.handleConn(serverConn2)
 	if _, err := readyTestWorkerMessage(handle, protocol.MsgReady, "ready").WriteTo(workerConn2); err != nil {
 		t.Fatalf("write reconnect ready message: %v", err)
+	}
+	ack = readReadyTestMessage(t, workerConn2)
+	if ack.Type != protocol.MsgAck || ack.SessionID != handle.SessionID || ack.Payload != "worker_ready" {
+		t.Fatalf("reconnect ready response = %#v, want worker_ready acknowledgment", ack)
 	}
 	waitForCondition(t, time.Second, func() bool {
 		handle.mu.Lock()
@@ -339,6 +352,53 @@ func TestHandleConnRejectsStaleWorkerAfterSessionReuse(t *testing.T) {
 	}
 }
 
+func TestHandleConnAcknowledgesReadyBeforePublishingConnection(t *testing.T) {
+	d, handle := newReadyTestDaemon(t)
+	serverConn, workerConn := net.Pipe()
+	gatedConn := newAckGatedConn(serverConn)
+	t.Cleanup(func() {
+		gatedConn.releaseWrite()
+		_ = workerConn.Close()
+		d.wg.Wait()
+	})
+
+	d.wg.Add(1)
+	go d.handleConn(gatedConn)
+
+	if _, err := readyTestWorkerMessage(handle, protocol.MsgReady, "ready").WriteTo(workerConn); err != nil {
+		t.Fatalf("write ready message: %v", err)
+	}
+	select {
+	case <-gatedConn.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ready acknowledgment write to start")
+	}
+
+	handle.mu.Lock()
+	publishedConn := handle.Conn
+	handle.mu.Unlock()
+	if publishedConn != nil {
+		t.Fatal("worker connection was published before ready acknowledgment completed")
+	}
+
+	gatedConn.releaseWrite()
+	ack := readReadyTestMessage(t, workerConn)
+	if ack.Type != protocol.MsgAck || ack.SessionID != handle.SessionID || ack.Payload != "worker_ready" {
+		t.Fatalf("ready response = %#v, want worker_ready acknowledgment", ack)
+	}
+	select {
+	case <-handle.Ready:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not become ready after acknowledgment")
+	}
+	handle.mu.Lock()
+	publishedConn = handle.Conn
+	handle.mu.Unlock()
+	if publishedConn != gatedConn {
+		t.Fatal("worker connection was not published after ready acknowledgment")
+	}
+}
+
 func TestNewWorkerInstanceIDIsRandomHex(t *testing.T) {
 	first, err := newWorkerInstanceID()
 	if err != nil {
@@ -411,4 +471,31 @@ func expectReadyTestEOF(t *testing.T, conn net.Conn) {
 	if _, err := protocol.DecodeMessage(conn); !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("read after error = %v, want closed peer", err)
 	}
+}
+
+type ackGatedConn struct {
+	net.Conn
+
+	writeStarted chan struct{}
+	release      chan struct{}
+	startOnce    sync.Once
+	releaseOnce  sync.Once
+}
+
+func newAckGatedConn(conn net.Conn) *ackGatedConn {
+	return &ackGatedConn{
+		Conn:         conn,
+		writeStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+}
+
+func (c *ackGatedConn) Write(data []byte) (int, error) {
+	c.startOnce.Do(func() { close(c.writeStarted) })
+	<-c.release
+	return c.Conn.Write(data)
+}
+
+func (c *ackGatedConn) releaseWrite() {
+	c.releaseOnce.Do(func() { close(c.release) })
 }

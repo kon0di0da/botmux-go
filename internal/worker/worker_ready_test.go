@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -134,6 +135,9 @@ func TestWorkerSendsReadyBeforeHeartbeats(t *testing.T) {
 	if first.WorkerInstanceID != "nonce-heartbeat-123" {
 		t.Fatalf("ready worker instance ID = %q, want %q", first.WorkerInstanceID, "nonce-heartbeat-123")
 	}
+	if _, err := protocol.NewMessage(protocol.MsgAck, w.sessionID, "worker_ready").WriteTo(conn); err != nil {
+		t.Fatalf("acknowledge ready: %v", err)
+	}
 	heartbeat, err := reader.Read()
 	if err != nil {
 		t.Fatalf("read queued heartbeat: %v", err)
@@ -226,10 +230,24 @@ func TestWorkerSendsReadyBeforeOutputEvents(t *testing.T) {
 		t.Fatalf("ready worker instance ID = %q, want %q", first.WorkerInstanceID, "nonce-output-123")
 	}
 
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("set pre-ack read deadline: %v", err)
+	}
+	if msg, err := reader.Read(); err == nil {
+		t.Fatalf("worker sent %s before ready acknowledgment: %#v", msg.Type, msg)
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("read before ready acknowledgment: %v, want timeout", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear pre-ack read deadline: %v", err)
+	}
+	if _, err := protocol.NewMessage(protocol.MsgAck, w.sessionID, "worker_ready").WriteTo(conn); err != nil {
+		t.Fatalf("acknowledge ready: %v", err)
+	}
 	select {
 	case <-cli.eventSent:
 	case <-time.After(time.Second):
-		t.Fatal("adapter output event was not consumed after ready")
+		t.Fatal("adapter output event was not consumed after ready acknowledgment")
 	}
 	output, err := reader.Read()
 	if err != nil {
@@ -253,7 +271,7 @@ func TestWorkerSendsReadyBeforeOutputEvents(t *testing.T) {
 	}
 }
 
-func TestWorkerDoesNotProcessInputBeforeReadySendSucceeds(t *testing.T) {
+func TestWorkerDoesNotProcessInputBeforeReadyAcknowledgment(t *testing.T) {
 	daemonConn, workerConn := net.Pipe()
 	blockingConn := newBlockingWriteConn(workerConn)
 	cli := newReadyBarrierTestAdapter()
@@ -285,20 +303,6 @@ func TestWorkerDoesNotProcessInputBeforeReadySendSucceeds(t *testing.T) {
 	})
 
 	waitForSignal(t, blockingConn.writeStarted, "ready write to start")
-
-	inputWrite := make(chan error, 1)
-	go func() {
-		_, err := protocol.NewMessage(protocol.MsgUserInput, w.sessionID, "hello").WriteTo(daemonConn)
-		inputWrite <- err
-	}()
-	select {
-	case err := <-inputWrite:
-		if err != nil {
-			t.Fatalf("send user input: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("user input write did not complete")
-	}
 
 	select {
 	case <-w.readyCh:
@@ -333,7 +337,33 @@ func TestWorkerDoesNotProcessInputBeforeReadySendSucceeds(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("ready send did not complete")
 	}
-	waitForSignal(t, cli.sendStarted, "adapter Send after ready")
+	select {
+	case <-w.readyCh:
+		t.Fatal("ready barrier opened before ready acknowledgment")
+	default:
+	}
+	select {
+	case <-cli.sendStarted:
+		t.Fatal("adapter Send started before ready acknowledgment")
+	default:
+	}
+	if _, err := protocol.NewMessage(protocol.MsgAck, w.sessionID, "worker_ready").WriteTo(daemonConn); err != nil {
+		t.Fatalf("acknowledge ready: %v", err)
+	}
+	inputWrite := make(chan error, 1)
+	go func() {
+		_, err := protocol.NewMessage(protocol.MsgUserInput, w.sessionID, "hello").WriteTo(daemonConn)
+		inputWrite <- err
+	}()
+	select {
+	case err := <-inputWrite:
+		if err != nil {
+			t.Fatalf("send user input: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("user input was not read after ready acknowledgment")
+	}
+	waitForSignal(t, cli.sendStarted, "adapter Send after ready acknowledgment")
 
 	if _, err := protocol.NewMessage(protocol.MsgClose, w.sessionID, "").WriteTo(daemonConn); err != nil {
 		t.Fatalf("send close: %v", err)
@@ -349,7 +379,7 @@ func TestWorkerDoesNotProcessInputBeforeReadySendSucceeds(t *testing.T) {
 	}
 }
 
-func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
+func TestWorkerReconnectPublishesOnlyAfterReadyAck(t *testing.T) {
 	oldDaemonConn, oldWorkerConn := net.Pipe()
 	newDaemonConn, newWorkerConn := net.Pipe()
 	blockingConn := newBlockingWriteConn(newWorkerConn)
@@ -361,6 +391,7 @@ func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
 	})
 	w.conn = oldWorkerConn
 	w.msgReader = protocol.NewMessageReader(oldWorkerConn)
+	oldReader := w.msgReader
 	w.dial = func(string, string) (net.Conn, error) {
 		return blockingConn, nil
 	}
@@ -379,7 +410,11 @@ func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
 		close(oldConnClosed)
 	}()
 
-	go w.reconnectToDaemon()
+	reconnectDone := make(chan struct{})
+	go func() {
+		w.reconnectToDaemon()
+		close(reconnectDone)
+	}()
 	waitForSignal(t, blockingConn.writeStarted, "reconnect ready write to start")
 
 	w.connMu.Lock()
@@ -418,15 +453,37 @@ func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
 		t.Fatal("reconnect ready send did not complete")
 	}
 
-	waitForSignal(t, oldConnClosed, "old connection to close after reconnect")
 	w.connMu.Lock()
 	publishedConn = w.conn
+	publishedReader := w.msgReader
+	w.connMu.Unlock()
+	if publishedConn != oldWorkerConn {
+		t.Fatal("reconnect published the new connection before ready acknowledgment")
+	}
+	if publishedReader != oldReader {
+		t.Fatal("reconnect published a new message reader before ready acknowledgment")
+	}
+	if w.isConnected() {
+		t.Fatal("reconnect marked worker connected before ready acknowledgment")
+	}
+
+	if _, err := protocol.NewMessage(protocol.MsgAck, w.sessionID, "worker_ready").WriteTo(newDaemonConn); err != nil {
+		t.Fatalf("acknowledge reconnect ready: %v", err)
+	}
+	waitForSignal(t, reconnectDone, "reconnect after ready acknowledgment")
+	waitForSignal(t, oldConnClosed, "old connection to close after reconnect acknowledgment")
+	w.connMu.Lock()
+	publishedConn = w.conn
+	publishedReader = w.msgReader
 	w.connMu.Unlock()
 	if publishedConn != blockingConn {
-		t.Fatal("reconnect did not publish the ready connection")
+		t.Fatal("reconnect did not publish the acknowledged connection")
+	}
+	if publishedReader == nil || publishedReader == oldReader {
+		t.Fatal("reconnect did not publish the acknowledged message reader")
 	}
 	if !w.isConnected() {
-		t.Fatal("reconnect did not mark worker connected after READY")
+		t.Fatal("reconnect did not mark worker connected after ready acknowledgment")
 	}
 
 	writes := blockingConn.writes()
@@ -439,6 +496,87 @@ func TestWorkerReconnectSendsReadyBeforePublishingConnection(t *testing.T) {
 	}
 	if first.Type != protocol.MsgReady {
 		t.Fatalf("first reconnect write = %s, want %s", first.Type, protocol.MsgReady)
+	}
+}
+
+func TestWorkerReconnectDoesNotPublishRejectedReady(t *testing.T) {
+	oldDaemonConn, oldWorkerConn := net.Pipe()
+	newDaemonConn, newWorkerConn := net.Pipe()
+	w := New(Options{
+		SessionID:        "worker-reconnect-rejected",
+		WorkerInstanceID: "nonce-rejected-123",
+		DaemonAddr:       "daemon-test",
+		CliType:          "mock",
+	})
+	w.conn = oldWorkerConn
+	w.msgReader = protocol.NewMessageReader(oldWorkerConn)
+	w.reconnectSleep = func(time.Duration) {}
+
+	var dialCalls atomic.Int32
+	w.dial = func(string, string) (net.Conn, error) {
+		if dialCalls.Add(1) != 1 {
+			t.Fatal("reconnect dialed again after permanent ready rejection")
+		}
+		return newWorkerConn, nil
+	}
+	t.Cleanup(func() {
+		w.Cancel()
+		_ = oldDaemonConn.Close()
+		_ = newDaemonConn.Close()
+	})
+
+	readyRead := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(newDaemonConn).Read()
+		if err != nil {
+			close(readyRead)
+			serverDone <- err
+			return
+		}
+		close(readyRead)
+		if msg.Type != protocol.MsgReady {
+			serverDone <- fmt.Errorf("first message = %s, want %s", msg.Type, protocol.MsgReady)
+			return
+		}
+		_, err = protocol.NewMessage(protocol.MsgError, w.sessionID, "worker instance mismatch").WriteTo(newDaemonConn)
+		serverDone <- err
+	}()
+
+	reconnectDone := make(chan struct{})
+	go func() {
+		w.reconnectToDaemon()
+		close(reconnectDone)
+	}()
+	waitForSignal(t, readyRead, "rejected reconnect ready")
+	waitForSignal(t, reconnectDone, "reconnect exit after ready rejection")
+
+	w.connMu.Lock()
+	publishedConn := w.conn
+	publishedReader := w.msgReader
+	w.connMu.Unlock()
+	if publishedConn == newWorkerConn {
+		t.Fatal("reconnect published the rejected connection")
+	}
+	if publishedReader != nil {
+		t.Fatal("reconnect retained a message reader after permanent ready rejection")
+	}
+	if w.isConnected() {
+		t.Fatal("reconnect marked worker connected after permanent ready rejection")
+	}
+	if !w.isClosed() {
+		t.Fatal("worker did not cancel after permanent ready rejection")
+	}
+	if got := dialCalls.Load(); got != 1 {
+		t.Fatalf("dial calls = %d, want 1", got)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("send ready rejection: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not finish sending ready rejection")
 	}
 }
 
@@ -542,6 +680,9 @@ func TestWorkerReconnectIsSingleFlight(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reconnect did not send READY")
 	}
+	if _, err := protocol.NewMessage(protocol.MsgAck, w.sessionID, "worker_ready").WriteTo(daemonConn); err != nil {
+		t.Fatalf("acknowledge reconnect ready: %v", err)
+	}
 	waitForSignal(t, ownerDone, "first reconnect to finish")
 
 	if got := dialCalls.Load(); got != 1 {
@@ -558,7 +699,7 @@ func TestWorkerReconnectIsSingleFlight(t *testing.T) {
 func TestWorkerReconnectPublishesConnectionDespiteBlockedOldWrite(t *testing.T) {
 	oldDaemonConn, oldWorkerConn := net.Pipe()
 	blockedOldConn := newCloseBlockingWriteConn(oldWorkerConn)
-	newConn := &recordingConn{}
+	newDaemonConn, newWorkerConn := net.Pipe()
 	w := New(Options{
 		SessionID:        "worker-reconnect-blocked-write",
 		WorkerInstanceID: "nonce-blocked-write-123",
@@ -568,7 +709,7 @@ func TestWorkerReconnectPublishesConnectionDespiteBlockedOldWrite(t *testing.T) 
 	w.conn = blockedOldConn
 	w.msgReader = protocol.NewMessageReader(blockedOldConn)
 	w.dial = func(string, string) (net.Conn, error) {
-		return newConn, nil
+		return newWorkerConn, nil
 	}
 	w.reconnectSleep = func(time.Duration) {}
 
@@ -579,7 +720,7 @@ func TestWorkerReconnectPublishesConnectionDespiteBlockedOldWrite(t *testing.T) 
 		_ = blockedOldConn.Close()
 		w.Cancel()
 		_ = oldDaemonConn.Close()
-		_ = newConn.Close()
+		_ = newDaemonConn.Close()
 		select {
 		case <-senderExited:
 		case <-time.After(time.Second):
@@ -593,33 +734,50 @@ func TestWorkerReconnectPublishesConnectionDespiteBlockedOldWrite(t *testing.T) 
 	}()
 	waitForSignal(t, blockedOldConn.writeStarted, "old write to start")
 
+	readyMessage := make(chan *protocol.Message, 1)
+	serverDone := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(newDaemonConn).Read()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		readyMessage <- msg
+		_, err = protocol.NewMessage(protocol.MsgAck, w.sessionID, "worker_ready").WriteTo(newDaemonConn)
+		serverDone <- err
+	}()
+
 	go func() {
 		w.reconnectToDaemon()
 		close(reconnectDone)
 	}()
 
-	waitForSignal(t, reconnectDone, "reconnect to publish a ready connection")
+	select {
+	case msg := <-readyMessage:
+		if msg.Type != protocol.MsgReady {
+			t.Fatalf("reconnect message type = %s, want %s", msg.Type, protocol.MsgReady)
+		}
+		if msg.WorkerInstanceID != "nonce-blocked-write-123" {
+			t.Fatalf("reconnect worker instance ID = %q, want %q", msg.WorkerInstanceID, "nonce-blocked-write-123")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not send READY")
+	}
+	waitForSignal(t, reconnectDone, "reconnect to publish an acknowledged connection")
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("acknowledge reconnect ready: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("daemon did not acknowledge reconnect ready")
+	}
 
 	w.connMu.Lock()
 	publishedConn := w.conn
 	w.connMu.Unlock()
-	if publishedConn != newConn {
+	if publishedConn != newWorkerConn {
 		t.Fatal("reconnect did not publish the replacement connection")
-	}
-
-	writes := newConn.writes()
-	if len(writes) != 1 {
-		t.Fatalf("new connection writes = %d, want 1", len(writes))
-	}
-	ready, err := protocol.DecodeMessage(bytes.NewReader(writes[0]))
-	if err != nil {
-		t.Fatalf("decode reconnect ready: %v", err)
-	}
-	if ready.Type != protocol.MsgReady {
-		t.Fatalf("reconnect message type = %s, want %s", ready.Type, protocol.MsgReady)
-	}
-	if ready.WorkerInstanceID != "nonce-blocked-write-123" {
-		t.Fatalf("reconnect worker instance ID = %q, want %q", ready.WorkerInstanceID, "nonce-blocked-write-123")
 	}
 
 	select {
