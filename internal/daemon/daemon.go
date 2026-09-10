@@ -583,16 +583,24 @@ func (d *Daemon) CancelTurn(id string) error {
 		d.sessionsMu.RUnlock()
 		return fmt.Errorf("session %s does not use Codex", id)
 	}
+	d.sessionsMu.RUnlock()
+	if !d.hasReadyCurrentWorkerForSession(meta) {
+		return fmt.Errorf("session %s has no ready worker", id)
+	}
+
+	d.sessionsMu.RLock()
 	token, ok := d.beginTurnCancelIfCurrentLocked(meta)
 	d.sessionsMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("session %s has no cancellable active turn", id)
 	}
-	if err := d.sendCancelToCurrentWorker(meta, token); err != nil {
-		d.finishCancelWithFailure(meta, token, "codex_cancel_failed", err.Error())
-		return fmt.Errorf("cancel Codex turn for session %s: %w", id, err)
-	}
 	go d.watchCancelledTurn(meta, token)
+	go func() {
+		if err := d.sendCancelToCurrentWorker(meta, token); err != nil {
+			d.finishCancelWithFailure(meta, token, "codex_cancel_failed", err.Error())
+			log.Printf("[daemon] session %s cancel delivery: %v", safeShort(meta.SessionID), err)
+		}
+	}()
 	return nil
 }
 
@@ -732,6 +740,21 @@ func (d *Daemon) isCurrentSession(meta *SessionMeta) bool {
 
 func (d *Daemon) isCurrentSessionLocked(meta *SessionMeta) bool {
 	return meta != nil && d.sessions[meta.SessionID] == meta
+}
+
+func (d *Daemon) hasReadyCurrentWorkerForSession(meta *SessionMeta) bool {
+	if meta == nil {
+		return false
+	}
+	d.workersMu.RLock()
+	defer d.workersMu.RUnlock()
+	handle := d.workers[meta.SessionID]
+	if handle == nil || !handle.IsReady() {
+		return false
+	}
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	return d.isCurrentSessionLocked(meta)
 }
 
 func (d *Daemon) beginCodexTurnIfReady(meta *SessionMeta) error {

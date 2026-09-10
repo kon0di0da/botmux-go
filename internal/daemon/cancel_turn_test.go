@@ -45,6 +45,63 @@ func TestCancelTurnSendsIPCAndMarksCancelling(t *testing.T) {
 	meta.CompleteTurn(protocol.TurnTerminal{Status: protocol.TurnAborted})
 }
 
+func TestCancelTurnWatchdogRunsWhileCancelWriteBlocks(t *testing.T) {
+	d, meta, handle, workerConn := newCancelTestDaemon(t)
+	if !meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+
+	cancelErr := make(chan error, 1)
+	go func() {
+		cancelErr <- d.CancelTurn(meta.SessionID)
+	}()
+
+	select {
+	case err := <-cancelErr:
+		if err != nil {
+			t.Fatalf("CancelTurn: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("CancelTurn did not return while cancel IPC write was blocked")
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		terminals, _, _ := meta.SnapshotTerminalsSince(0)
+		if len(terminals) != 1 {
+			return false
+		}
+		d.sessionsMu.RLock()
+		status := meta.Status
+		d.sessionsMu.RUnlock()
+		return status == StatusRecovering
+	})
+	terminals, _, _ := meta.SnapshotTerminalsSince(0)
+	if got := terminals[0]; got.Status != protocol.TurnFailed || got.ErrorCode != "codex_cancel_timeout" {
+		t.Fatalf("terminal = %#v, want codex_cancel_timeout failure", got)
+	}
+	if snapshot := meta.TurnSnapshot(); snapshot.Active || snapshot.Cancelling {
+		t.Fatalf("turn snapshot = %#v, want inactive non-cancelling turn", snapshot)
+	}
+
+	cursor, terminalNotify := meta.TerminalSubscription()
+	if cursor != 1 {
+		t.Fatalf("terminal cursor = %d, want 1", cursor)
+	}
+	if err := workerConn.Close(); err != nil {
+		t.Fatalf("close worker pipe: %v", err)
+	}
+	handle.CloseConn()
+
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-terminalNotify:
+		terminals, _, _ := meta.SnapshotTerminalsSince(0)
+		t.Fatalf("late cancel delivery published a second terminal: %#v", terminals)
+	case <-timer.C:
+	}
+}
+
 func TestCancelTurnRetriesReplacementWorker(t *testing.T) {
 	d, meta, original, _ := newCancelTestDaemon(t)
 	d.turnCancelTimeout = time.Second
@@ -83,9 +140,9 @@ func TestCancelTurnRetriesReplacementWorker(t *testing.T) {
 	meta.CompleteTurn(protocol.TurnTerminal{Status: protocol.TurnAborted})
 }
 
-func TestCancelTurnFailsAfterWorkerReplacementRetryExhaustion(t *testing.T) {
+func TestCancelTurnAcceptsBeforeWorkerReplacementRetryExhaustionFailure(t *testing.T) {
 	d, meta, original, _ := newCancelTestDaemon(t)
-	d.turnCancelTimeout = 10 * time.Millisecond
+	d.turnCancelTimeout = 100 * time.Millisecond
 	if !meta.BeginTurn() {
 		t.Fatal("begin turn")
 	}
@@ -109,11 +166,14 @@ func TestCancelTurnFailsAfterWorkerReplacementRetryExhaustion(t *testing.T) {
 		})
 	}
 
-	err := d.CancelTurn(meta.SessionID)
-	if err == nil {
-		t.Fatal("CancelTurn succeeded after worker replacement retry exhaustion")
+	if err := d.CancelTurn(meta.SessionID); err != nil {
+		t.Fatalf("CancelTurn: %v", err)
 	}
 
+	waitForCondition(t, time.Second, func() bool {
+		terminals, _, _ := meta.SnapshotTerminalsSince(0)
+		return len(terminals) == 1
+	})
 	terminals, _, _ := meta.SnapshotTerminalsSince(0)
 	if len(terminals) != 1 {
 		t.Fatalf("terminal count = %d, want 1: %#v", len(terminals), terminals)
@@ -121,8 +181,8 @@ func TestCancelTurnFailsAfterWorkerReplacementRetryExhaustion(t *testing.T) {
 	if got := terminals[0]; got.Status != protocol.TurnFailed || got.ErrorCode != "codex_cancel_failed" {
 		t.Fatalf("terminal = %#v, want codex_cancel_failed failure", got)
 	}
-	if terminals[0].ErrorDetail == "" || !strings.Contains(err.Error(), terminals[0].ErrorDetail) {
-		t.Fatalf("terminal error detail = %q, want detail from CancelTurn error %q", terminals[0].ErrorDetail, err)
+	if terminals[0].ErrorDetail == "" {
+		t.Fatal("terminal failure did not include the delivery error")
 	}
 	if snapshot := meta.TurnSnapshot(); snapshot.Active || snapshot.Cancelling {
 		t.Fatalf("turn snapshot = %#v, want terminal non-cancelling turn", snapshot)
