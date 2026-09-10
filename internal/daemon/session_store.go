@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -25,7 +26,10 @@ type PersistedSession struct {
 }
 
 type SessionStore struct {
+	mu  sync.Mutex
 	dir string
+	// beforeSave is a test hook. Production stores leave it nil.
+	beforeSave func(*PersistedSession)
 }
 
 func NewSessionStore(dir string) *SessionStore {
@@ -33,6 +37,12 @@ func NewSessionStore(dir string) *SessionStore {
 }
 
 func (s *SessionStore) save(ps *PersistedSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked(ps)
+}
+
+func (s *SessionStore) saveLocked(ps *PersistedSession) error {
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return err
 	}
@@ -40,6 +50,9 @@ func (s *SessionStore) save(ps *PersistedSession) error {
 	data, err := json.MarshalIndent(ps, "", "  ")
 	if err != nil {
 		return err
+	}
+	if s.beforeSave != nil {
+		s.beforeSave(ps)
 	}
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
@@ -49,6 +62,12 @@ func (s *SessionStore) save(ps *PersistedSession) error {
 }
 
 func (s *SessionStore) load(sessionID string) (*PersistedSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadLocked(sessionID)
+}
+
+func (s *SessionStore) loadLocked(sessionID string) (*PersistedSession, error) {
 	path := filepath.Join(s.dir, sessionID+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -62,6 +81,9 @@ func (s *SessionStore) load(sessionID string) (*PersistedSession, error) {
 }
 
 func (s *SessionStore) list() ([]*PersistedSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -77,7 +99,7 @@ func (s *SessionStore) list() ([]*PersistedSession, error) {
 		if filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		ps, err := s.load(e.Name()[:len(e.Name())-len(".json")])
+		ps, err := s.loadLocked(e.Name()[:len(e.Name())-len(".json")])
 		if err != nil {
 			continue
 		}
@@ -89,6 +111,12 @@ func (s *SessionStore) list() ([]*PersistedSession, error) {
 }
 
 func (s *SessionStore) remove(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.removeLocked(sessionID)
+}
+
+func (s *SessionStore) removeLocked(sessionID string) error {
 	path := filepath.Join(s.dir, sessionID+".json")
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
@@ -97,56 +125,83 @@ func (s *SessionStore) remove(sessionID string) error {
 }
 
 func (s *SessionStore) MarkClosed(sessionID string) error {
-	ps, err := s.load(sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ps, err := s.loadLocked(sessionID)
 	if err != nil {
 		return err
 	}
 	ps.Closed = true
 	ps.LastActive = time.Now()
-	return s.save(ps)
+	return s.saveLocked(ps)
 }
 
 const maxPersistedOutputLines = 5000
 
 func (s *SessionStore) UpdateOutput(sessionID string, output string) error {
-	ps, err := s.load(sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ps, err := s.loadLocked(sessionID)
 	if err != nil {
 		return err
+	}
+	if ps.Closed {
+		return nil
 	}
 	ps.LastOutput = append(ps.LastOutput, output)
 	if len(ps.LastOutput) > maxPersistedOutputLines {
 		ps.LastOutput = ps.LastOutput[len(ps.LastOutput)-maxPersistedOutputLines:]
 	}
 	ps.LastActive = time.Now()
-	return s.save(ps)
+	return s.saveLocked(ps)
 }
 
 func (s *SessionStore) UpdateLastActive(sessionID string) error {
-	ps, err := s.load(sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ps, err := s.loadLocked(sessionID)
 	if err != nil {
 		return err
 	}
+	if ps.Closed {
+		return nil
+	}
 	ps.LastActive = time.Now()
-	return s.save(ps)
+	return s.saveLocked(ps)
 }
 
 func (s *SessionStore) UpdateWorkerPID(sessionID string, pid int) error {
-	ps, err := s.load(sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ps, err := s.loadLocked(sessionID)
 	if err != nil {
 		return err
 	}
+	if ps.Closed {
+		return nil
+	}
 	ps.WorkerPID = pid
-	return s.save(ps)
+	return s.saveLocked(ps)
 }
 
 func (s *SessionStore) UpdateCliSessionID(sessionID, cliSessionID string) error {
-	ps, err := s.load(sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ps, err := s.loadLocked(sessionID)
 	if err != nil {
 		return err
 	}
+	if ps.Closed {
+		return nil
+	}
 	ps.CliSessionID = cliSessionID
 	ps.LastActive = time.Now()
-	return s.save(ps)
+	return s.saveLocked(ps)
 }
 
 func (s *SessionStore) List() ([]*PersistedSession, error) {

@@ -227,8 +227,9 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 	d.sessions[opts.SessionID] = meta
 	d.sessionsMu.Unlock()
 
-	ps := meta.ToPersisted()
-	if err := d.store.save(ps); err != nil {
+	if err := d.persistCurrentSession(meta, func() error {
+		return d.store.save(meta.ToPersisted())
+	}); err != nil {
 		log.Printf("[daemon] warn: persist session %s failed: %v", safeShort(opts.SessionID), err)
 	}
 
@@ -314,7 +315,11 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 
 	d.stopWorkerHandle(existing)
 
-	_ = d.store.UpdateWorkerPID(meta.SessionID, handle.Pid)
+	if err := d.persistCurrentSession(meta, func() error {
+		return d.store.UpdateWorkerPID(meta.SessionID, handle.Pid)
+	}); err != nil {
+		log.Printf("[daemon] session %s persist worker PID: %v", safeShort(meta.SessionID), err)
+	}
 
 	go d.waitWorkerExit(handle)
 	go d.monitorReady(handle, meta)
@@ -505,6 +510,7 @@ func (d *Daemon) PurgeSession(id string) {
 		d.deleteWorkerIfCurrentLocked(id, h)
 	}
 	delete(d.sessions, id)
+	_ = d.store.remove(id)
 	d.sessionsMu.Unlock()
 	d.workersMu.Unlock()
 
@@ -523,7 +529,6 @@ func (d *Daemon) PurgeSession(id string) {
 			}
 		}
 	}
-	_ = d.store.remove(id)
 }
 
 func (d *Daemon) CloseSession(id, reason string) {
@@ -587,7 +592,11 @@ func (d *Daemon) SendInput(id, input string) error {
 	meta.touchActive()
 	userLine := "[user] " + input
 	meta.AddOutput(userLine)
-	_ = d.store.UpdateOutput(id, userLine)
+	if err := d.persistCurrentSession(meta, func() error {
+		return d.store.UpdateOutput(meta.SessionID, userLine)
+	}); err != nil {
+		log.Printf("[daemon] session %s persist input: %v", safeShort(meta.SessionID), err)
+	}
 	fmt.Printf("[session=%s] %s\n", safeShort(id), userLine)
 	if err := h.Send(msg); err != nil {
 		meta.FinishTurn()
@@ -764,6 +773,25 @@ func (d *Daemon) isCurrentSession(meta *SessionMeta) bool {
 	d.sessionsMu.RLock()
 	defer d.sessionsMu.RUnlock()
 	return d.isCurrentSessionLocked(meta)
+}
+
+// persistCurrentSession keeps the SessionMeta identity stable until its
+// ID-keyed store operation completes. Stale or terminal metas are no-ops.
+func (d *Daemon) persistCurrentSession(meta *SessionMeta, fn func() error) error {
+	if meta == nil || fn == nil {
+		return nil
+	}
+	d.sessionsMu.RLock()
+	defer d.sessionsMu.RUnlock()
+	// A zero-value Daemon has no session registry and is only used by direct
+	// store tests. Running daemons initialize sessions in New.
+	if d.sessions == nil {
+		return fn()
+	}
+	if d.sessions[meta.SessionID] != meta || meta.Closed {
+		return nil
+	}
+	return fn()
 }
 
 func (d *Daemon) isCurrentSessionLocked(meta *SessionMeta) bool {
@@ -1541,13 +1569,21 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 		d.clearSpawnFailure(meta.SessionID)
 		log.Printf("[daemon] session %s -> READY", safeShort(meta.SessionID))
 		meta.touchActive()
-		_ = d.store.UpdateLastActive(meta.SessionID)
+		if err := d.persistCurrentSession(meta, func() error {
+			return d.store.UpdateLastActive(meta.SessionID)
+		}); err != nil {
+			log.Printf("[daemon] session %s persist ready activity: %v", safeShort(meta.SessionID), err)
+		}
 	case protocol.MsgHeartbeat:
 		h.TouchHb()
 	case protocol.MsgOutput:
 		meta.AddOutput(msg.Payload)
 		meta.touchActive()
-		_ = d.store.UpdateOutput(meta.SessionID, msg.Payload)
+		if err := d.persistCurrentSession(meta, func() error {
+			return d.store.UpdateOutput(meta.SessionID, msg.Payload)
+		}); err != nil {
+			log.Printf("[daemon] session %s persist output: %v", safeShort(meta.SessionID), err)
+		}
 		fmt.Printf("[session=%s] %s\n", safeShort(meta.SessionID), msg.Payload)
 	case protocol.MsgError:
 		log.Printf("[daemon] session %s error: %s", safeShort(meta.SessionID), msg.Payload)
@@ -1558,7 +1594,9 @@ func (d *Daemon) routeMessage(msg *protocol.Message, meta *SessionMeta, h *Worke
 		}
 		meta.SetCliSessionID(msg.Payload)
 		meta.touchActive()
-		if err := d.store.UpdateCliSessionID(meta.SessionID, msg.Payload); err != nil {
+		if err := d.persistCurrentSession(meta, func() error {
+			return d.store.UpdateCliSessionID(meta.SessionID, msg.Payload)
+		}); err != nil {
 			log.Printf("[daemon] session %s persist Codex session ID: %v", safeShort(meta.SessionID), err)
 		}
 	case protocol.MsgTurnCompleted:

@@ -324,3 +324,47 @@ func TestCloseSessionMetaDoesNotCloseReusedSession(t *testing.T) {
 	default:
 	}
 }
+
+func TestPersistCurrentSessionSkipsStaleMeta(t *testing.T) {
+	const sessionID = "session-persist-reused"
+
+	oldMeta := NewSessionMeta(sessionID, "bot-old")
+	replacementMeta := NewSessionMeta(sessionID, "bot-replacement")
+	replacementMeta.AddOutput("replacement output")
+	d := &Daemon{
+		sessions: map[string]*SessionMeta{
+			sessionID: oldMeta,
+		},
+		store: NewSessionStore(t.TempDir()),
+	}
+	if err := d.store.save(oldMeta.ToPersisted()); err != nil {
+		t.Fatalf("persist old session fixture: %v", err)
+	}
+
+	d.sessions[sessionID] = replacementMeta
+	if err := d.store.save(replacementMeta.ToPersisted()); err != nil {
+		t.Fatalf("persist replacement session fixture: %v", err)
+	}
+
+	persisted := false
+	if err := d.persistCurrentSession(oldMeta, func() error {
+		persisted = true
+		return d.store.UpdateOutput(sessionID, "stale output")
+	}); err != nil {
+		t.Fatalf("persist stale session: %v", err)
+	}
+	if persisted {
+		t.Fatal("stale session persistence callback was invoked")
+	}
+
+	got, err := d.store.load(sessionID)
+	if err != nil {
+		t.Fatalf("load replacement session: %v", err)
+	}
+	if got.Closed {
+		t.Fatal("replacement persisted session is closed")
+	}
+	if len(got.LastOutput) != 1 || got.LastOutput[0] != "replacement output" {
+		t.Fatalf("replacement LastOutput = %#v, want unchanged output", got.LastOutput)
+	}
+}
