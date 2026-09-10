@@ -52,6 +52,16 @@ sequenceDiagram
 
 重启时 daemon 将保存的 `CliSessionID` 放入 Worker 环境；adapter 使用 `codex resume <id>`。resume 保留已选 `--profile`，因为 ArkCLI 等 provider 需要 profile 恢复鉴权上下文；仍不传 `--model`，避免覆盖原会话模型选择。
 
+## Worker 实例围栏
+
+daemon 为每个 `WorkerHandle` 生成一个临时的随机 128-bit instance nonce，并通过 `BOTMUX_WORKER_INSTANCE_ID` 传给该 worker。nonce 不持久化；daemon 重启会生成新的 worker，因此旧 worker 不能重新取得原实例身份。
+
+worker 在 `MsgReady` 中携带该 nonce。首次连接和重连均先在未发布的私有连接上完成 `READY -> ACK("worker_ready")` 握手；只有 ACK 写入成功后，双方才发布或替换该连接，并将 worker 标为 ready。
+
+daemon 仅接受同时满足下列条件的 READY：session 仍为当前且未关闭、该 session 当前的精确 `WorkerHandle` 仍由该 session owner 持有、且 nonce 与 handle 预期值完全相同。缺少 nonce、非预期 worker、已替换 session 或 nonce 不匹配均返回错误而不发布连接。被拒绝的初始或重连 worker 会清理 CLI/连接并停止重连，避免陈旧 worker 反复争用。
+
+此 nonce 是 daemon 内本机 worker 生命周期的实例围栏，不提供远程身份认证。`Closed` 状态仅由 daemon 落盘；同一 session ID 的重建、关闭和文件操作同时受当前 `SessionMeta` 指针与按 ID 文件锁保护。worker 只做资源清理，绝不写入 closed 状态。
+
 ## Profile
 
 仅发现 `${CODEX_HOME:-~/.codex}/*.config.toml` 的合法名称。profile 内容不会被读取、记录或通过 API 返回。fresh launch 接受 bot 默认或创建会话时的覆盖值；resume 重用已持久化的 profile。
