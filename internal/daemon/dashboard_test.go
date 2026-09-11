@@ -203,6 +203,51 @@ func TestDashboardSameSessionStaleDetailSourceGuards(t *testing.T) {
 	}
 }
 
+func TestDashboardPollingSingleFlightSourceGuards(t *testing.T) {
+	data, err := dashboardFS.ReadFile("dashboard.html")
+	if err != nil {
+		t.Fatalf("read dashboard: %v", err)
+	}
+	html := string(data)
+
+	if !strings.Contains(html, `var pollInFlight = false;`) {
+		t.Error("dashboard missing poll single-flight state")
+	}
+
+	pollStart := strings.Index(html, `async function poll() {`)
+	pollEnd := strings.Index(html[pollStart:], `function updateTopbar()`)
+	if pollStart < 0 || pollEnd < 0 {
+		t.Fatal("dashboard missing poll or updateTopbar")
+	}
+	pollBody := html[pollStart : pollStart+pollEnd]
+	guard := strings.Index(pollBody, `if (pollInFlight) return;`)
+	acquire := strings.Index(pollBody, `pollInFlight = true;`)
+	tryStart := strings.Index(pollBody, `try {`)
+	firstRefresh := strings.Index(pollBody, `await refreshHealth();`)
+	finallyStart := strings.Index(pollBody, `} finally {`)
+	release := strings.Index(pollBody, `pollInFlight = false;`)
+	if guard < 0 || acquire < 0 || tryStart < 0 || firstRefresh < 0 || finallyStart < 0 || release < 0 {
+		t.Error("poll missing single-flight guard, acquisition, or release")
+	} else if guard > acquire || acquire > tryStart || tryStart > firstRefresh || firstRefresh > finallyStart || finallyStart > release {
+		t.Error("poll must wrap all refresh and route returns in a try/finally single-flight guard")
+	}
+
+	startPollingStart := strings.Index(html, `function startPolling() {`)
+	startPollingEnd := strings.Index(html[startPollingStart:], `window.addEventListener('hashchange', fullRender);`)
+	if startPollingStart < 0 || startPollingEnd < 0 {
+		t.Fatal("dashboard missing startPolling")
+	}
+	startPollingBody := html[startPollingStart : startPollingStart+startPollingEnd]
+	initialPoll := strings.Index(startPollingBody, `poll();`)
+	interval := strings.Index(startPollingBody, `setInterval(poll, 2000);`)
+	if initialPoll < 0 || interval < 0 || initialPoll > interval {
+		t.Error("startPolling must trigger its initial refresh through poll before scheduling the interval")
+	}
+	if strings.Contains(startPollingBody, `Promise.all([refreshHealth(), refreshSessions(), refreshBots(), refreshCodexProfiles()])`) {
+		t.Error("startPolling still has the independent initial refresh chain")
+	}
+}
+
 func TestDashboardSessionScopedAsyncSourceGuards(t *testing.T) {
 	data, err := dashboardFS.ReadFile("dashboard.html")
 	if err != nil {

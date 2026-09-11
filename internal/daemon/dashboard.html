@@ -135,6 +135,7 @@ let botsData = { bots: [] };
 let codexProfilesData = { profiles: [] };
 let currentSessionId = null;
 let pollTimer = null;
+var pollInFlight = false;
 let chatPollTimer = null;
 let lastOutputCount = 0;
 
@@ -686,29 +687,35 @@ async function fullRender() {
 }
 
 async function poll() {
-  await refreshHealth();
-  await refreshSessions();
-  await refreshBots();
-  await refreshCodexProfiles();
-  updateTopbar();
-  var route = resolveRoute();
-  if (route.name !== currentRoute || (route.name === 'chat' && route.sid !== renderedSessionId)) {
-    await fullRender();
-    return;
-  }
-  if (route.name === 'home') {
-    updateHomeStats();
-    updateHomeTable();
-  } else if (route.name === 'chat') {
-    var sid = route.sid;
-    currentSessionId = sid;
-    var committed = await loadChatSession(sid);
-    if (!isCurrentChatSession(sid)) return;
-    if (!committed) return;
-    updateChatHeader(sid, chatSessionData);
-    updateChatMessages(chatSessionData, sid);
-    updateChatSidebar(sid);
-    updateChatControls(chatSessionData, sid);
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    await refreshHealth();
+    await refreshSessions();
+    await refreshBots();
+    await refreshCodexProfiles();
+    updateTopbar();
+    var route = resolveRoute();
+    if (route.name !== currentRoute || (route.name === 'chat' && route.sid !== renderedSessionId)) {
+      await fullRender();
+      return;
+    }
+    if (route.name === 'home') {
+      updateHomeStats();
+      updateHomeTable();
+    } else if (route.name === 'chat') {
+      var sid = route.sid;
+      currentSessionId = sid;
+      var committed = await loadChatSession(sid);
+      if (!isCurrentChatSession(sid)) return;
+      if (!committed) return;
+      updateChatHeader(sid, chatSessionData);
+      updateChatMessages(chatSessionData, sid);
+      updateChatSidebar(sid);
+      updateChatControls(chatSessionData, sid);
+    }
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -775,10 +782,7 @@ function updateHomeTable() {
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  Promise.all([refreshHealth(), refreshSessions(), refreshBots(), refreshCodexProfiles()]).then(function() {
-    updateTopbar();
-    fullRender();
-  });
+  poll();
   pollTimer = setInterval(poll, 2000);
 }
 
