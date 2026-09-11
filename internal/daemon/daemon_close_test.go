@@ -143,6 +143,115 @@ func TestStopWaitsForWorkerExitBeforeCancelingDaemonContext(t *testing.T) {
 	}
 }
 
+func TestStopPreservesSessionsForRestore(t *testing.T) {
+	const nativeSessionID = "01234567-89ab-cdef-0123-456789abcdef"
+
+	sessionsDir := t.TempDir()
+	meta := NewSessionMeta("daemon-stop-preserves-for-restore", "bot-codex")
+	meta.CliType = string(config.CliCodex)
+	meta.CliSessionID = nativeSessionID
+	handle := NewWorkerHandle(meta.SessionID)
+	daemonConn, workerConn := net.Pipe()
+	handle.SetConn(daemonConn)
+	handle.Cmd = exec.Command("/bin/sh", "-c", "sleep 0.15")
+	if err := handle.Cmd.Start(); err != nil {
+		t.Fatalf("start worker fixture: %v", err)
+	}
+	handle.Pid = handle.Cmd.Process.Pid
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &Daemon{
+		cfg:              &config.DaemonConfig{SessionsDir: sessionsDir},
+		ctx:              ctx,
+		cancel:           cancel,
+		store:            NewSessionStore(sessionsDir),
+		sessions:         map[string]*SessionMeta{meta.SessionID: meta},
+		sessionFileLocks: make(map[string]*sessionFileLockEntry),
+		pendingRestart:   make(map[*SessionMeta]*WorkerHandle),
+		workers:          map[string]*WorkerHandle{meta.SessionID: handle},
+		workerOwners:     map[*WorkerHandle]*SessionMeta{handle: meta},
+		connToSess:       make(map[net.Conn]string),
+		spawnFailures:    make(map[string]*spawnFailure),
+	}
+	if err := d.store.save(meta.ToPersisted()); err != nil {
+		t.Fatalf("persist session fixture: %v", err)
+	}
+
+	workerExited := make(chan struct{})
+	go func() {
+		d.waitWorkerExit(handle)
+		close(workerExited)
+	}()
+	t.Cleanup(func() {
+		_ = daemonConn.Close()
+		_ = workerConn.Close()
+		if handle.Cmd.Process != nil {
+			_ = handle.Cmd.Process.Kill()
+		}
+		select {
+		case <-workerExited:
+		case <-time.After(2 * time.Second):
+			t.Error("worker fixture was not reaped")
+		}
+	})
+
+	restartMessage := make(chan *protocol.Message, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		msg, err := protocol.NewMessageReader(workerConn).Read()
+		if err != nil {
+			readErr <- err
+			return
+		}
+		restartMessage <- msg
+	}()
+
+	if err := d.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	select {
+	case err := <-readErr:
+		t.Fatalf("read worker cleanup message: %v", err)
+	case msg := <-restartMessage:
+		if msg.Type != protocol.MsgRestartWorker || msg.SessionID != meta.SessionID {
+			t.Fatalf("cleanup message = %#v, want restart_worker for %q", msg, meta.SessionID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not receive restart_worker cleanup message")
+	}
+
+	select {
+	case <-handle.ExitDone:
+	default:
+		t.Fatal("Stop returned before the worker exit was reaped")
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("Stop did not cancel the daemon context")
+	}
+
+	persisted, err := d.store.load(meta.SessionID)
+	if err != nil {
+		t.Fatalf("load session after Stop: %v", err)
+	}
+	if persisted.Closed {
+		t.Fatal("Stop persisted the session as closed")
+	}
+	if persisted.CliSessionID != nativeSessionID {
+		t.Fatalf("persisted native session ID = %q, want %q", persisted.CliSessionID, nativeSessionID)
+	}
+
+	stored, err := d.store.list()
+	if err != nil {
+		t.Fatalf("list persisted sessions: %v", err)
+	}
+	if len(stored) != 1 || stored[0].SessionID != meta.SessionID {
+		t.Fatalf("store.list() = %#v, want open session %q", stored, meta.SessionID)
+	}
+}
+
 func TestStopKillsWorkerThatMissesGracePeriod(t *testing.T) {
 	meta := NewSessionMeta("daemon-stop-kills-stuck-worker", "bot-test")
 	handle := NewWorkerHandle(meta.SessionID)

@@ -52,6 +52,8 @@ sequenceDiagram
 
 重启时 daemon 将保存的 `CliSessionID` 放入 Worker 环境；adapter 使用 `codex resume <id>`。resume 保留已选 `--profile`，因为 ArkCLI 等 provider 需要 profile 恢复鉴权上下文；仍不传 `--model`，避免覆盖原会话模型选择。
 
+显式用户/session close 仍调用 `CloseSession` 并持久化 `closed:true`。相反，daemon 的优雅 `Stop` 保留所有 open session 记录及其 native session ID：它向当前 worker 异步发送 `restart_worker` 请求资源清理，给予 3 秒退出窗口并强杀残留 worker，最后才取消 daemon context。该清理不标记 session closed，因此新 daemon 可 restore 并由 session monitor 启动 replacement worker 完成 native resume。
+
 ## Worker 实例围栏
 
 daemon 为每个 `WorkerHandle` 生成一个临时的随机 128-bit instance nonce，并通过 `BOTMUX_WORKER_INSTANCE_ID` 传给该 worker。nonce 不持久化；daemon 重启会生成新的 worker，因此旧 worker 不能重新取得原实例身份。
@@ -68,7 +70,7 @@ daemon 仅接受同时满足下列条件的 READY：session 仍为当前且未�
 
 取消后 10 秒内必须产生 terminal。若未收到 terminal，daemon 只生成一次 `status=failed`、`code=codex_cancel_timeout` 的终态，并释放 active turn；重复超时和迟到事件不会产生第二个 terminal。
 
-worker 因取消退出时仅清理其资源，绝不将 session 落盘为 closed。session monitor 会使用持久化的 native session ID 启动 replacement worker，并执行 `codex resume <native-session-id>`。旧 worker 在 replacement 后迟到的输出或 terminal 事件会因 Worker 实例围栏被忽略，不能影响当前 worker 或新回合。
+worker 因取消退出时仅清理其资源，绝不将 session 落盘为 closed。取消或 graceful daemon shutdown 的 `restart_worker` 清理都不会关闭 session；session monitor 会使用持久化的 native session ID 启动 replacement worker，并执行 `codex resume <native-session-id>`。旧 worker 在 replacement 后迟到的输出或 terminal 事件会因 Worker 实例围栏被忽略，不能影响当前 worker 或新回合。
 
 ## Profile
 
@@ -87,9 +89,9 @@ worker 因取消退出时仅清理其资源，绝不将 session 落盘为 closed
 
 ## 验收
 
-已通过 `go test ./...`、`go test -race ./...`、`go build ./...`、`go vet ./...`。fake Codex 测试覆盖 fresh/profile、multiline、history ownership、rollout final/terminal 和 resume argv。
+已通过 `go test ./...`、`go test -race ./...`、`go build ./...`、`go vet ./...`。fake Codex 测试覆盖 fresh/profile、multiline、history ownership、rollout final/terminal 和 resume argv；daemon shutdown 覆盖确认 `restart_worker` 清理、worker 退出后取消 context，以及 open persistence/native ID 可被 restore。
 
-真实账号验收于 2026-09-08 执行 [v6_codex_e2e.sh](../../scripts/v6_codex_e2e.sh)：fresh 回合返回 `CODEX_V6_ONE` 与 `CODEX_V6_TWO`；daemon 重启后 native resume 回答了两个 marker。脚本会等待 daemon 监听并在恢复期重试 worker-not-ready。
+真实账号验收于 2026-09-08 执行 [v6_codex_e2e.sh](../../scripts/v6_codex_e2e.sh)：fresh 回合返回 `CODEX_V6_ONE` 与 `CODEX_V6_TWO`；daemon 重启后 native resume 回答了两个 marker。脚本会在 resume launch 前停止并等待先前的 daemon child，避免陈旧 PID/端口交接竞争；恢复期仍会重试 worker-not-ready。
 
 ## 后续
 

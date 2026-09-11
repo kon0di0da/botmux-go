@@ -176,18 +176,29 @@ func (d *Daemon) Stop() error {
 	if d.listener != nil {
 		_ = d.listener.Close()
 	}
-	d.sessionsMu.RLock()
-	ids := make([]string, 0, len(d.sessions))
-	for id := range d.sessions {
-		ids = append(ids, id)
-	}
-	d.sessionsMu.RUnlock()
-	for _, id := range ids {
-		d.CloseSession(id, "daemon shutdown")
-	}
+	d.restartWorkersForShutdown()
 	d.waitForWorkersExit()
 	d.cancel()
 	return nil
+}
+
+func (d *Daemon) restartWorkersForShutdown() {
+	d.workersMu.RLock()
+	handles := make([]*WorkerHandle, 0, len(d.workers))
+	for _, handle := range d.workers {
+		if handle != nil {
+			handles = append(handles, handle)
+		}
+	}
+	d.workersMu.RUnlock()
+
+	for _, handle := range handles {
+		go func(h *WorkerHandle) {
+			if err := h.Send(protocol.NewMessage(protocol.MsgRestartWorker, h.SessionID, "daemon shutdown")); err != nil {
+				log.Printf("[daemon] session %s shutdown restart worker: %v", safeShort(h.SessionID), err)
+			}
+		}(handle)
+	}
 }
 
 type NewSessionOpts struct {

@@ -7,6 +7,22 @@ LOG=/tmp/botmux-go-v6-codex-daemon.log
 PID=/tmp/botmux-go-v6-codex.pid
 SID="v6-codex-$(date +%s)"
 
+stop_daemon() {
+  local pid
+
+  if [[ ! -f "$PID" ]]; then
+    return 0
+  fi
+  pid=$(<"$PID")
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID"
+}
+
 wait_for_daemon() {
   for _ in $(seq 1 100); do
     if nc -z 127.0.0.1 17890 2>/dev/null; then
@@ -84,13 +100,13 @@ rm -rf "$HOME/.botmux-go/sessions"
 mkdir -p "$HOME/.botmux-go/sessions"
 "$BIN" -config ./configs/bots.json >"$LOG" 2>&1 &
 echo $! >"$PID"
-trap 'kill "$(cat "$PID")" 2>/dev/null || true' EXIT
+trap 'stop_daemon' EXIT
 wait_for_daemon
 
 "$BIN" -cmd new "$SID" bot-codex
 "$BIN" -cmd send "$SID" $'Return exactly two lines:\nCODEX_V6_ONE\nCODEX_V6_TWO'
 
-kill "$(cat "$PID")"
+stop_daemon
 "$BIN" -config ./configs/bots.json >"${LOG%.log}-resume.log" 2>&1 &
 echo $! >"$PID"
 wait_for_daemon
