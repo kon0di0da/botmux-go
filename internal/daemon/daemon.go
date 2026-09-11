@@ -309,12 +309,20 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 }
 
 func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
+	d.closeMu.Lock()
+	if d.closed {
+		d.closeMu.Unlock()
+		return errors.New("daemon closed")
+	}
+
 	handle := NewWorkerHandle(meta.SessionID)
 	instanceID, err := newWorkerInstanceID()
 	if err != nil {
+		d.closeMu.Unlock()
 		return fmt.Errorf("generate worker instance ID: %w", err)
 	}
 	if instanceID == "" {
+		d.closeMu.Unlock()
 		return errors.New("generate worker instance ID: empty value")
 	}
 	handle.InstanceID = instanceID
@@ -347,6 +355,7 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 	if !d.isCurrentSessionLocked(meta) {
 		d.sessionsMu.Unlock()
 		d.workersMu.Unlock()
+		d.closeMu.Unlock()
 		return fmt.Errorf("session %s is no longer current", meta.SessionID)
 	}
 	meta.Status = StatusSpawning
@@ -358,12 +367,14 @@ func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 		meta.Status = StatusRecovering
 		d.sessionsMu.Unlock()
 		d.workersMu.Unlock()
+		d.closeMu.Unlock()
 		d.stopWorkerHandle(existing)
 		return fmt.Errorf("spawn worker: %w", err)
 	}
 	handle.Pid = cmd.Process.Pid
 	d.sessionsMu.Unlock()
 	d.workersMu.Unlock()
+	d.closeMu.Unlock()
 
 	d.stopWorkerHandle(existing)
 

@@ -4,12 +4,51 @@ import (
 	"context"
 	"net"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
 	"botmux-go/internal/config"
 	"botmux-go/internal/protocol"
 )
+
+func TestSpawnWorkerRejectsClosedDaemon(t *testing.T) {
+	meta := NewSessionMeta("closed-daemon-spawn", "bot-test")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{
+		cfg:            &config.DaemonConfig{ListenAddr: "127.0.0.1:1", SessionsDir: t.TempDir()},
+		selfExe:        "/bin/sh",
+		store:          NewSessionStore(t.TempDir()),
+		ctx:            ctx,
+		cancel:         cancel,
+		sessions:       map[string]*SessionMeta{meta.SessionID: meta},
+		workers:        make(map[string]*WorkerHandle),
+		workerOwners:   make(map[*WorkerHandle]*SessionMeta),
+		pendingRestart: make(map[*SessionMeta]*WorkerHandle),
+	}
+	d.closeMu.Lock()
+	d.closed = true
+	d.closeMu.Unlock()
+
+	err := d.spawnWorkerForSession(meta)
+	if err == nil || !strings.Contains(err.Error(), "daemon closed") {
+		t.Fatalf("spawn closed daemon error = %v, want daemon closed", err)
+	}
+
+	d.workersMu.RLock()
+	handle, exists := d.workers[meta.SessionID]
+	d.workersMu.RUnlock()
+	if exists || handle != nil {
+		t.Fatalf("closed daemon installed worker handle = %#v", handle)
+	}
+	d.sessionsMu.RLock()
+	status := meta.Status
+	d.sessionsMu.RUnlock()
+	if status != StatusCreated {
+		t.Fatalf("closed daemon changed session status to %s, want %s", status, StatusCreated)
+	}
+}
 
 func TestSessionFileLockRegistryReleasesUnusedEntries(t *testing.T) {
 	d := &Daemon{}
