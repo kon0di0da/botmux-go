@@ -187,6 +187,18 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+function escapeJSString(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\x22')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/</g, '\\x3c')
+    .replace(/>/g, '\\x3e')
+    .replace(/&/g, '\\x26');
+}
+
 function fmtTime(s) {
   if (!s) return '';
   try { var d = new Date(s); return d.toLocaleTimeString(); } catch(e) { return s; }
@@ -264,7 +276,7 @@ function renderHome() {
       html += '<td>';
       html += '<a href="#/session/' + encodeURIComponent(s.session_id) + '" class="btn btn-sm">Open</a> ';
       if (!s.closed) {
-        html += '<button class="btn btn-sm btn-danger" onclick="closeSession(\'' + escapeHtml(s.session_id) + '\')">Close</button>';
+        html += '<button class="btn btn-sm btn-danger" onclick="closeSession(\'' + escapeJSString(s.session_id) + '\')">Close</button>';
       }
       html += '</td>';
       html += '</tr>';
@@ -452,7 +464,7 @@ function renderChat(sid) {
   html += '<div class="actions">';
   html += '<a href="/api/sessions/' + encodeURIComponent(sid) + '/history?format=txt" class="btn btn-sm" download>Download .txt</a> ';
   if (s && !s.closed) {
-    html += '<button class="btn btn-sm btn-danger" onclick="closeSessionFromChat(\'' + escapeHtml(sid) + '\')">Close</button>';
+    html += '<button class="btn btn-sm btn-danger" onclick="closeSessionFromChat(\'' + escapeJSString(sid) + '\')">Close</button>';
   }
   html += '</div></div>';
 
@@ -463,11 +475,11 @@ function renderChat(sid) {
   var disabled = composerDisabled(s);
   var disabledAttr = disabled ? 'disabled' : '';
   html += '<div class="chat-input">';
-  html += '<textarea id="chat-input" rows="3" placeholder="Type a message..." ' + disabledAttr + ' onkeydown="handleComposerKey(event, \'' + escapeHtml(sid) + '\')" autofocus></textarea>';
+  html += '<textarea id="chat-input" rows="3" placeholder="Type a message..." ' + disabledAttr + ' onkeydown="handleComposerKey(event, \'' + escapeJSString(sid) + '\')" autofocus></textarea>';
   if (s && !s.closed) {
-    html += '<button class="btn btn-icon" id="chat-cancel-btn" onclick="cancelTurn(\'' + escapeHtml(sid) + '\')" hidden title="Cancel turn" aria-label="Cancel turn">&#9632;</button>';
+    html += '<button class="btn btn-icon" id="chat-cancel-btn" onclick="cancelTurn(\'' + escapeJSString(sid) + '\')" hidden title="Cancel turn" aria-label="Cancel turn">&#9632;</button>';
   }
-  html += '<button class="btn btn-primary" id="chat-send-btn" onclick="sendMessage(\'' + escapeHtml(sid) + '\')" ' + disabledAttr + '>Send</button>';
+  html += '<button class="btn btn-primary" id="chat-send-btn" onclick="sendMessage(\'' + escapeJSString(sid) + '\')" ' + disabledAttr + '>Send</button>';
   html += '</div></div>';
 
   var listHtml = '<div class="session-list" id="session-sidebar">';
@@ -510,7 +522,8 @@ async function sendMessage(sid) {
   var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/send', { method: 'POST', body: { message: msg } });
   if (resp && resp.ok) {
     input.value = '';
-    updateChatControls({ turn_active: true, turn_cancelling: false });
+    chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: false });
+    updateChatControls(chatSessionData);
     await new Promise(function(r) { setTimeout(r, 600); });
     await loadChatSession(sid);
     updateChatMessages(chatSessionData);
@@ -679,7 +692,7 @@ function updateHomeTable() {
       html += '<td>';
       html += '<a href="#/session/' + encodeURIComponent(s.session_id) + '" class="btn btn-sm">Open</a> ';
       if (!s.closed) {
-        html += '<button class="btn btn-sm btn-danger" onclick="closeSession(\'' + escapeHtml(s.session_id) + '\')">Close</button>';
+        html += '<button class="btn btn-sm btn-danger" onclick="closeSession(\'' + escapeJSString(s.session_id) + '\')">Close</button>';
       }
       html += '</td>';
       html += '</tr>';
