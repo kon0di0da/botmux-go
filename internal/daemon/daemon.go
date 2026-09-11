@@ -26,6 +26,8 @@ const (
 	workerReadyAckPayload     = "worker_ready"
 )
 
+var errDaemonClosed = errors.New("daemon closed")
+
 type cancelSendFailureResult uint8
 
 const (
@@ -218,7 +220,7 @@ type newSessionPayload struct {
 
 func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 	if d.isClosed() {
-		return nil, errors.New("daemon closed")
+		return nil, errDaemonClosed
 	}
 	if opts.SessionID == "" {
 		return nil, errors.New("session_id required")
@@ -286,6 +288,9 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 	unlockFile()
 
 	if err := d.spawnWorkerForSession(meta); err != nil {
+		if errors.Is(err, errDaemonClosed) {
+			d.rollbackNewSession(meta)
+		}
 		return nil, err
 	}
 
@@ -308,11 +313,28 @@ func (d *Daemon) NewSession(opts NewSessionOpts) (*SessionMeta, error) {
 	return meta, nil
 }
 
+func (d *Daemon) rollbackNewSession(meta *SessionMeta) {
+	unlockFile := d.lockSessionFile(meta.SessionID)
+	defer unlockFile()
+
+	d.sessionsMu.Lock()
+	if !d.isCurrentSessionLocked(meta) {
+		d.sessionsMu.Unlock()
+		return
+	}
+	delete(d.sessions, meta.SessionID)
+	d.sessionsMu.Unlock()
+
+	if err := d.store.remove(meta.SessionID); err != nil {
+		log.Printf("[daemon] warn: remove shutdown-raced session %s: %v", safeShort(meta.SessionID), err)
+	}
+}
+
 func (d *Daemon) spawnWorkerForSession(meta *SessionMeta) error {
 	d.closeMu.Lock()
 	if d.closed {
 		d.closeMu.Unlock()
-		return errors.New("daemon closed")
+		return errDaemonClosed
 	}
 
 	handle := NewWorkerHandle(meta.SessionID)

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -47,6 +48,74 @@ func TestSpawnWorkerRejectsClosedDaemon(t *testing.T) {
 	d.sessionsMu.RUnlock()
 	if status != StatusCreated {
 		t.Fatalf("closed daemon changed session status to %s, want %s", status, StatusCreated)
+	}
+}
+
+func TestNewSessionRollsBackWhenStopRacesAfterPersistence(t *testing.T) {
+	const sessionID = "shutdown-raced-new-session"
+
+	cfg := config.DefaultConfig()
+	cfg.SessionsDir = t.TempDir()
+	store := NewSessionStore(cfg.SessionsDir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{
+		cfg:            cfg,
+		store:          store,
+		ctx:            ctx,
+		cancel:         cancel,
+		sessions:       make(map[string]*SessionMeta),
+		workers:        make(map[string]*WorkerHandle),
+		workerOwners:   make(map[*WorkerHandle]*SessionMeta),
+		pendingRestart: make(map[*SessionMeta]*WorkerHandle),
+	}
+
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	store.beforeSave = func(ps *PersistedSession) {
+		if ps.SessionID == sessionID && !ps.Closed {
+			close(saveStarted)
+			<-releaseSave
+		}
+	}
+
+	newDone := make(chan error, 1)
+	go func() {
+		_, err := d.NewSession(NewSessionOpts{SessionID: sessionID})
+		newDone <- err
+	}()
+
+	select {
+	case <-saveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("NewSession did not register and begin persisting the session")
+	}
+	if err := d.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	close(releaseSave)
+
+	select {
+	case err := <-newDone:
+		if err == nil || !strings.Contains(err.Error(), "daemon closed") {
+			t.Fatalf("NewSession error = %v, want daemon closed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("NewSession did not return after persistence was released")
+	}
+
+	if _, exists := d.GetSessionMeta(sessionID); exists {
+		t.Fatal("shutdown-raced NewSession remained registered")
+	}
+	if _, err := store.load(sessionID); !os.IsNotExist(err) {
+		t.Fatalf("load shutdown-raced session error = %v, want not exist", err)
+	}
+	sessions, err := store.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("List() = %#v, want no shutdown-raced session", sessions)
 	}
 }
 
