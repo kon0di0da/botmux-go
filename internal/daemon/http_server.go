@@ -530,33 +530,7 @@ type cancelTurnResponse struct {
 }
 
 func (d *Daemon) handleSessionCancel(w http.ResponseWriter, _ *http.Request, sid string) {
-	preflight := func() (meta *SessionMeta, found, eligible bool) {
-		d.sessionsMu.RLock()
-		meta, found = d.sessions[sid]
-		if !found {
-			d.sessionsMu.RUnlock()
-			return nil, false, false
-		}
-		if meta.Closed || meta.CliType != string(config.CliCodex) {
-			d.sessionsMu.RUnlock()
-			return meta, true, false
-		}
-		snapshot := meta.TurnSnapshot()
-		d.sessionsMu.RUnlock()
-		if !snapshot.Active || snapshot.Cancelling {
-			return meta, true, false
-		}
-
-		d.workersMu.RLock()
-		handle := d.workers[sid]
-		d.workersMu.RUnlock()
-		if handle == nil || !handle.IsReady() || !d.isCurrentSessionWorker(meta, handle) {
-			return meta, true, false
-		}
-		return meta, true, true
-	}
-
-	_, found, eligible := preflight()
+	meta, found, eligible := d.cancelTurnPreflight(sid)
 	if !found {
 		d.writeError(w, http.StatusNotFound, "session not found: "+sid)
 		return
@@ -566,13 +540,9 @@ func (d *Daemon) handleSessionCancel(w http.ResponseWriter, _ *http.Request, sid
 		return
 	}
 
-	if err := d.CancelTurn(sid); err != nil {
-		_, _, eligible = preflight()
-		if !eligible {
-			d.writeError(w, http.StatusConflict, "session is no longer cancellable: "+sid)
-			return
-		}
-		d.writeError(w, http.StatusInternalServerError, "cancel turn: "+err.Error())
+	if err := d.CancelTurnMeta(meta); err != nil {
+		status, message := d.cancelTurnErrorResponse(meta, sid, err)
+		d.writeError(w, status, message)
 		return
 	}
 
@@ -581,6 +551,33 @@ func (d *Daemon) handleSessionCancel(w http.ResponseWriter, _ *http.Request, sid
 		SessionID:  sid,
 		Cancelling: true,
 	})
+}
+
+func (d *Daemon) cancelTurnPreflight(sid string) (meta *SessionMeta, found, eligible bool) {
+	d.sessionsMu.RLock()
+	meta, found = d.sessions[sid]
+	if !found {
+		d.sessionsMu.RUnlock()
+		return nil, false, false
+	}
+	if meta.Closed || meta.CliType != string(config.CliCodex) {
+		d.sessionsMu.RUnlock()
+		return meta, true, false
+	}
+	snapshot := meta.TurnSnapshot()
+	d.sessionsMu.RUnlock()
+	if !snapshot.Active || snapshot.Cancelling {
+		return meta, true, false
+	}
+	return meta, true, d.hasReadyCurrentWorkerForSession(meta)
+}
+
+func (d *Daemon) cancelTurnErrorResponse(meta *SessionMeta, sid string, err error) (int, string) {
+	current, found, eligible := d.cancelTurnPreflight(sid)
+	if !found || current != meta || !eligible {
+		return http.StatusConflict, "session is no longer cancellable: " + sid
+	}
+	return http.StatusInternalServerError, "cancel turn: " + err.Error()
 }
 
 func (d *Daemon) handleSessionSend(w http.ResponseWriter, r *http.Request, sid string) {

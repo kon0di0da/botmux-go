@@ -653,28 +653,45 @@ func (d *Daemon) SendInput(id, input string) error {
 func (d *Daemon) CancelTurn(id string) error {
 	d.sessionsMu.RLock()
 	meta, ok := d.sessions[id]
+	d.sessionsMu.RUnlock()
 	if !ok {
-		d.sessionsMu.RUnlock()
 		return fmt.Errorf("session %s not found", id)
 	}
-	if meta.Closed {
-		d.sessionsMu.RUnlock()
-		return fmt.Errorf("session %s is closed", id)
-	}
-	if meta.CliType != string(config.CliCodex) {
-		d.sessionsMu.RUnlock()
-		return fmt.Errorf("session %s does not use Codex", id)
-	}
-	d.sessionsMu.RUnlock()
-	if !d.hasReadyCurrentWorkerForSession(meta) {
-		return fmt.Errorf("session %s has no ready worker", id)
+	return d.CancelTurnMeta(meta)
+}
+
+func (d *Daemon) CancelTurnMeta(meta *SessionMeta) error {
+	if meta == nil {
+		return errors.New("session meta required")
 	}
 
 	d.sessionsMu.RLock()
-	token, ok := d.beginTurnCancelIfCurrentLocked(meta)
+	if !d.isCurrentSessionLocked(meta) {
+		d.sessionsMu.RUnlock()
+		return fmt.Errorf("session %s is no longer current", meta.SessionID)
+	}
+	if meta.Closed {
+		d.sessionsMu.RUnlock()
+		return fmt.Errorf("session %s is closed", meta.SessionID)
+	}
+	if meta.CliType != string(config.CliCodex) {
+		d.sessionsMu.RUnlock()
+		return fmt.Errorf("session %s does not use Codex", meta.SessionID)
+	}
 	d.sessionsMu.RUnlock()
+	if !d.hasReadyCurrentWorkerForSession(meta) {
+		if !d.isCurrentSession(meta) {
+			return fmt.Errorf("session %s is no longer current", meta.SessionID)
+		}
+		return fmt.Errorf("session %s has no ready worker", meta.SessionID)
+	}
+
+	token, ok := d.beginTurnCancelIfCurrent(meta)
 	if !ok {
-		return fmt.Errorf("session %s has no cancellable active turn", id)
+		if !d.isCurrentSession(meta) {
+			return fmt.Errorf("session %s is no longer current", meta.SessionID)
+		}
+		return fmt.Errorf("session %s has no cancellable active turn", meta.SessionID)
 	}
 	go d.watchCancelledTurn(meta, token)
 	go func() {
@@ -924,7 +941,7 @@ func (d *Daemon) hasReadyCurrentWorkerForSession(meta *SessionMeta) bool {
 	d.workersMu.RLock()
 	defer d.workersMu.RUnlock()
 	handle := d.workers[meta.SessionID]
-	if handle == nil || !handle.IsReady() {
+	if handle == nil || !d.workerOwnedByMetaLocked(handle, meta) || !handle.IsReady() {
 		return false
 	}
 	d.sessionsMu.RLock()

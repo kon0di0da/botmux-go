@@ -171,6 +171,76 @@ func TestCancelEndpointRejectsIneligibleSessionWithoutIPC(t *testing.T) {
 	}
 }
 
+func TestCancelEndpointDoesNotCancelReusedSessionID(t *testing.T) {
+	fixture := newHTTPServerTestFixture(t, true)
+	if !fixture.meta.BeginTurn() {
+		t.Fatal("begin old turn")
+	}
+
+	oldMeta, found, eligible := fixture.daemon.cancelTurnPreflight(fixture.meta.SessionID)
+	if !found || !eligible {
+		t.Fatalf("preflight = (found=%t, eligible=%t), want true, true", found, eligible)
+	}
+
+	replacement := NewSessionMeta(oldMeta.SessionID, "bot-codex")
+	replacement.CliType = string(config.CliCodex)
+	replacement.Status = StatusReady
+	if !replacement.BeginTurn() {
+		t.Fatal("begin replacement turn")
+	}
+	replacementHandle := NewWorkerHandle(replacement.SessionID)
+	replacementHandle.markReady()
+	replacementDaemonConn, replacementWorkerConn := net.Pipe()
+	replacementHandle.SetConn(replacementDaemonConn)
+	t.Cleanup(func() {
+		_ = replacementDaemonConn.Close()
+		_ = replacementWorkerConn.Close()
+	})
+
+	fixture.daemon.sessionsMu.Lock()
+	fixture.daemon.sessions[replacement.SessionID] = replacement
+	fixture.daemon.sessionsMu.Unlock()
+	fixture.daemon.workersMu.Lock()
+	fixture.daemon.workers[replacement.SessionID] = replacementHandle
+	fixture.daemon.workerOwners[replacementHandle] = replacement
+	fixture.daemon.workersMu.Unlock()
+
+	err := fixture.daemon.CancelTurnMeta(oldMeta)
+	if err == nil || err.Error() != "session "+oldMeta.SessionID+" is no longer current" {
+		t.Fatalf("CancelTurnMeta stale error = %v, want stale session error", err)
+	}
+	assertNoHTTPTestIPC(t, fixture.workerConn)
+	assertNoHTTPTestIPC(t, replacementWorkerConn)
+
+	if snapshot := oldMeta.TurnSnapshot(); !snapshot.Active || snapshot.Cancelling {
+		t.Fatalf("old turn snapshot = %#v, want active non-cancelling turn", snapshot)
+	}
+	if snapshot := replacement.TurnSnapshot(); !snapshot.Active || snapshot.Cancelling {
+		t.Fatalf("replacement turn snapshot = %#v, want active non-cancelling turn", snapshot)
+	}
+}
+
+func TestCancelEndpointMapsStaleMetaToConflict(t *testing.T) {
+	fixture := newHTTPServerTestFixture(t, true)
+	oldMeta := fixture.meta
+	replacement := NewSessionMeta(oldMeta.SessionID, "bot-codex")
+	replacement.CliType = string(config.CliCodex)
+	replacement.Status = StatusReady
+
+	fixture.daemon.sessionsMu.Lock()
+	fixture.daemon.sessions[replacement.SessionID] = replacement
+	fixture.daemon.sessionsMu.Unlock()
+
+	err := fixture.daemon.CancelTurnMeta(oldMeta)
+	if err == nil || err.Error() != "session "+oldMeta.SessionID+" is no longer current" {
+		t.Fatalf("CancelTurnMeta stale error = %v, want stale session error", err)
+	}
+	status, _ := fixture.daemon.cancelTurnErrorResponse(oldMeta, oldMeta.SessionID, err)
+	if status != http.StatusConflict {
+		t.Fatalf("error response status = %d, want %d", status, http.StatusConflict)
+	}
+}
+
 func TestCancelEndpointReturnsNotFoundForUnknown(t *testing.T) {
 	fixture := newHTTPServerTestFixture(t, true)
 
