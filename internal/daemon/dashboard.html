@@ -81,10 +81,11 @@ tr:hover td { background: var(--bg2); }
 .chat-line.bot b { color: var(--green); }
 .chat-line.system b { color: var(--yellow); }
 
-.chat-input { padding: 10px 16px; border-top: 1px solid var(--border); background: var(--bg2); display: flex; gap: 8px; flex-shrink: 0; }
-.chat-input input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--fg); padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 12px; outline: none; }
-.chat-input input:focus { border-color: var(--accent); }
-.chat-input input:disabled { opacity: 0.5; }
+.chat-input { padding: 10px 16px; border-top: 1px solid var(--border); background: var(--bg2); display: flex; align-items: flex-end; gap: 8px; flex-shrink: 0; }
+.chat-input textarea { flex: 1; min-height: 64px; max-height: 180px; resize: vertical; background: var(--bg); border: 1px solid var(--border); color: var(--fg); padding: 8px 10px; border-radius: 4px; font-family: inherit; font-size: 12px; line-height: 1.4; outline: none; }
+.chat-input textarea:focus { border-color: var(--accent); }
+.chat-input textarea:disabled { opacity: 0.5; }
+.btn-icon { width: 30px; height: 30px; justify-content: center; padding: 0; }
 
 .form { max-width: 480px; }
 .form-group { margin-bottom: 14px; }
@@ -398,6 +399,35 @@ function updateChatSidebar(activeSid) {
   list.innerHTML = buildSidebarHtml(activeSid);
 }
 
+function composerDisabled(s) {
+  return !s || s.closed || s.turn_active || s.turn_cancelling;
+}
+
+function updateChatControls(s) {
+  var input = document.getElementById('chat-input');
+  var send = document.getElementById('chat-send-btn');
+  var cancel = document.getElementById('chat-cancel-btn');
+  var disabled = composerDisabled(s);
+  var canCancel = !!(s && !s.closed && s.turn_active);
+  var cancelling = !!(s && s.turn_cancelling);
+
+  if (input) input.disabled = disabled;
+  if (send) send.disabled = disabled;
+  if (cancel) {
+    cancel.hidden = !canCancel;
+    cancel.disabled = cancelling;
+    cancel.title = cancelling ? 'Cancelling turn...' : 'Cancel turn';
+    cancel.setAttribute('aria-label', cancelling ? 'Cancelling turn' : 'Cancel turn');
+  }
+}
+
+function handleComposerKey(event, sid) {
+  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    sendMessage(sid);
+  }
+}
+
 function renderChat(sid) {
   var s = chatSessionData;
   renderedSessionId = sid;
@@ -430,10 +460,14 @@ function renderChat(sid) {
   html += buildMessagesHtml(s);
   html += '</div>';
 
-  var disabled = (s && s.closed) ? 'disabled' : '';
+  var disabled = composerDisabled(s);
+  var disabledAttr = disabled ? 'disabled' : '';
   html += '<div class="chat-input">';
-  html += '<input type="text" id="chat-input" placeholder="Type a message..." ' + disabled + ' onkeydown="if(event.key===\'Enter\')sendMessage(\'' + escapeHtml(sid) + '\')" autofocus>';
-  html += '<button class="btn btn-primary" id="chat-send-btn" onclick="sendMessage(\'' + escapeHtml(sid) + '\')" ' + disabled + '>Send</button>';
+  html += '<textarea id="chat-input" rows="3" placeholder="Type a message..." ' + disabledAttr + ' onkeydown="handleComposerKey(event, \'' + escapeHtml(sid) + '\')" autofocus></textarea>';
+  if (s && !s.closed) {
+    html += '<button class="btn btn-icon" id="chat-cancel-btn" onclick="cancelTurn(\'' + escapeHtml(sid) + '\')" hidden title="Cancel turn" aria-label="Cancel turn">&#9632;</button>';
+  }
+  html += '<button class="btn btn-primary" id="chat-send-btn" onclick="sendMessage(\'' + escapeHtml(sid) + '\')" ' + disabledAttr + '>Send</button>';
   html += '</div></div>';
 
   var listHtml = '<div class="session-list" id="session-sidebar">';
@@ -444,6 +478,7 @@ function renderChat(sid) {
 
   var msgDiv = document.getElementById('chat-messages');
   if (msgDiv) msgDiv.scrollTop = msgDiv.scrollHeight;
+  updateChatControls(s);
   var input = document.getElementById('chat-input');
   if (input && !disabled) input.focus();
 }
@@ -467,21 +502,47 @@ async function createSession() {
 async function sendMessage(sid) {
   var input = document.getElementById('chat-input');
   var btn = document.getElementById('chat-send-btn');
-  var msg = input.value.trim();
-  if (!msg) return;
-  input.value = '';
+  if (!input || composerDisabled(chatSessionData)) return;
+  var msg = input.value;
+  if (!msg.trim()) return;
   input.disabled = true;
   if (btn) btn.disabled = true;
   var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/send', { method: 'POST', body: { message: msg } });
-  input.disabled = false;
-  if (btn) btn.disabled = false;
-  input.focus();
   if (resp && resp.ok) {
+    input.value = '';
+    updateChatControls({ turn_active: true, turn_cancelling: false });
     await new Promise(function(r) { setTimeout(r, 600); });
     await loadChatSession(sid);
     updateChatMessages(chatSessionData);
     updateChatHeader(sid, chatSessionData);
     updateChatSidebar(sid);
+    updateChatControls(chatSessionData);
+  } else {
+    updateChatControls(chatSessionData);
+    input.focus();
+  }
+}
+
+async function cancelTurn(sid) {
+  var btn = document.getElementById('chat-cancel-btn');
+  var s = chatSessionData;
+  if (!btn || btn.disabled || !s || s.closed || !s.turn_active || s.turn_cancelling) return;
+
+  btn.disabled = true;
+  btn.title = 'Cancelling turn...';
+  btn.setAttribute('aria-label', 'Cancelling turn');
+  var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/cancel', { method: 'POST' });
+  if (resp && resp.ok) {
+    chatSessionData = Object.assign({}, s, { turn_active: true, turn_cancelling: true });
+    updateChatControls(chatSessionData);
+    toast('Turn cancellation requested', 'info');
+    await loadChatSession(sid);
+    updateChatMessages(chatSessionData);
+    updateChatHeader(sid, chatSessionData);
+    updateChatSidebar(sid);
+    updateChatControls(chatSessionData);
+  } else {
+    updateChatControls(chatSessionData);
   }
 }
 
@@ -562,11 +623,7 @@ async function poll() {
     updateChatHeader(sid, chatSessionData);
     updateChatMessages(chatSessionData);
     updateChatSidebar(sid);
-    var input = document.getElementById('chat-input');
-    var isClosed = chatSessionData && chatSessionData.closed;
-    if (input) input.disabled = isClosed;
-    var btn = document.getElementById('chat-send-btn');
-    if (btn) btn.disabled = isClosed;
+    updateChatControls(chatSessionData);
   }
 }
 
