@@ -478,21 +478,52 @@ func (d *Daemon) waitForWorkersExit() {
 	d.workersMu.RLock()
 	handles := make([]*WorkerHandle, 0, len(d.workers))
 	for _, handle := range d.workers {
-		handles = append(handles, handle)
+		if handle != nil {
+			handles = append(handles, handle)
+		}
 	}
 	d.workersMu.RUnlock()
+	if len(handles) == 0 {
+		return
+	}
 
 	const shutdownGracePeriod = 3 * time.Second
+	exited := make(chan *WorkerHandle, len(handles))
+	for _, handle := range handles {
+		go func(h *WorkerHandle) {
+			<-h.ExitDone
+			exited <- h
+		}(handle)
+	}
+
 	deadline := time.NewTimer(shutdownGracePeriod)
 	defer deadline.Stop()
-	for _, handle := range handles {
+	remaining := len(handles)
+	exitedHandles := make(map[*WorkerHandle]bool, len(handles))
+	for remaining > 0 {
 		select {
-		case <-handle.ExitDone:
-		case <-deadline.C:
-			if handle.Cmd != nil && handle.Cmd.Process != nil {
-				_ = handle.Cmd.Process.Kill()
+		case handle := <-exited:
+			if !exitedHandles[handle] {
+				exitedHandles[handle] = true
+				remaining--
 			}
-			<-handle.ExitDone
+		case <-deadline.C:
+			for _, handle := range handles {
+				if exitedHandles[handle] {
+					continue
+				}
+				if handle.Cmd != nil && handle.Cmd.Process != nil {
+					_ = handle.Cmd.Process.Kill()
+				}
+			}
+			for remaining > 0 {
+				handle := <-exited
+				if !exitedHandles[handle] {
+					exitedHandles[handle] = true
+					remaining--
+				}
+			}
+			return
 		}
 	}
 }

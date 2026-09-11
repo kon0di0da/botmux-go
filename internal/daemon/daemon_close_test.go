@@ -289,6 +289,82 @@ func TestStopKillsWorkerThatMissesGracePeriod(t *testing.T) {
 	}
 }
 
+func TestStopKillsAllWorkersThatMissGracePeriod(t *testing.T) {
+	metas := []*SessionMeta{
+		NewSessionMeta("daemon-stop-kills-first-stuck-worker", "bot-test"),
+		NewSessionMeta("daemon-stop-kills-second-stuck-worker", "bot-test"),
+	}
+	handles := make([]*WorkerHandle, len(metas))
+	for i, meta := range metas {
+		handle := NewWorkerHandle(meta.SessionID)
+		handle.Cmd = exec.Command("/bin/sh", "-c", "sleep 10")
+		if err := handle.Cmd.Start(); err != nil {
+			t.Fatalf("start worker fixture %d: %v", i, err)
+		}
+		handle.Pid = handle.Cmd.Process.Pid
+		handles[i] = handle
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &Daemon{
+		ctx:           ctx,
+		cancel:        cancel,
+		sessions:      make(map[string]*SessionMeta, len(metas)),
+		workers:       make(map[string]*WorkerHandle, len(handles)),
+		store:         NewSessionStore(t.TempDir()),
+		spawnFailures: make(map[string]*spawnFailure),
+	}
+	for i, meta := range metas {
+		handle := handles[i]
+		d.sessions[meta.SessionID] = meta
+		d.workers[meta.SessionID] = handle
+		if err := d.store.save(meta.ToPersisted()); err != nil {
+			t.Fatalf("persist session fixture %d: %v", i, err)
+		}
+		go d.waitWorkerExit(handle)
+	}
+	t.Cleanup(func() {
+		cancel()
+		for _, handle := range handles {
+			if handle.Cmd != nil && handle.Cmd.Process != nil {
+				_ = handle.Cmd.Process.Kill()
+			}
+		}
+		for i, handle := range handles {
+			select {
+			case <-handle.ExitDone:
+			case <-time.After(2 * time.Second):
+				t.Errorf("worker fixture %d was not reaped", i)
+			}
+		}
+	})
+
+	stopDone := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		stopDone <- d.Stop()
+	}()
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("Stop did not return after the global shutdown grace period")
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("Stop exceeded grace period: %v", elapsed)
+	}
+	for i, handle := range handles {
+		select {
+		case <-handle.ExitDone:
+		default:
+			t.Fatalf("stuck worker %d was not reaped after shutdown grace period", i)
+		}
+	}
+}
+
 func TestCloseSessionPersistsBeforeWorkerExit(t *testing.T) {
 	meta := NewSessionMeta("session-close-persisted-first", "bot-test")
 	handle := NewWorkerHandle(meta.SessionID)
