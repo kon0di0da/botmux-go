@@ -333,15 +333,29 @@ function renderBots() {
 }
 
 var chatSessionData = null;
-var chatSendInFlight = false;
+var chatSendInFlight = Object.create(null);
 var renderedSessionId = null;
 var lastOutputLen = 0;
 
+function isCurrentChatSession(sid) {
+  var route = resolveRoute();
+  return route.name === 'chat' &&
+    route.sid === sid &&
+    currentRoute === 'chat' &&
+    currentSessionId === sid &&
+    (renderedSessionId === null || renderedSessionId === sid);
+}
+
 async function loadChatSession(sid) {
-  var detail = await api('/api/sessions/' + encodeURIComponent(sid) + '?limit=2000');
+  if (!isCurrentChatSession(sid)) return null;
+  var detail = await api('/api/sessions/' + encodeURIComponent(sid) + '?limit=2000', { silent: true });
+  if (!isCurrentChatSession(sid)) return null;
   if (detail && !detail.error) {
     chatSessionData = detail;
+  } else if (detail && detail.error) {
+    toast(detail.error, 'error');
   }
+  return detail;
 }
 
 function parseChatLine(line) {
@@ -385,6 +399,7 @@ function buildSidebarHtml(activeSid) {
 }
 
 function updateChatHeader(sid, s) {
+  if (!isCurrentChatSession(sid)) return;
   var header = document.querySelector('.chat-header .info');
   if (!header) return;
   var badge = s ? statusBadge(s.status, s.closed) : '';
@@ -399,7 +414,8 @@ function updateChatHeader(sid, s) {
   header.innerHTML = '<span class="sid">' + escapeHtml(sid) + '</span>' + badge + pid + bot + linesInfo;
 }
 
-function updateChatMessages(s) {
+function updateChatMessages(s, sid) {
+  if (sid && !isCurrentChatSession(sid)) return;
   var msgDiv = document.getElementById('chat-messages');
   if (!msgDiv) return;
   var outputs = (s && s.outputs) ? s.outputs : [];
@@ -411,20 +427,22 @@ function updateChatMessages(s) {
 }
 
 function updateChatSidebar(activeSid) {
+  if (!isCurrentChatSession(activeSid)) return;
   var list = document.querySelector('.session-list');
   if (!list) return;
   list.innerHTML = buildSidebarHtml(activeSid);
 }
 
-function composerDisabled(s) {
-  return chatSendInFlight || !s || s.closed || s.turn_active || s.turn_cancelling;
+function composerDisabled(s, sid) {
+  return !!chatSendInFlight[sid] || !s || s.closed || s.turn_active || s.turn_cancelling;
 }
 
-function updateChatControls(s) {
+function updateChatControls(s, sid) {
+  if (sid && !isCurrentChatSession(sid)) return;
   var input = document.getElementById('chat-input');
   var send = document.getElementById('chat-send-btn');
   var cancel = document.getElementById('chat-cancel-btn');
-  var disabled = composerDisabled(s);
+  var disabled = composerDisabled(s, sid);
   var canCancel = !!(s && !s.closed && s.turn_active);
   var cancelling = !!(s && s.turn_cancelling);
 
@@ -438,6 +456,12 @@ function updateChatControls(s) {
   }
 }
 
+function focusChatComposer(sid) {
+  if (!isCurrentChatSession(sid)) return;
+  var input = document.getElementById('chat-input');
+  if (input && !input.disabled) input.focus();
+}
+
 function handleComposerKey(event, sid) {
   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
@@ -446,6 +470,7 @@ function handleComposerKey(event, sid) {
 }
 
 function renderChat(sid) {
+  if (!isCurrentChatSession(sid)) return;
   var s = chatSessionData;
   renderedSessionId = sid;
   lastOutputLen = (s && s.outputs) ? s.outputs.length : 0;
@@ -477,7 +502,7 @@ function renderChat(sid) {
   html += buildMessagesHtml(s);
   html += '</div>';
 
-  var disabled = composerDisabled(s);
+  var disabled = composerDisabled(s, sid);
   var disabledAttr = disabled ? 'disabled' : '';
   html += '<div class="chat-input">';
   html += '<textarea id="chat-input" rows="3" placeholder="Type a message..." ' + disabledAttr + ' onkeydown="handleComposerKey(event, \'' + escapeJSString(sid) + '\')" autofocus></textarea>';
@@ -495,9 +520,8 @@ function renderChat(sid) {
 
   var msgDiv = document.getElementById('chat-messages');
   if (msgDiv) msgDiv.scrollTop = msgDiv.scrollHeight;
-  updateChatControls(s);
-  var input = document.getElementById('chat-input');
-  if (input && !disabled) input.focus();
+  updateChatControls(s, sid);
+  focusChatComposer(sid);
 }
 
 async function createSession() {
@@ -517,34 +541,41 @@ async function createSession() {
 }
 
 async function sendMessage(sid) {
+  if (!isCurrentChatSession(sid)) return;
   var input = document.getElementById('chat-input');
-  if (!input || composerDisabled(chatSessionData)) return;
+  if (!input || composerDisabled(chatSessionData, sid)) return;
   var msg = input.value;
   if (!msg.trim()) return;
-  chatSendInFlight = true;
-  updateChatControls(chatSessionData);
-  var sendSucceeded = false;
+  chatSendInFlight[sid] = true;
+  updateChatControls(chatSessionData, sid);
   try {
-    var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/send', { method: 'POST', body: { message: msg } });
+    var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/send', { method: 'POST', body: { message: msg }, silent: true });
+    if (!isCurrentChatSession(sid)) return;
     if (resp && resp.ok) {
-      sendSucceeded = true;
       input.value = '';
       chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: false });
-      updateChatControls(chatSessionData);
+      updateChatControls(chatSessionData, sid);
       await new Promise(function(r) { setTimeout(r, 600); });
+      if (!isCurrentChatSession(sid)) return;
       await loadChatSession(sid);
-      updateChatMessages(chatSessionData);
+      if (!isCurrentChatSession(sid)) return;
+      updateChatMessages(chatSessionData, sid);
       updateChatHeader(sid, chatSessionData);
       updateChatSidebar(sid);
+    } else if (resp && resp.error) {
+      toast(resp.error, 'error');
     }
   } finally {
-    chatSendInFlight = false;
-    updateChatControls(chatSessionData);
+    delete chatSendInFlight[sid];
+    if (isCurrentChatSession(sid)) {
+      updateChatControls(chatSessionData, sid);
+      focusChatComposer(sid);
+    }
   }
-  if (!sendSucceeded) input.focus();
 }
 
 async function cancelTurn(sid) {
+  if (!isCurrentChatSession(sid)) return;
   var btn = document.getElementById('chat-cancel-btn');
   var s = chatSessionData;
   if (!btn || btn.disabled || !s || s.closed || !s.turn_active || s.turn_cancelling) return;
@@ -552,18 +583,22 @@ async function cancelTurn(sid) {
   btn.disabled = true;
   btn.title = 'Cancelling turn...';
   btn.setAttribute('aria-label', 'Cancelling turn');
-  var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/cancel', { method: 'POST' });
+  var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/cancel', { method: 'POST', silent: true });
+  if (!isCurrentChatSession(sid)) return;
   if (resp && resp.ok) {
     chatSessionData = Object.assign({}, s, { turn_active: true, turn_cancelling: true });
-    updateChatControls(chatSessionData);
+    updateChatControls(chatSessionData, sid);
     toast('Turn cancellation requested', 'info');
+    if (!isCurrentChatSession(sid)) return;
     await loadChatSession(sid);
-    updateChatMessages(chatSessionData);
+    if (!isCurrentChatSession(sid)) return;
+    updateChatMessages(chatSessionData, sid);
     updateChatHeader(sid, chatSessionData);
     updateChatSidebar(sid);
-    updateChatControls(chatSessionData);
+    updateChatControls(chatSessionData, sid);
   } else {
-    updateChatControls(chatSessionData);
+    if (resp && resp.error) toast(resp.error, 'error');
+    updateChatControls(chatSessionData, sid);
   }
 }
 
@@ -619,6 +654,7 @@ async function fullRender() {
     setActiveNav('/');
     currentSessionId = route.sid;
     await loadChatSession(route.sid);
+    if (!isCurrentChatSession(route.sid)) return;
     renderChat(route.sid);
   }
 }
@@ -641,10 +677,11 @@ async function poll() {
     var sid = route.sid;
     currentSessionId = sid;
     await loadChatSession(sid);
+    if (!isCurrentChatSession(sid)) return;
     updateChatHeader(sid, chatSessionData);
-    updateChatMessages(chatSessionData);
+    updateChatMessages(chatSessionData, sid);
     updateChatSidebar(sid);
-    updateChatControls(chatSessionData);
+    updateChatControls(chatSessionData, sid);
   }
 }
 
