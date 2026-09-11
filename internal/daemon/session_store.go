@@ -28,8 +28,9 @@ type PersistedSession struct {
 type SessionStore struct {
 	mu  sync.Mutex
 	dir string
-	// beforeSave and beforeRemove are test hooks. Production stores leave them nil.
+	// beforeSave, afterSave, and beforeRemove are test hooks. Production stores leave them nil.
 	beforeSave   func(*PersistedSession)
+	afterSave    func(*PersistedSession)
 	beforeRemove func()
 }
 
@@ -39,8 +40,12 @@ func NewSessionStore(dir string) *SessionStore {
 
 func (s *SessionStore) save(ps *PersistedSession) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saveLocked(ps)
+	err := s.saveLocked(ps)
+	s.mu.Unlock()
+	if err == nil && s.afterSave != nil {
+		s.afterSave(ps)
+	}
+	return err
 }
 
 func (s *SessionStore) saveLocked(ps *PersistedSession) error {

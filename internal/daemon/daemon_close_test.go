@@ -70,12 +70,18 @@ func TestNewSessionRollsBackWhenStopRacesAfterPersistence(t *testing.T) {
 		pendingRestart: make(map[*SessionMeta]*WorkerHandle),
 	}
 
-	saveStarted := make(chan struct{})
-	releaseSave := make(chan struct{})
-	store.beforeSave = func(ps *PersistedSession) {
+	saveCompleted := make(chan struct{})
+	releaseAfterSave := make(chan struct{})
+	afterSaveReleased := false
+	t.Cleanup(func() {
+		if !afterSaveReleased {
+			close(releaseAfterSave)
+		}
+	})
+	store.afterSave = func(ps *PersistedSession) {
 		if ps.SessionID == sessionID && !ps.Closed {
-			close(saveStarted)
-			<-releaseSave
+			close(saveCompleted)
+			<-releaseAfterSave
 		}
 	}
 
@@ -86,14 +92,22 @@ func TestNewSessionRollsBackWhenStopRacesAfterPersistence(t *testing.T) {
 	}()
 
 	select {
-	case <-saveStarted:
+	case <-saveCompleted:
 	case <-time.After(time.Second):
-		t.Fatal("NewSession did not register and begin persisting the session")
+		t.Fatal("NewSession did not persist the session")
+	}
+	persisted, err := store.load(sessionID)
+	if err != nil {
+		t.Fatalf("load persisted shutdown-raced session: %v", err)
+	}
+	if persisted.Closed {
+		t.Fatal("persisted shutdown-raced session is unexpectedly closed")
 	}
 	if err := d.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	close(releaseSave)
+	close(releaseAfterSave)
+	afterSaveReleased = true
 
 	select {
 	case err := <-newDone:
