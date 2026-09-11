@@ -64,7 +64,7 @@ daemon 仅接受同时满足下列条件的 READY：session 仍为当前且未�
 
 ## Turn Cancellation
 
-用户按 Esc 取消当前回合时，adapter 向 native Codex 发送取消；native `turn_aborted` 是该回合的权威终态，但 session 保持可用，不会关闭或丢失其 native session ID。
+用户通过 Dashboard 的 Cancel 按钮或 POST cancel API 取消当前回合时，daemon/worker adapter 会在内部向 Codex TUI 写入 Esc；native `turn_aborted` 是该回合的权威终态，但 session 保持可用，不会关闭或丢失其 native session ID。
 
 取消后 10 秒内必须产生 terminal。若未收到 terminal，daemon 只生成一次 `status=failed`、`code=codex_cancel_timeout` 的终态，并释放 active turn；重复超时和迟到事件不会产生第二个 terminal。
 
