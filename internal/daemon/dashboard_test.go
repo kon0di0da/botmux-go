@@ -78,6 +78,131 @@ func TestDashboardSendTurnStateSourceGuards(t *testing.T) {
 	}
 }
 
+func TestDashboardSameSessionStaleDetailSourceGuards(t *testing.T) {
+	data, err := dashboardFS.ReadFile("dashboard.html")
+	if err != nil {
+		t.Fatalf("read dashboard: %v", err)
+	}
+	html := string(data)
+
+	for _, want := range []string{
+		`var chatDetailRequestSeq = Object.create(null);`,
+		`var chatDetailStateSeq = Object.create(null);`,
+		`function isActiveChatRoute(sid) {`,
+		`function markChatDetailStateChanged(sid) {`,
+		`chatDetailStateSeq[sid] = (chatDetailStateSeq[sid] || 0) + 1;`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("dashboard missing stale-detail guard %q", want)
+		}
+	}
+
+	activeRouteStart := strings.Index(html, `function isActiveChatRoute(sid) {`)
+	currentSessionStart := strings.Index(html, `function isCurrentChatSession(sid) {`)
+	loadStart := strings.Index(html, `async function loadChatSession(sid) {`)
+	parseStart := strings.Index(html, `function parseChatLine`)
+	if activeRouteStart < 0 || currentSessionStart < 0 || loadStart < 0 || parseStart < 0 {
+		t.Fatal("dashboard missing active-route or detail-loader helper")
+	}
+	activeRouteBody := html[activeRouteStart:currentSessionStart]
+	for _, want := range []string{`resolveRoute()`, `route.sid === sid`, `currentRoute === 'chat'`, `currentSessionId === sid`} {
+		if !strings.Contains(activeRouteBody, want) {
+			t.Errorf("isActiveChatRoute missing %q", want)
+		}
+	}
+	if strings.Contains(activeRouteBody, `renderedSessionId`) {
+		t.Error("isActiveChatRoute must work before renderChat sets renderedSessionId")
+	}
+
+	loadBody := html[loadStart:parseStart]
+	requestSeq := strings.Index(loadBody, `var requestSeq = (chatDetailRequestSeq[sid] || 0) + 1;`)
+	stateSeq := strings.Index(loadBody, `var stateSeq = chatDetailStateSeq[sid] || 0;`)
+	requestSeqSet := strings.Index(loadBody, `chatDetailRequestSeq[sid] = requestSeq;`)
+	detailFetch := strings.Index(loadBody, `var detail = await api('/api/sessions/' + encodeURIComponent(sid) + '?limit=2000', { silent: true });`)
+	if requestSeq < 0 || stateSeq < 0 || requestSeqSet < 0 || detailFetch < 0 {
+		t.Error("loadChatSession must capture request and state sequences before fetching detail")
+	} else if requestSeq > detailFetch || stateSeq > detailFetch || requestSeqSet > detailFetch {
+		t.Error("loadChatSession starts a detail request before capturing its sequence guards")
+	}
+	for _, want := range []string{
+		`if (!isActiveChatRoute(sid)) return false;`,
+		`requestSeq !== chatDetailRequestSeq[sid]`,
+		`stateSeq !== (chatDetailStateSeq[sid] || 0)`,
+		`chatSessionData = detail;`,
+		`return true;`,
+	} {
+		if !strings.Contains(loadBody, want) {
+			t.Errorf("loadChatSession missing stale-detail commit guard %q", want)
+		}
+	}
+	commit := strings.Index(loadBody, `chatSessionData = detail;`)
+	if commit >= 0 {
+		for _, guard := range []string{
+			`!isActiveChatRoute(sid)`,
+			`requestSeq !== chatDetailRequestSeq[sid]`,
+			`stateSeq !== (chatDetailStateSeq[sid] || 0)`,
+		} {
+			guardIndex := strings.LastIndex(loadBody[:commit], guard)
+			if guardIndex < 0 {
+				t.Errorf("loadChatSession commits detail without checking %q", guard)
+			}
+		}
+	}
+
+	sendStart := strings.Index(html, `async function sendMessage(sid) {`)
+	cancelStart := strings.Index(html, `async function cancelTurn(sid) {`)
+	if sendStart < 0 || cancelStart < 0 || cancelStart <= sendStart {
+		t.Fatal("dashboard missing sendMessage or cancelTurn function")
+	}
+	sendBody := html[sendStart:cancelStart]
+	sendMark := strings.Index(sendBody, `markChatDetailStateChanged(sid);`)
+	sendState := strings.Index(sendBody, `chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: false });`)
+	if sendMark < 0 || sendState < 0 || sendMark > sendState {
+		t.Error("sendMessage must mark detail state changed before optimistic turn activation")
+	}
+	if !strings.Contains(sendBody, `var committed = await loadChatSession(sid);`) ||
+		!strings.Contains(sendBody, `if (!committed) return;`) {
+		t.Error("sendMessage must only refresh chat UI after a committed detail load")
+	}
+
+	cancelEnd := strings.Index(html[cancelStart:], `async function closeSession(sid) {`)
+	if cancelEnd < 0 {
+		t.Fatal("dashboard missing closeSession after cancelTurn")
+	}
+	cancelBody := html[cancelStart : cancelStart+cancelEnd]
+	cancelMark := strings.Index(cancelBody, `markChatDetailStateChanged(sid);`)
+	cancelState := strings.Index(cancelBody, `chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: true });`)
+	cancelControls := strings.Index(cancelBody, `updateChatControls(chatSessionData, sid);`)
+	cancelPost := strings.Index(cancelBody, `'/cancel', { method: 'POST', silent: true }`)
+	if cancelMark < 0 || cancelState < 0 || cancelControls < 0 || cancelPost < 0 ||
+		cancelMark > cancelState || cancelState > cancelControls || cancelControls > cancelPost {
+		t.Error("cancelTurn must mark and render cancelling state before its cancel POST")
+	}
+	errorStart := strings.Index(cancelBody, `} else {`)
+	if errorStart < 0 ||
+		!strings.Contains(cancelBody[errorStart:], `markChatDetailStateChanged(sid);`) ||
+		!strings.Contains(cancelBody[errorStart:], `await loadChatSession(sid);`) {
+		t.Error("cancelTurn must invalidate stale detail and reload after a cancel error")
+	}
+	if strings.Count(cancelBody, `var committed = await loadChatSession(sid);`) < 2 ||
+		strings.Count(cancelBody, `if (!committed) return;`) < 2 {
+		t.Error("cancelTurn must refresh chat UI only after committed detail loads on success and error")
+	}
+
+	pollStart := strings.Index(html, `async function poll() {`)
+	pollEnd := strings.Index(html[pollStart:], `function updateTopbar()`)
+	if pollStart < 0 || pollEnd < 0 {
+		t.Fatal("dashboard missing poll or updateTopbar")
+	}
+	pollBody := html[pollStart : pollStart+pollEnd]
+	pollLoad := strings.Index(pollBody, `var committed = await loadChatSession(sid);`)
+	pollCommit := strings.Index(pollBody, `if (!committed) return;`)
+	pollUpdate := strings.Index(pollBody, `updateChatHeader(sid, chatSessionData);`)
+	if pollLoad < 0 || pollCommit < 0 || pollUpdate < 0 || pollLoad > pollCommit || pollCommit > pollUpdate {
+		t.Error("poll must update chat UI only after a committed detail load")
+	}
+}
+
 func TestDashboardSessionScopedAsyncSourceGuards(t *testing.T) {
 	data, err := dashboardFS.ReadFile("dashboard.html")
 	if err != nil {
@@ -109,7 +234,7 @@ func TestDashboardSessionScopedAsyncSourceGuards(t *testing.T) {
 		t.Fatal("dashboard missing session-scoped chat helpers")
 	}
 	currentBody := html[currentStart:focusStart]
-	for _, want := range []string{`resolveRoute()`, `renderedSessionId === sid`, `currentSessionId === sid`} {
+	for _, want := range []string{`isActiveChatRoute(sid)`, `renderedSessionId === sid`} {
 		if !strings.Contains(currentBody, want) {
 			t.Errorf("isCurrentChatSession missing %q", want)
 		}

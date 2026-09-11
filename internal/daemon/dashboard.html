@@ -334,28 +334,45 @@ function renderBots() {
 
 var chatSessionData = null;
 var chatSendInFlight = Object.create(null);
+var chatDetailRequestSeq = Object.create(null);
+var chatDetailStateSeq = Object.create(null);
 var renderedSessionId = null;
 var lastOutputLen = 0;
 
-function isCurrentChatSession(sid) {
+function isActiveChatRoute(sid) {
   var route = resolveRoute();
   return route.name === 'chat' &&
     route.sid === sid &&
     currentRoute === 'chat' &&
-    currentSessionId === sid &&
+    currentSessionId === sid;
+}
+
+function isCurrentChatSession(sid) {
+  return isActiveChatRoute(sid) &&
     (renderedSessionId === null || renderedSessionId === sid);
 }
 
+function markChatDetailStateChanged(sid) {
+  chatDetailStateSeq[sid] = (chatDetailStateSeq[sid] || 0) + 1;
+}
+
 async function loadChatSession(sid) {
-  if (!isCurrentChatSession(sid)) return null;
+  if (!isActiveChatRoute(sid)) return false;
+  var requestSeq = (chatDetailRequestSeq[sid] || 0) + 1;
+  var stateSeq = chatDetailStateSeq[sid] || 0;
+  chatDetailRequestSeq[sid] = requestSeq;
   var detail = await api('/api/sessions/' + encodeURIComponent(sid) + '?limit=2000', { silent: true });
-  if (!isCurrentChatSession(sid)) return null;
-  if (detail && !detail.error) {
-    chatSessionData = detail;
-  } else if (detail && detail.error) {
-    toast(detail.error, 'error');
+  if (!isActiveChatRoute(sid) ||
+    requestSeq !== chatDetailRequestSeq[sid] ||
+    stateSeq !== (chatDetailStateSeq[sid] || 0)) return false;
+  if (!detail || detail.error) {
+    if (detail && detail.error) {
+      toast(detail.error, 'error');
+    }
+    return false;
   }
-  return detail;
+  chatSessionData = detail;
+  return true;
 }
 
 function parseChatLine(line) {
@@ -553,12 +570,14 @@ async function sendMessage(sid) {
     if (!isCurrentChatSession(sid)) return;
     if (resp && resp.ok) {
       input.value = '';
+      markChatDetailStateChanged(sid);
       chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: false });
       updateChatControls(chatSessionData, sid);
       await new Promise(function(r) { setTimeout(r, 600); });
       if (!isCurrentChatSession(sid)) return;
-      await loadChatSession(sid);
+      var committed = await loadChatSession(sid);
       if (!isCurrentChatSession(sid)) return;
+      if (!committed) return;
       updateChatMessages(chatSessionData, sid);
       updateChatHeader(sid, chatSessionData);
       updateChatSidebar(sid);
@@ -580,24 +599,30 @@ async function cancelTurn(sid) {
   var s = chatSessionData;
   if (!btn || btn.disabled || !s || s.closed || !s.turn_active || s.turn_cancelling) return;
 
-  btn.disabled = true;
-  btn.title = 'Cancelling turn...';
-  btn.setAttribute('aria-label', 'Cancelling turn');
+  markChatDetailStateChanged(sid);
+  chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: true });
+  updateChatControls(chatSessionData, sid);
   var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/cancel', { method: 'POST', silent: true });
   if (!isCurrentChatSession(sid)) return;
   if (resp && resp.ok) {
-    chatSessionData = Object.assign({}, s, { turn_active: true, turn_cancelling: true });
-    updateChatControls(chatSessionData, sid);
     toast('Turn cancellation requested', 'info');
     if (!isCurrentChatSession(sid)) return;
-    await loadChatSession(sid);
+    var committed = await loadChatSession(sid);
     if (!isCurrentChatSession(sid)) return;
+    if (!committed) return;
     updateChatMessages(chatSessionData, sid);
     updateChatHeader(sid, chatSessionData);
     updateChatSidebar(sid);
     updateChatControls(chatSessionData, sid);
   } else {
     if (resp && resp.error) toast(resp.error, 'error');
+    markChatDetailStateChanged(sid);
+    var committed = await loadChatSession(sid);
+    if (!isCurrentChatSession(sid)) return;
+    if (!committed) return;
+    updateChatMessages(chatSessionData, sid);
+    updateChatHeader(sid, chatSessionData);
+    updateChatSidebar(sid);
     updateChatControls(chatSessionData, sid);
   }
 }
@@ -653,8 +678,9 @@ async function fullRender() {
   } else if (route.name === 'chat') {
     setActiveNav('/');
     currentSessionId = route.sid;
-    await loadChatSession(route.sid);
+    var committed = await loadChatSession(route.sid);
     if (!isCurrentChatSession(route.sid)) return;
+    if (!committed) return;
     renderChat(route.sid);
   }
 }
@@ -676,8 +702,9 @@ async function poll() {
   } else if (route.name === 'chat') {
     var sid = route.sid;
     currentSessionId = sid;
-    await loadChatSession(sid);
+    var committed = await loadChatSession(sid);
     if (!isCurrentChatSession(sid)) return;
+    if (!committed) return;
     updateChatHeader(sid, chatSessionData);
     updateChatMessages(chatSessionData, sid);
     updateChatSidebar(sid);
