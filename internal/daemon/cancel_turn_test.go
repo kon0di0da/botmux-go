@@ -247,6 +247,48 @@ func TestCancelTurnTimeoutPublishesOneFailureAndRestartsWorker(t *testing.T) {
 	}
 }
 
+func TestCancelTimeoutForcesRestartWhenRestartWriteBlocks(t *testing.T) {
+	d, meta, handle, workerConn := newCancelTestDaemon(t)
+	d.turnCancelTimeout = 20 * time.Millisecond
+	d.restartWorkerGrace = 20 * time.Millisecond
+	t.Cleanup(func() {
+		_ = workerConn.Close()
+	})
+	if !meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+
+	cancelErr := make(chan error, 1)
+	go func() {
+		cancelErr <- d.CancelTurn(meta.SessionID)
+	}()
+
+	if msg := mustReadMessage(t, workerConn); msg.Type != protocol.MsgCancelTurn {
+		t.Fatalf("cancel message type = %s, want %s", msg.Type, protocol.MsgCancelTurn)
+	}
+	if err := <-cancelErr; err != nil {
+		t.Fatalf("CancelTurn: %v", err)
+	}
+
+	// Do not read MsgRestartWorker. The net.Pipe write must remain blocked.
+	waitForCondition(t, time.Second, func() bool {
+		terminals, _, _ := meta.SnapshotTerminalsSince(0)
+		return len(terminals) == 1
+	})
+	select {
+	case <-handle.ExitDone:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not exit after restart grace period with blocked restart IPC")
+	}
+
+	d.sessionsMu.RLock()
+	closed := meta.Closed
+	d.sessionsMu.RUnlock()
+	if closed {
+		t.Fatal("session closed after cancellation timeout")
+	}
+}
+
 func TestCancelTimeoutLateReadyDoesNotAdmitTurn(t *testing.T) {
 	d, meta, handle, workerConn := newCancelTestDaemon(t)
 	if !meta.BeginTurn() {

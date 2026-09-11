@@ -1053,6 +1053,7 @@ func (d *Daemon) sendToCurrentWorker(
 
 func (d *Daemon) restartWorkerForSession(meta *SessionMeta) {
 	var lastErr error
+	scheduled := make(map[*WorkerHandle]bool)
 	for attempt := 0; attempt < maxCurrentWorkerSendTries; attempt++ {
 		handle, current := d.markCurrentWorkerRestartPending(meta)
 		if !current {
@@ -1063,13 +1064,16 @@ func (d *Daemon) restartWorkerForSession(meta *SessionMeta) {
 			return
 		}
 
+		if !scheduled[handle] {
+			d.restartWorkerAfterGrace(meta, handle)
+			scheduled[handle] = true
+		}
 		err := handle.Send(protocol.NewMessage(protocol.MsgRestartWorker, meta.SessionID, ""))
 		if d.isCurrentWorkerForSession(meta, handle) {
 			if err != nil {
 				log.Printf("[daemon] session %s restart worker: %v", safeShort(meta.SessionID), err)
 				return
 			}
-			d.restartWorkerAfterGrace(meta, handle)
 			return
 		}
 		if err != nil {
