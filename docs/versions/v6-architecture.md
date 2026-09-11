@@ -62,6 +62,14 @@ daemon 仅接受同时满足下列条件的 READY：session 仍为当前且未�
 
 此 nonce 是 daemon 内本机 worker 生命周期的实例围栏，不提供远程身份认证。`Closed` 状态仅由 daemon 落盘；同一 session ID 的重建、关闭和文件操作同时受当前 `SessionMeta` 指针与按 ID 文件锁保护。worker 只做资源清理，绝不写入 closed 状态。
 
+## Turn Cancellation
+
+用户按 Esc 取消当前回合时，adapter 向 native Codex 发送取消；native `turn_aborted` 是该回合的权威终态，但 session 保持可用，不会关闭或丢失其 native session ID。
+
+取消后 10 秒内必须产生 terminal。若未收到 terminal，daemon 只生成一次 `status=failed`、`code=codex_cancel_timeout` 的终态，并释放 active turn；重复超时和迟到事件不会产生第二个 terminal。
+
+worker 因取消退出时仅清理其资源，绝不将 session 落盘为 closed。session monitor 会使用持久化的 native session ID 启动 replacement worker，并执行 `codex resume <native-session-id>`。旧 worker 在 replacement 后迟到的输出或 terminal 事件会因 Worker 实例围栏被忽略，不能影响当前 worker 或新回合。
+
 ## Profile
 
 仅发现 `${CODEX_HOME:-~/.codex}/*.config.toml` 的合法名称。profile 内容不会被读取、记录或通过 API 返回。fresh launch 接受 bot 默认或创建会话时的覆盖值；resume 重用已持久化的 profile。
