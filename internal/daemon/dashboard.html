@@ -333,6 +333,7 @@ function renderBots() {
 }
 
 var chatSessionData = null;
+var chatSendInFlight = false;
 var renderedSessionId = null;
 var lastOutputLen = 0;
 
@@ -365,6 +366,10 @@ function buildMessagesHtml(s) {
   }).join('');
 }
 
+function openChatSession(sid) {
+  location.hash = '#/session/' + encodeURIComponent(sid);
+}
+
 function buildSidebarHtml(activeSid) {
   if (sessionsData.items.length === 0) {
     return '<div class="empty">No sessions</div>';
@@ -372,7 +377,7 @@ function buildSidebarHtml(activeSid) {
   return sessionsData.items.map(function(item) {
     var active = item.session_id === activeSid ? 'active' : '';
     var sd = item.closed ? '<span style="color:var(--red)">CLOSED</span>' : '<span class="sids">' + (item.status||'?') + '</span>';
-    return '<div class="item ' + active + '" data-sid="' + escapeHtml(item.session_id) + '" onclick="location.hash=\'#/session/' + encodeURIComponent(item.session_id) + '\'">' +
+    return '<div class="item ' + active + '" data-sid="' + escapeHtml(item.session_id) + '" onclick="openChatSession(\'' + escapeJSString(item.session_id) + '\')">' +
       '<div class="sid">' + escapeHtml(item.session_id) + '</div>' +
       '<div class="meta">' + sd + ' | ' + escapeHtml(item.bot_id) + '</div>' +
       '</div>';
@@ -412,7 +417,7 @@ function updateChatSidebar(activeSid) {
 }
 
 function composerDisabled(s) {
-  return !s || s.closed || s.turn_active || s.turn_cancelling;
+  return chatSendInFlight || !s || s.closed || s.turn_active || s.turn_cancelling;
 }
 
 function updateChatControls(s) {
@@ -513,27 +518,30 @@ async function createSession() {
 
 async function sendMessage(sid) {
   var input = document.getElementById('chat-input');
-  var btn = document.getElementById('chat-send-btn');
   if (!input || composerDisabled(chatSessionData)) return;
   var msg = input.value;
   if (!msg.trim()) return;
-  input.disabled = true;
-  if (btn) btn.disabled = true;
-  var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/send', { method: 'POST', body: { message: msg } });
-  if (resp && resp.ok) {
-    input.value = '';
-    chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: false });
+  chatSendInFlight = true;
+  updateChatControls(chatSessionData);
+  var sendSucceeded = false;
+  try {
+    var resp = await api('/api/sessions/' + encodeURIComponent(sid) + '/send', { method: 'POST', body: { message: msg } });
+    if (resp && resp.ok) {
+      sendSucceeded = true;
+      input.value = '';
+      chatSessionData = Object.assign({}, chatSessionData || {}, { turn_active: true, turn_cancelling: false });
+      updateChatControls(chatSessionData);
+      await new Promise(function(r) { setTimeout(r, 600); });
+      await loadChatSession(sid);
+      updateChatMessages(chatSessionData);
+      updateChatHeader(sid, chatSessionData);
+      updateChatSidebar(sid);
+    }
+  } finally {
+    chatSendInFlight = false;
     updateChatControls(chatSessionData);
-    await new Promise(function(r) { setTimeout(r, 600); });
-    await loadChatSession(sid);
-    updateChatMessages(chatSessionData);
-    updateChatHeader(sid, chatSessionData);
-    updateChatSidebar(sid);
-    updateChatControls(chatSessionData);
-  } else {
-    updateChatControls(chatSessionData);
-    input.focus();
   }
+  if (!sendSucceeded) input.focus();
 }
 
 async function cancelTurn(sid) {
