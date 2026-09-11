@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"botmux-go/internal/config"
+	"botmux-go/internal/protocol"
 )
 
 func (d *Daemon) startHTTPServer() {
@@ -95,6 +96,8 @@ func (d *Daemon) handleSessionsSubrouter(w http.ResponseWriter, r *http.Request)
 		switch sub {
 		case "send":
 			d.handleSessionSend(w, r, sid)
+		case "cancel":
+			d.handleSessionCancel(w, r, sid)
 		default:
 			d.writeError(w, http.StatusNotFound, "unknown subpath: "+sub)
 		}
@@ -280,22 +283,25 @@ func (d *Daemon) httpListSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 type sessionDetailResponse struct {
-	SessionID    string          `json:"session_id"`
-	BotID        string          `json:"bot_id"`
-	CliType      string          `json:"cli_type"`
-	CodexProfile string          `json:"codex_profile,omitempty"`
-	CliPath      string          `json:"cli_path"`
-	WorkingDir   string          `json:"working_dir"`
-	Status       string          `json:"status"`
-	Pid          int             `json:"pid"`
-	Closed       bool            `json:"closed"`
-	CreatedAt    string          `json:"created_at"`
-	LastActive   string          `json:"last_active"`
-	TotalLines   int             `json:"total_lines"`
-	Offset       int             `json:"offset"`
-	Limit        int             `json:"limit"`
-	Outputs      []string        `json:"outputs"`
-	Worker       *workerSnapshot `json:"worker"`
+	SessionID      string                 `json:"session_id"`
+	BotID          string                 `json:"bot_id"`
+	CliType        string                 `json:"cli_type"`
+	CodexProfile   string                 `json:"codex_profile,omitempty"`
+	CliPath        string                 `json:"cli_path"`
+	WorkingDir     string                 `json:"working_dir"`
+	Status         string                 `json:"status"`
+	Pid            int                    `json:"pid"`
+	Closed         bool                   `json:"closed"`
+	CreatedAt      string                 `json:"created_at"`
+	LastActive     string                 `json:"last_active"`
+	TotalLines     int                    `json:"total_lines"`
+	Offset         int                    `json:"offset"`
+	Limit          int                    `json:"limit"`
+	Outputs        []string               `json:"outputs"`
+	Worker         *workerSnapshot        `json:"worker"`
+	TurnActive     bool                   `json:"turn_active"`
+	TurnCancelling bool                   `json:"turn_cancelling"`
+	LatestTerminal *protocol.TurnTerminal `json:"latest_terminal,omitempty"`
 }
 
 type workerSnapshot struct {
@@ -307,11 +313,22 @@ type workerSnapshot struct {
 func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid string) {
 	d.sessionsMu.RLock()
 	m, ok := d.sessions[sid]
-	d.sessionsMu.RUnlock()
 	if !ok {
+		d.sessionsMu.RUnlock()
 		d.writeError(w, http.StatusNotFound, "session not found: "+sid)
 		return
 	}
+	sessionID := m.SessionID
+	botID := m.BotID
+	cliType := m.CliType
+	codexProfile := m.CodexProfile
+	cliPath := m.CliPath
+	workingDir := m.WorkingDir
+	status := m.Status
+	closed := m.Closed
+	createdAt := m.CreatedAt
+	d.sessionsMu.RUnlock()
+	snapshot := m.TurnSnapshot()
 	q := r.URL.Query()
 	defaultLimit := maxMemoryOutputLines
 	if defaultLimit > 500 {
@@ -354,22 +371,25 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid st
 	}
 	paged := all[start:end]
 	resp := sessionDetailResponse{
-		SessionID:    m.SessionID,
-		BotID:        m.BotID,
-		CliType:      m.CliType,
-		CodexProfile: m.CodexProfile,
-		CliPath:      m.CliPath,
-		WorkingDir:   m.WorkingDir,
-		Status:       string(m.Status),
-		Pid:          pid,
-		Closed:       m.Closed,
-		CreatedAt:    m.CreatedAt.Format(time.RFC3339),
-		LastActive:   m.LastActive().Format(time.RFC3339),
-		TotalLines:   total,
-		Offset:       start,
-		Limit:        limit,
-		Outputs:      paged,
-		Worker:       ws,
+		SessionID:      sessionID,
+		BotID:          botID,
+		CliType:        cliType,
+		CodexProfile:   codexProfile,
+		CliPath:        cliPath,
+		WorkingDir:     workingDir,
+		Status:         string(status),
+		Pid:            pid,
+		Closed:         closed,
+		CreatedAt:      createdAt.Format(time.RFC3339),
+		LastActive:     m.LastActive().Format(time.RFC3339),
+		TotalLines:     total,
+		Offset:         start,
+		Limit:          limit,
+		Outputs:        paged,
+		Worker:         ws,
+		TurnActive:     snapshot.Active,
+		TurnCancelling: snapshot.Cancelling,
+		LatestTerminal: snapshot.Latest,
 	}
 	d.writeJSON(w, http.StatusOK, resp)
 }
@@ -501,6 +521,66 @@ type sendMessageResponse struct {
 	SessionID string   `json:"session_id"`
 	Sent      string   `json:"sent"`
 	Outputs   []string `json:"outputs"`
+}
+
+type cancelTurnResponse struct {
+	OK         bool   `json:"ok"`
+	SessionID  string `json:"session_id"`
+	Cancelling bool   `json:"cancelling"`
+}
+
+func (d *Daemon) handleSessionCancel(w http.ResponseWriter, _ *http.Request, sid string) {
+	preflight := func() (meta *SessionMeta, found, eligible bool) {
+		d.sessionsMu.RLock()
+		meta, found = d.sessions[sid]
+		if !found {
+			d.sessionsMu.RUnlock()
+			return nil, false, false
+		}
+		if meta.Closed || meta.CliType != string(config.CliCodex) {
+			d.sessionsMu.RUnlock()
+			return meta, true, false
+		}
+		snapshot := meta.TurnSnapshot()
+		d.sessionsMu.RUnlock()
+		if !snapshot.Active || snapshot.Cancelling {
+			return meta, true, false
+		}
+
+		d.workersMu.RLock()
+		handle := d.workers[sid]
+		d.workersMu.RUnlock()
+		if handle == nil || !handle.IsReady() || !d.isCurrentSessionWorker(meta, handle) {
+			return meta, true, false
+		}
+		return meta, true, true
+	}
+
+	_, found, eligible := preflight()
+	if !found {
+		d.writeError(w, http.StatusNotFound, "session not found: "+sid)
+		return
+	}
+	if !eligible {
+		d.writeError(w, http.StatusConflict, "session is not cancellable: "+sid)
+		return
+	}
+
+	if err := d.CancelTurn(sid); err != nil {
+		_, _, eligible = preflight()
+		if !eligible {
+			d.writeError(w, http.StatusConflict, "session is no longer cancellable: "+sid)
+			return
+		}
+		d.writeError(w, http.StatusInternalServerError, "cancel turn: "+err.Error())
+		return
+	}
+
+	d.writeJSON(w, http.StatusAccepted, cancelTurnResponse{
+		OK:         true,
+		SessionID:  sid,
+		Cancelling: true,
+	})
 }
 
 func (d *Daemon) handleSessionSend(w http.ResponseWriter, r *http.Request, sid string) {
