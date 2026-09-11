@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -46,6 +47,40 @@ func TestSessionDetailIncludesTurnState(t *testing.T) {
 	}
 	if got.LatestTerminal == nil || got.LatestTerminal.Status != protocol.TurnAborted {
 		t.Fatalf("latest_terminal = %#v, want aborted terminal", got.LatestTerminal)
+	}
+}
+
+func TestSessionDetailRejectsReusedSessionGeneration(t *testing.T) {
+	fixture := newHTTPServerTestFixture(t, true)
+	oldMeta := fixture.meta
+	oldMeta.BotID = "old-bot"
+	oldMeta.AddOutput("old output")
+	fixture.handle.Pid = 101
+
+	replacement := NewSessionMeta(oldMeta.SessionID, "new-bot")
+	replacement.CliType = string(config.CliCodex)
+	replacement.Status = StatusReady
+	replacement.AddOutput("new output")
+	replacementHandle := NewWorkerHandle(replacement.SessionID)
+	replacementHandle.Pid = 202
+	replacementHandle.markReady()
+
+	fixture.daemon.sessionsMu.Lock()
+	fixture.daemon.sessions[replacement.SessionID] = replacement
+	fixture.daemon.sessionsMu.Unlock()
+	fixture.daemon.workersMu.Lock()
+	fixture.daemon.workers[replacement.SessionID] = replacementHandle
+	delete(fixture.daemon.workerOwners, fixture.handle)
+	fixture.daemon.workerOwners[replacementHandle] = replacement
+	fixture.daemon.workersMu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/"+oldMeta.SessionID, nil)
+	resp, status := fixture.daemon.sessionDetailForMeta(req, oldMeta.SessionID, oldMeta)
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", status, http.StatusConflict)
+	}
+	if resp.BotID != "" || len(resp.Outputs) != 0 || resp.Pid != 0 || resp.Worker != nil {
+		t.Fatalf("stale response = %#v, want no old/new session detail", resp)
 	}
 }
 
@@ -168,6 +203,45 @@ func TestCancelEndpointRejectsIneligibleSessionWithoutIPC(t *testing.T) {
 			}
 			assertNoHTTPTestIPC(t, fixture.workerConn)
 		})
+	}
+}
+
+func TestCancelEndpointReturnsConflictWhenWorkerReplacedAfterPreflight(t *testing.T) {
+	fixture := newHTTPServerTestFixture(t, true)
+	if !fixture.meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+
+	meta, found, eligible := fixture.daemon.cancelTurnPreflight(fixture.meta.SessionID)
+	if !found || !eligible {
+		t.Fatalf("preflight = (found=%t, eligible=%t), want true, true", found, eligible)
+	}
+
+	replacementHandle := NewWorkerHandle(meta.SessionID)
+	replacementHandle.markReady()
+	fixture.daemon.workersMu.Lock()
+	fixture.daemon.workers[meta.SessionID] = replacementHandle
+	delete(fixture.daemon.workerOwners, fixture.handle)
+	fixture.daemon.workerOwners[replacementHandle] = meta
+	fixture.daemon.workersMu.Unlock()
+
+	status, _ := fixture.daemon.cancelTurnErrorResponse(meta, meta.SessionID,
+		errors.New("session "+meta.SessionID+" has no ready worker"))
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", status, http.StatusConflict)
+	}
+}
+
+func TestCancelEndpointReturnsInternalServerErrorForUnexpectedError(t *testing.T) {
+	fixture := newHTTPServerTestFixture(t, true)
+	if !fixture.meta.BeginTurn() {
+		t.Fatal("begin turn")
+	}
+
+	status, _ := fixture.daemon.cancelTurnErrorResponse(fixture.meta, fixture.meta.SessionID,
+		errors.New("unexpected cancellation failure"))
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", status, http.StatusInternalServerError)
 	}
 }
 

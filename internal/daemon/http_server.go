@@ -313,10 +313,25 @@ type workerSnapshot struct {
 func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid string) {
 	d.sessionsMu.RLock()
 	m, ok := d.sessions[sid]
+	d.sessionsMu.RUnlock()
 	if !ok {
-		d.sessionsMu.RUnlock()
 		d.writeError(w, http.StatusNotFound, "session not found: "+sid)
 		return
+	}
+
+	resp, status := d.sessionDetailForMeta(r, sid, m)
+	if status != http.StatusOK {
+		d.writeError(w, status, "session generation changed: "+sid)
+		return
+	}
+	d.writeJSON(w, http.StatusOK, resp)
+}
+
+func (d *Daemon) sessionDetailForMeta(r *http.Request, sid string, m *SessionMeta) (sessionDetailResponse, int) {
+	d.sessionsMu.RLock()
+	if d.sessions[sid] != m {
+		d.sessionsMu.RUnlock()
+		return sessionDetailResponse{}, http.StatusConflict
 	}
 	sessionID := m.SessionID
 	botID := m.BotID
@@ -328,6 +343,7 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid st
 	closed := m.Closed
 	createdAt := m.CreatedAt
 	d.sessionsMu.RUnlock()
+
 	snapshot := m.TurnSnapshot()
 	q := r.URL.Query()
 	defaultLimit := maxMemoryOutputLines
@@ -349,7 +365,9 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid st
 	pid := 0
 	var ws *workerSnapshot
 	d.workersMu.RLock()
-	if h, hw := d.workers[sid]; hw {
+	h := d.workers[sid]
+	d.workersMu.RUnlock()
+	if d.isCurrentSessionWorker(m, h) {
 		pid = h.Pid
 		lh := h.LastHb()
 		ws = &workerSnapshot{
@@ -358,7 +376,6 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid st
 			LastHb: lh.Format(time.RFC3339),
 		}
 	}
-	d.workersMu.RUnlock()
 	all := m.SnapshotOutput()
 	total := len(all)
 	start := offset
@@ -391,7 +408,13 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request, sid st
 		TurnCancelling: snapshot.Cancelling,
 		LatestTerminal: snapshot.Latest,
 	}
-	d.writeJSON(w, http.StatusOK, resp)
+	d.sessionsMu.RLock()
+	current := d.sessions[sid] == m
+	d.sessionsMu.RUnlock()
+	if !current {
+		return sessionDetailResponse{}, http.StatusConflict
+	}
+	return resp, http.StatusOK
 }
 
 func (d *Daemon) handleGetSessionHistory(w http.ResponseWriter, r *http.Request, sid string) {
@@ -573,11 +596,36 @@ func (d *Daemon) cancelTurnPreflight(sid string) (meta *SessionMeta, found, elig
 }
 
 func (d *Daemon) cancelTurnErrorResponse(meta *SessionMeta, sid string, err error) (int, string) {
-	current, found, eligible := d.cancelTurnPreflight(sid)
-	if !found || current != meta || !eligible {
+	if cancelTurnErrorIsConflict(err) || !d.isCurrentSession(meta) {
+		return http.StatusConflict, "session is no longer cancellable: " + sid
+	}
+	snapshot := meta.TurnSnapshot()
+	if !snapshot.Active || snapshot.Cancelling || !d.hasReadyCurrentWorkerForSession(meta) {
 		return http.StatusConflict, "session is no longer cancellable: " + sid
 	}
 	return http.StatusInternalServerError, "cancel turn: " + err.Error()
+}
+
+func cancelTurnErrorIsConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"not found",
+		"closed",
+		"does not use codex",
+		"no ready worker",
+		"no cancellable active turn",
+		"no longer current",
+		"cancellation is no longer active",
+		"worker changed",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Daemon) handleSessionSend(w http.ResponseWriter, r *http.Request, sid string) {
