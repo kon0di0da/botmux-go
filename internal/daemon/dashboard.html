@@ -481,6 +481,7 @@ function focusChatComposer(sid) {
 }
 
 function handleComposerKey(event, sid) {
+  if (event.isComposing || event.keyCode === 229) return;
   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
     sendMessage(sid);

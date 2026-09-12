@@ -50,6 +50,24 @@ func TestDashboardCancelTurnSourceGuards(t *testing.T) {
 	}
 }
 
+func TestDashboardComposerIgnoresIMECompositionEnter(t *testing.T) {
+	data, err := dashboardFS.ReadFile("dashboard.html")
+	if err != nil {
+		t.Fatalf("read dashboard: %v", err)
+	}
+	html := string(data)
+
+	handlerStart := strings.Index(html, `function handleComposerKey(event, sid) {`)
+	renderStart := strings.Index(html, `function renderChat(sid) {`)
+	if handlerStart < 0 || renderStart < 0 || renderStart <= handlerStart {
+		t.Fatal("dashboard missing handleComposerKey before renderChat")
+	}
+	handler := html[handlerStart:renderStart]
+	if !strings.Contains(handler, `if (event.isComposing || event.keyCode === 229) return;`) {
+		t.Error("handleComposerKey does not ignore Enter while an IME composition is active")
+	}
+}
+
 func TestDashboardSendTurnStateSourceGuards(t *testing.T) {
 	data, err := dashboardFS.ReadFile("dashboard.html")
 	if err != nil {
