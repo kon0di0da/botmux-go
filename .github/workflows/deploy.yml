@@ -41,23 +41,23 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          port: ${{ secrets.DEPLOY_PORT || '22' }}
           script: |
             set -e
-
+            
             # Variables
             DEPLOY_DIR="/opt/botmux-go"
             CONFIG_FILE="${DEPLOY_DIR}/configs/bots.json"
             SESSIONS_DIR="/tmp/botmux-sessions"
             BINARY_PATH="${DEPLOY_DIR}/botmux-go-daemon"
             SERVICE_NAME="botmux-go-daemon"
-
+            
             echo "🚀 Starting deployment..."
-
+            
             # 1. Ensure deployment directory exists
             mkdir -p $DEPLOY_DIR
             mkdir -p $SESSIONS_DIR
-
+            
             # 2. Clone or update repository
             if [ -d "${DEPLOY_DIR}/.git" ]; then
               echo "📥 Updating repository..."
@@ -69,13 +69,13 @@ jobs:
               git clone https://github.com/kon0di0da/botmux-go.git $DEPLOY_DIR
               cd $DEPLOY_DIR
             fi
-
+            
             # 3. Build the binary
             echo "🔨 Building binary..."
             export BOTMUX_SESSIONS_DIR=$SESSIONS_DIR
             go build -o $BINARY_PATH ./cmd/daemon
             chmod +x $BINARY_PATH
-
+            
             # 4. Check if config file exists
             if [ ! -f "$CONFIG_FILE" ]; then
               echo "⚠️  Config file not found at $CONFIG_FILE"
@@ -83,20 +83,20 @@ jobs:
               mkdir -p $(dirname $CONFIG_FILE)
               echo '{}' > $CONFIG_FILE
             fi
-
+            
             # 5. Stop existing daemon (if running)
             echo "🛑 Stopping existing daemon..."
             if pgrep -f "$BINARY_PATH" > /dev/null; then
               pkill -f "$BINARY_PATH" || true
               sleep 2
             fi
-
+            
             # 6. Start new daemon in background
             echo "✨ Starting daemon..."
             nohup $BINARY_PATH -config $CONFIG_FILE > /tmp/botmux-go.log 2>&1 &
             DAEMON_PID=$!
             sleep 2
-
+            
             # 7. Verify daemon is running
             if ps -p $DAEMON_PID > /dev/null; then
               echo "✅ Daemon started successfully (PID: $DAEMON_PID)"
@@ -105,7 +105,7 @@ jobs:
               cat /tmp/botmux-go.log
               exit 1
             fi
-
+            
             echo "🎉 Deployment completed successfully!"
             echo "Log file: /tmp/botmux-go.log"
             echo "Config: $CONFIG_FILE"
